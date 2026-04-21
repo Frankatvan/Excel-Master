@@ -1,0 +1,163 @@
+version: "v0.1"
+workbook: "Project Ledger_WBWT Sandy Cove_4.12.2026"
+
+global_rules:
+  primary_key: "AiWB_UID"
+  period_mode_current: "yearly"
+  period_mode_future: "monthly"
+  write_policy: "delta_only"
+  formula_authority: "python"
+  rounding:
+    amount_display: 2
+    percent_display: 8
+    internal_full_precision: true
+
+sheet_schema:
+  "109":
+    role: "financial_control"
+    key_columns:
+      total: "E"
+      aiwb_years: ["F", "G", "H", "I", "J", "K"]
+      audited_years: ["M", "N", "O", "P", "Q", "R"]
+      entity: "B"
+      item: "C"
+  "Scoping":
+    role: "master_cost_code"
+    key_columns:
+      group_number: "C"
+      group_name: "D"
+      gmp: "E"
+      fee: "F"
+      wip: "G"
+      wtc: "H"
+      budget: "L"
+      incurred_amount: "M"
+  "Unit Budget":
+    role: "unit_budget_master"
+    key_columns:
+      unit_code: "B"
+      budget_amount: "C"
+      wip_budget: "D"
+      incurred_amount: "E"
+      settlement_amount: "F"
+      settlement_year: "G"
+      budget_diff: "H"
+      group: "J"
+      gmp_flag: "K"
+      fee_flag: "L"
+      wip_flag: "M"
+      q_plus_unit_matrix_start: "Q"
+  "Payable":
+    role: "cost_detail_ledger"
+    key_columns:
+      entity_tag: "C"
+      filter_flag: "E"
+      year_key: "J"
+      vendor_name: "O"
+      incurred_date: "V"
+      amount: "AB"
+      unit_code: "AL"
+      cost_code_raw: "AM"
+  "Final Detail":
+    role: "unit_detail_bridge"
+    key_columns:
+      b_to_k_calc_output: "B:K"
+      summary_e_to_h_output: "E:H"
+      unit_code: "U"
+      type: "V"
+      date_t: "T"
+      amount_p: "P"
+      source_z: "Z"
+  "Draw request report":
+    role: "draw_progress_and_unit_events"
+    key_columns:
+      draw_date: "F"
+      draw_invoice: "G"
+      unit_code: "H"
+      incurred_date: "O"
+      amount: "Z"
+  "Draw Invoice List":
+    role: "draw_invoice_ledger"
+    key_columns:
+      draw_date: "B"
+      vendor_name: "I"
+      invoice_no: "J"
+      invoice_date: "K"
+      total: "L"
+  "Transfer Log":
+    role: "reclass_transfer_ledger"
+    key_columns:
+      request_no: "B"
+      draw_date: "C"
+      code: "F"
+      deduct: "H"
+      credit: "I"
+      total: "J"
+  "Change Order Log":
+    role: "change_order_ledger"
+    key_columns:
+      submitted_date: "B"
+      approved_date: "C"
+      code: "E"
+      description: "F"
+      approved_change_orders: "J"
+      potential_budget_increase: "K"
+
+mapping_to_109:
+  - target_item: "Cost of Goods Sold-Company"
+    target_sheet: "109"
+    source:
+      sheet: "Payable"
+      amount_col: "AB"
+      period_key: "V/J"
+      filters:
+        E: 1
+      adjustments:
+        exclude_vendor: "WB Home LLC"
+    status: "confirmed"
+  - target_item: "WB Home Income"
+    target_sheet: "109"
+    source:
+      sheet: "Payable"
+      amount_col: "AB"
+      period_key: "V/J"
+      filters:
+        E: 1
+        C: "WBH"
+    status: "confirmed"
+  - target_item: "WB Home COGS"
+    target_sheet: "109"
+    source:
+      mode: "manual"
+    status: "confirmed"
+  - target_item: "Budget Cost Change Order"
+    target_sheet: "109"
+    source:
+      mode: "pending_auto_source"
+      candidate_sheets: ["Change Order Log", "Transfer Log"]
+      candidate_codes: ["66009101", "66009104"]
+    status: "pending"
+  - target_item: "Accounts Receivable-Incurred"
+    target_sheet: "109"
+    source:
+      formula: "-General Conditions fee-Company_t"
+    status: "confirmed_by_snapshot"
+  - target_item: "Accounts Receivable-Company"
+    target_sheet: "109"
+    source:
+      formula: "IF(AR_audited_t not blank, AR_audited_t, AR_incurred_t)"
+    status: "inferred_high_confidence"
+  - target_item: "Accounts Receivable"
+    target_sheet: "109"
+    source:
+      formula: "CUMSUM(Accounts Receivable-Company <= t)"
+    status: "inferred_high_confidence"
+
+manual_override_priority:
+  enabled: true
+  rule: "manual_value_overrides_auto_when_not_blank"
+  scope:
+    - "WB Home COGS"
+    - "WB Home Inventory Income"
+    - "WB Home Inventory"
+    - "Budget Cost Change Order"

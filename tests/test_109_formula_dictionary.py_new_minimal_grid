@@ -1,0 +1,41 @@
+import unittest
+from unittest import mock
+
+import check_finance as cf
+import pandas as pd
+
+
+def build_minimal_109_grid():
+    return [
+        ["", "", "", "Contract price (Day1):", 1000, "2021", "2022", "2023", "2024", "2025", "2026"],
+        ["", "", "Contract price", "", 1000],
+        ["", "", "Contract Amount"],
+        ["", "", "Budget Surplus"],
+        ["", "", "Scoping Budget Cost"],
+        ["", "", "Cost of Goods Sold-Company"],
+        ["", "", "Cost of Goods Sold-Audited"],
+        ["", "", "Cost of Goods Sold"],
+        ["", "", "Percentage of Completion"],
+        ["", "", "Completion Rate for the Period"],
+        ["", "", "Contract Change Order"],
+        ["", "", "General Conditions fee-Company"],
+        ["", "", "General Conditions fee-Audited"],
+        ["", "", "General Conditions fee"],
+        ["", "", "Gross Profit-Company"],
+        ["", "", "Gross Profit"],
+        ["", "", "Accounts Receivable-Incurred"],
+        ["", "", "Accounts Receivable-Audited"],
+        ["", "", "Accounts Receivable-Company"],
+        ["", "", "Accounts Receivable"],
+        ["", "", "WB Home Income"],
+        ["", "", "WB Home COGS"],
+        ["", "", "WB Home Inventory Income"],
+        ["", "", "WB Home Inventory"],
+        ["", "", "WB Home Inventory Income-Reverse"],
+        ["", "", "WB Home Inventory-Reverse"],
+        ["", "", "WB. Home Material Margin Total"],
+        ["", "", "Material Margin"],
+        ["", "", "Material Margin"],
+        ["", "", "Day 1 Budget"],
+        ["", "", "Budget Surplus"],
+    ]

@@ -1,0 +1,109 @@
+version: "v1"
+sheet: "109"
+period_axis:
+  mode: "yearly"
+  years: [2021, 2022, 2023, 2024, 2025, 2026]
+  future_mode: "monthly"
+
+precision:
+  display:
+    amount_decimals: 2
+    percent_decimals: 8
+  internal:
+    keep_full_precision: true
+
+constants:
+  contract_price_tp:
+    source: "Contract price (Day1)"
+    dynamic: false
+
+anchors:
+  initial_direct_cost:
+    source: "Unit Budget!C1"
+    note: "Day1预算直接成本"
+  budget_cost_change_order:
+    source: "TBD"
+    note: "Owner不确认成本超支；当期变动额，累计入EAC"
+    status: "pending_source"
+
+inputs_from_payable:
+  cogs_company:
+    target_row: "Cost of Goods Sold-Company"
+    filters:
+      col_E: 1
+    amount_col: "AB"
+    period_key: "Incurred date (current: yearly key)"
+    adjustments:
+      exclude_vendor: "WB Home LLC"
+  wb_home_income:
+    target_row: "WB Home Income"
+    filters:
+      col_E: 1
+      col_C: "WBH"
+    amount_col: "AB"
+    period_key: "Incurred date (current: yearly key)"
+
+manual_inputs:
+  - "WB Home COGS"
+  - "WB Home Inventory Income"
+  - "WB Home Inventory"
+  - "Budget Cost Change Order (until source finalized)"
+
+formulas:
+  - id: "f_eac"
+    target: "EAC_t"
+    expr: "InitialDirectCost + CUMSUM(Budget Cost Change Order <= t)"
+    status: "confirmed"
+  - id: "f_cogs_company_total"
+    target: "Cost of Goods Sold-Company.Total"
+    expr: "SUM(Cost of Goods Sold-Company.period)"
+    status: "confirmed"
+  - id: "f_poc"
+    target: "Percentage of Completion"
+    expr: "CUMSUM(Cost of Goods Sold-Company <= t) / EAC_t"
+    status: "confirmed"
+  - id: "f_cr"
+    target: "Completion Rate for the Period"
+    expr: "POC_t - POC_(t-1)"
+    status: "confirmed"
+  - id: "f_revenue_company"
+    target: "General Conditions fee-Company"
+    expr: "POC_t * TP - CUMSUM(General Conditions fee-Company < t)"
+    status: "confirmed"
+  - id: "f_gp_company"
+    target: "Gross Profit-Company"
+    expr: "General Conditions fee-Company_t - Cost of Goods Sold-Company_t"
+    status: "confirmed"
+  - id: "f_ar_incurred"
+    target: "Accounts Receivable-Incurred"
+    expr: "- General Conditions fee-Company_t"
+    status: "confirmed_by_snapshot"
+  - id: "f_ar_company"
+    target: "Accounts Receivable-Company"
+    expr: "IF(Accounts Receivable-Audited_t is not blank, Accounts Receivable-Audited_t, Accounts Receivable-Incurred_t)"
+    status: "inferred_high_confidence"
+  - id: "f_ar_balance"
+    target: "Accounts Receivable"
+    expr: "CUMSUM(Accounts Receivable-Company <= t)"
+    status: "inferred_high_confidence"
+  - id: "f_wbh_margin"
+    target: "Material Margin (WB Home main)"
+    expr: "WB Home Income_t - WB Home COGS_t"
+    status: "confirmed"
+  - id: "f_inventory_reverse_income"
+    target: "WB Home Inventory Income-Reverse"
+    expr: "IF(t is first_period, blank, -WB Home Inventory Income_(t-1))"
+    status: "confirmed"
+  - id: "f_inventory_reverse_cogs"
+    target: "WB Home Inventory-Reverse"
+    expr: "IF(t is first_period, blank, -WB Home Inventory_(t-1))"
+    status: "confirmed"
+
+audited_layer:
+  role: "comparison_layer"
+  note: "M列后审计区作为对照，不直接覆盖主链计算"
+
+open_items:
+  - "Budget Cost Change Order source mapping"
+  - "Draw Invoice / AR-Payment integration into AR chain (if any hard formula)"
+  - "Yearly to monthly period bucketing migration rule"

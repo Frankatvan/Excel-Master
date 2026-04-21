@@ -1,0 +1,53 @@
+finance_sheets:
+  "109":
+    label_col_idx: 2
+    data_start_col: "F"
+    labels:
+      eac: "Dynamic Budget (EAC)"
+      poc: "Percentage of Completion"
+      confirmed_cogs: "Cost of Goods Sold"
+      initial_budget: "Day 1 Budget"
+      revenue: "General Conditions fee"
+      budget_surplus: "Cumulative Savings (Target vs Actual)"
+      contract_price: "Total Estimated Revenue"
+      cogs_audited: "Audit Adjustment (Current Period)"
+      revenue_audited: "general conditions fee-audited"
+      cogs_company: "cost of goods sold-company"
+      revenue_company: "general conditions fee-company"
+      gc_cost: "Total GC Cost"
+      accrued_warranty: "Accrued Warranty Expenses"
+      actual_warranty: "Actual Warranty Expenses (Reversed)"
+  "BudgetCO":
+    label_col_idx: 1
+    data_start_col: "G"
+    labels:
+      savings: "Total Savings Identified"
+      contingency: "Owner Contingency"
+      eac_summary: "Total Budget (EAC)"
+    formulas:
+      eac_summary:
+        template: "={eac_summary}"
+        refs: ["eac_summary"]
+  "Project Ledger":
+    label_col_idx: 0
+    data_start_col: "H"
+    labels:
+      total_actuals: "Total Actual Expenditure"
+      accrual_adj: "Accrual Adjustments"
+  "Payable":
+    columns:
+      vendor: "Vendor"
+      amount: "Amount"
+      incurred_date: "Incurred Date"
+      unit_code: "Unit Code"
+      cost_code: "Cost Code"
+  "Final Detail":
+    columns:
+      final_date: "Final Date"
+      incurred_date: "Incurred Date"
+      unit_code: "Unit Code"
+      activity_no: "Activity No."
+      cost_code: "Cost Code"
+      amount: "Amount"
+      vendor: "Vendor"
+      type: "Type"

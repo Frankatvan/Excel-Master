@@ -1,0 +1,17 @@
+### 📥 CODEX EXECUTION PROTOCOL: PROJECT LEDGER REFACTOR
+
+SOURCE_SPEC: @docs/superpowers/specs/2026-04-19-Refactor-ProjectLedger-Semantic.md
+
+ACTION 1: UPDATE [docs/finance_semantic_config.yaml]
+- Add "Project Ledger" section as defined in Spec.
+
+ACTION 2: MODIFY [check_finance.py]
+- Locate Project Ledger processing functions.
+- Inject "mapper = MapperFactory.create('Project Ledger', ledger_values)".
+- Replace hardcoded index-based lookups with "mapper.get_row(...)".
+
+ACTION 3: CREATE [tests/test_ledger_integration.py]
+- Implement test to verify label discovery in Column A for Ledger.
+
+CONSTRAINTS:
+- Ensure the "Shadow Reconcile" logic (comparing Ledger total to 109 total) uses semantic labels from both mappers.

@@ -1,0 +1,4570 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pickle
+import re
+import uuid
+from datetime import date, datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+
+import pandas as pd
+import streamlit as st
+import yaml
+import finance_classification as _finance_classification
+from openpyxl import load_workbook
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from streamlit.errors import StreamlitSecretNotFoundError
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+DAILY_API_QUOTA_ESTIMATE = 5000
+DEFAULT_UID_COLUMN = "AiWB_UID"
+DEFAULT_AMOUNT_COLUMN = "Amount"
+DEFAULT_ENTITY_COLUMN = "WBH"
+DEFAULT_GUARD_SHEET = "Project Ledger"
+DEFAULT_EXPECTED_FIRST_CELL = "Project Ledger"
+DEFAULT_SERVICE_ACCOUNT_FILE = "credentials.json"
+
+INTERNAL_COL_PREFIX = "__AIWB_"
+UID_STATUS_COL = "__AIWB_UID_SYNC_STATUS"
+SHADOW_CONFLICT_COL = "__AIWB_SHADOW_CONFLICT"
+SHADOW_PY_PROFIT_COL = "__AIWB_PY_PROFIT"
+SHADOW_PY_TAX_COL = "__AIWB_PY_TAX"
+
+UID_PENDING_VALUE = "待同步"
+UID_SYNCED_VALUE = "已同步"
+
+LOCAL_ROOT = Path(".aiwb_local")
+DRAFT_DIR = LOCAL_ROOT / "drafts"
+AUDIT_LOG_FILE = LOCAL_ROOT / "aiwb_audit.log"
+CLOUD_SNAPSHOT_FILE = LOCAL_ROOT / "cloud_snapshot.pkl"
+RULE_ID_HIT_RATE_BASELINE_FILE = LOCAL_ROOT / "rule_id_hit_rate_baseline.json"
+FORMULA_DICTIONARY_109_FILE = Path("docs/AiWB_公式字典_109_v1.yaml")
+SANDY_COVE_DATES_FILE = Path("docs/Sandy cove.xlsx")
+SHEET_109_NAME = "109"
+SHEET_109_LOG_NAME = "AiWB_109_Log"
+SHEET_UNIT_MASTER_NAME = "Unit Master"
+COLOR_FILL_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+COLOR_FILL_LIGHT_GRAY = {"red": 0.93, "green": 0.93, "blue": 0.93}
+COLOR_FILL_LIGHT_RED = {"red": 0.98, "green": 0.89, "blue": 0.89}
+COLOR_FILL_LIGHT_YELLOW = {"red": 1.0, "green": 0.96, "blue": 0.76}
+NUMBER_FORMAT_PERCENT_2 = {"type": "NUMBER", "pattern": "0.00%"}
+NUMBER_FORMAT_YEAR_0 = {"type": "NUMBER", "pattern": "0"}
+NUMBER_FORMAT_DATE_ISO = {"type": "DATE", "pattern": "yyyy-mm-dd"}
+DEFAULT_RULE_ID_HIT_RATE_ALERT_THRESHOLD = 0.20
+
+
+def _to_plain_dict(obj: Any) -> Any:
+    if isinstance(obj, Mapping):
+        return {k: _to_plain_dict(v) for k, v in obj.items()}
+    return obj
+
+
+def _safe_secrets() -> Mapping[str, Any]:
+    try:
+        return _to_plain_dict(dict(st.secrets))
+    except StreamlitSecretNotFoundError:
+        return {}
+
+
+def _get_secret(name: str, default: Any = None) -> Any:
+    secrets = _safe_secrets()
+    if name in secrets:
+        return secrets[name]
+    if "app" in secrets and name in secrets["app"]:
+        return secrets["app"][name]
+    return default
+
+
+def _parse_options(value: Any, fallback: Sequence[str]) -> List[str]:
+    if value is None:
+        return list(fallback)
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, Sequence):
+        return [str(item) for item in value]
+    return list(fallback)
+
+
+def _is_internal_col(col: str) -> bool:
+    return str(col).startswith(INTERNAL_COL_PREFIX)
+
+
+def _cloud_view(df: pd.DataFrame) -> pd.DataFrame:
+    return df[[c for c in df.columns if not _is_internal_col(str(c))]].copy()
+
+
+def _column_number_to_a1(index_1_based: int) -> str:
+    if index_1_based < 1:
+        raise ValueError("列号必须 >= 1")
+    chars: List[str] = []
+    value = index_1_based
+    while value > 0:
+        value, rem = divmod(value - 1, 26)
+        chars.append(chr(ord("A") + rem))
+    return "".join(reversed(chars))
+
+
+def _quote_sheet_name(name: str) -> str:
+    escaped = name.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _normalize_formula_range(a1: str) -> str:
+    x = _safe_string(a1).replace("$", "")
+    if "!" not in x:
+        return x
+    sheet, cell = x.split("!", 1)
+    sheet = sheet.strip().strip("'")
+    return f"{sheet}!{cell}"
+
+
+def _normalize_formula_text_for_compare(formula: Any) -> str:
+    text = _safe_string(formula)
+    if not text:
+        return ""
+
+    out: List[str] = []
+    in_quotes = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            out.append(ch)
+            if in_quotes and i + 1 < len(text) and text[i + 1] == '"':
+                out.append('"')
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        out.append(ch if in_quotes else ch.upper())
+        i += 1
+    return "".join(out)
+
+
+def _column_a1_to_number(label: str) -> int:
+    value = 0
+    for ch in _safe_string(label).upper():
+        if not ("A" <= ch <= "Z"):
+            raise ValueError(f"非法列标: {label}")
+        value = value * 26 + (ord(ch) - ord("A") + 1)
+    if value < 1:
+        raise ValueError(f"非法列标: {label}")
+    return value
+
+
+def _normalize_headers(headers: Sequence[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    normalized: List[str] = []
+    for i, header in enumerate(headers):
+        base = str(header).strip() or f"Unnamed_{i + 1}"
+        seen[base] = seen.get(base, 0) + 1
+        if seen[base] == 1:
+            normalized.append(base)
+        else:
+            normalized.append(f"{base}_{seen[base]}")
+    return normalized
+
+
+def _parse_cell_value(cell: Dict[str, Any]) -> Any:
+    """用于编辑器展示：优先展示计算结果值而非公式本体。"""
+    if "formattedValue" in cell:
+        return cell["formattedValue"]
+
+    entered = cell.get("userEnteredValue", {})
+    for key in ("stringValue", "numberValue", "boolValue"):
+        if key in entered:
+            return entered[key]
+    return ""
+
+
+def _parse_formula_value(cell: Dict[str, Any]) -> str:
+    entered = cell.get("userEnteredValue", {})
+    formula = entered.get("formulaValue", "")
+    return str(formula) if formula else ""
+
+
+def _trim_matrix(matrix: List[List[Any]]) -> List[List[Any]]:
+    while matrix and all(str(item).strip() == "" for item in matrix[-1]):
+        matrix.pop()
+    if not matrix:
+        return []
+
+    max_cols = max(len(row) for row in matrix)
+    padded = [row + [""] * (max_cols - len(row)) for row in matrix]
+    keep_cols = [
+        idx for idx in range(max_cols) if any(str(row[idx]).strip() != "" for row in padded)
+    ]
+    if not keep_cols:
+        return []
+    return [[row[idx] for idx in keep_cols] for row in padded]
+
+
+def _trim_display_and_formula_matrices(
+    display_matrix: List[List[Any]],
+    formula_matrix: List[List[str]],
+) -> Tuple[List[List[Any]], List[List[str]]]:
+    while display_matrix and all(str(item).strip() == "" for item in display_matrix[-1]):
+        display_matrix.pop()
+        if formula_matrix:
+            formula_matrix.pop()
+
+    if not display_matrix:
+        return [], []
+
+    max_cols = max(len(row) for row in display_matrix)
+    padded_display = [row + [""] * (max_cols - len(row)) for row in display_matrix]
+    padded_formula = []
+    for idx, row in enumerate(formula_matrix):
+        padded_formula.append(row + [""] * (max_cols - len(row)))
+    if len(padded_formula) < len(padded_display):
+        padded_formula.extend([[""] * max_cols for _ in range(len(padded_display) - len(padded_formula))])
+
+    keep_cols = [
+        idx
+        for idx in range(max_cols)
+        if any(str(row[idx]).strip() != "" for row in padded_display)
+    ]
+    if not keep_cols:
+        return [], []
+
+    trimmed_display = [[row[idx] for idx in keep_cols] for row in padded_display]
+    trimmed_formula = [[row[idx] for idx in keep_cols] for row in padded_formula]
+    return trimmed_display, trimmed_formula
+
+
+def _build_formula_lookup(
+    trimmed_display: List[List[Any]],
+    trimmed_formula: List[List[str]],
+) -> Dict[Tuple[int, str], str]:
+    if not trimmed_display:
+        return {}
+
+    headers = _normalize_headers(trimmed_display[0])
+    lookup: Dict[Tuple[int, str], str] = {}
+
+    for data_row_idx, row in enumerate(trimmed_formula[1:]):
+        padded = row[: len(headers)] + [""] * max(0, len(headers) - len(row))
+        for col_idx, formula in enumerate(padded):
+            formula_text = str(formula).strip()
+            if formula_text.startswith("="):
+                lookup[(data_row_idx, headers[col_idx])] = formula_text
+
+    return lookup
+
+
+def _build_formula_lookup_by_headers(
+    headers: Sequence[str],
+    formula_matrix: Sequence[Sequence[Any]],
+) -> Dict[Tuple[int, str], str]:
+    if not headers or not formula_matrix:
+        return {}
+
+    norm_headers = _normalize_headers([str(h) for h in headers])
+    lookup: Dict[Tuple[int, str], str] = {}
+    for data_row_idx, row in enumerate(formula_matrix[1:]):
+        padded = list(row)[: len(norm_headers)] + [""] * max(0, len(norm_headers) - len(row))
+        for col_idx, formula in enumerate(padded):
+            formula_text = _safe_string(formula)
+            if formula_text.startswith("="):
+                lookup[(data_row_idx, norm_headers[col_idx])] = formula_text
+    return lookup
+
+
+def _values_to_dataframe(values: List[List[Any]]) -> pd.DataFrame:
+    if not values:
+        return pd.DataFrame()
+
+    headers = _normalize_headers(values[0])
+    width = len(headers)
+    rows: List[List[Any]] = []
+    for row in values[1:]:
+        normalized_row = row[:width] + [""] * max(0, width - len(row))
+        rows.append(normalized_row)
+    return pd.DataFrame(rows, columns=headers)
+
+
+def _serialize_for_api(value: Any) -> Any:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, (int, float, bool, str)):
+        return value
+    return str(value)
+
+
+def _dataframe_to_values(df: pd.DataFrame) -> List[List[Any]]:
+    headers = [str(col) for col in df.columns.tolist()]
+    body = (
+        df.applymap(_serialize_for_api)
+        .replace({pd.NA: "", None: ""})
+        .values.tolist()
+    )
+    return [headers] + body
+
+
+def _df_signature(df: pd.DataFrame) -> str:
+    cloud_df = _cloud_view(df)
+    cols = [str(col) for col in cloud_df.columns.tolist()]
+    normalized = cloud_df.astype("string").fillna("")
+    payload = "|".join(cols) + "\n" + normalized.to_csv(index=False)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _safe_string(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _safe_number(value: Any) -> float:
+    num = _to_float(value)
+    return num if num is not None else 0.0
+
+
+def _extract_tail_int(value: Any, digits: int) -> int | None:
+    text = _safe_string(value)
+    if not text:
+        return None
+    if len(text) < digits:
+        # If it's short but purely numeric (e.g. "50"), return it as is.
+        if text.isdigit():
+            return int(text)
+        return None
+    tail = text[-digits:]
+    if tail.isdigit():
+        return int(tail)
+    return None
+
+
+def _extract_tail_str(value: Any, digits: int) -> str:
+    text = _safe_string(value)
+    if not text:
+        return ""
+    return text[-digits:] if len(text) >= digits else text
+
+
+@lru_cache(maxsize=8192)
+def _extract_year_text_cached(text: str) -> int | str:
+    if not text:
+        return ""
+
+    year_only_match = re.fullmatch(r"(19|20)\d{2}", text)
+    if year_only_match:
+        return int(text)
+
+    leading_year_match = re.match(r"^\s*((19|20)\d{2})(?=[^\d]|$)", text)
+    if leading_year_match:
+        return int(leading_year_match.group(1))
+
+    trailing_year_match = re.search(r"(?<!\d)((19|20)\d{2})(?!\d)", text)
+    if trailing_year_match and len(text) <= 10:
+        return int(trailing_year_match.group(1))
+
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.notna(dt):
+        return int(dt.year)
+
+    if trailing_year_match:
+        return int(trailing_year_match.group(1))
+
+    return ""
+
+
+def _extract_year(value: Any) -> int | str:
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return ""
+        return int(value.year)
+    if isinstance(value, datetime):
+        return int(value.year)
+    if isinstance(value, date):
+        return int(value.year)
+    if isinstance(value, int):
+        return value if 1900 <= value <= 2100 else ""
+    if isinstance(value, float):
+        if pd.isna(value):
+            return ""
+        if value.is_integer():
+            year = int(value)
+            return year if 1900 <= year <= 2100 else ""
+        return ""
+    if pd.isna(value):
+        return ""
+
+    text = _safe_string(value)
+    if not text:
+        return ""
+    return _extract_year_text_cached(text)
+
+
+def _co_date_to_actual_settlement_date(co_date: Any) -> str:
+    text = _safe_string(co_date)
+    if not text:
+        return ""
+
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.isna(dt):
+        return ""
+
+    actual = dt + pd.offsets.MonthBegin(1) + pd.offsets.MonthEnd(1)
+    return actual.strftime("%Y-%m-%d")
+
+
+def _format_iso_date_or_blank(value: Any) -> str:
+    dt = _normalize_date_value(value)
+    return dt.strftime("%Y-%m-%d") if dt is not None else ""
+
+
+def _derive_unit_budget_actual_settlement_fields(
+    unit_code: Any,
+    settlement_year: Any,
+    co_date: Any,
+    latest_unit_year: int | None,
+) -> Tuple[str, int | str]:
+    code_text = _safe_string(unit_code)
+    actual_date = _co_date_to_actual_settlement_date(co_date)
+    settlement_year_value = _extract_year(settlement_year)
+    settlement_year_num = int(settlement_year_value) if settlement_year_value != "" else None
+    actual_date_year = _extract_year(actual_date)
+    actual_date_year_num = int(actual_date_year) if actual_date_year != "" else None
+    is_unit_row = any(ch.isdigit() for ch in code_text)
+
+    if is_unit_row:
+        if actual_date_year_num is None:
+            return "", ""
+        # Prioritize actual_date_year_num from co_date over the existing settlement_year_num
+        return actual_date, actual_date_year_num
+    else:
+        # For non-unit rows (like 'Common Area'), use fallback chain
+        fallback_candidates = [x for x in [actual_date_year_num, latest_unit_year, settlement_year_num] if x is not None]
+        actual_year = fallback_candidates[0] if fallback_candidates else ""
+
+    return actual_date, actual_year
+
+
+@lru_cache(maxsize=8192)
+def _normalize_date_text_cached(text: str) -> pd.Timestamp | None:
+    if not text:
+        return None
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return pd.Timestamp(dt).normalize()
+
+
+def _normalize_date_value(value: Any) -> pd.Timestamp | None:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.normalize()
+    if isinstance(value, datetime):
+        return pd.Timestamp(value).normalize()
+    if isinstance(value, date):
+        return pd.Timestamp(value).normalize()
+    return _normalize_date_text_cached(_safe_string(value))
+
+
+def _normalize_amount_key(value: Any) -> float:
+    return round(_safe_number(value), 2)
+
+
+def _normalize_text_key(value: Any) -> str:
+    return _safe_string(value).upper()
+
+
+def _has_digits(value: Any) -> bool:
+    return any(ch.isdigit() for ch in _safe_string(value))
+
+
+def _contains_general_condition(value: Any) -> bool:
+    return "GENERAL CONDITION" in _normalize_text_key(value)
+
+
+def _normalize_header_token(value: Any) -> str:
+    text = _safe_string(value).upper()
+    return re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "", text)
+
+
+def _find_col_in_headers(df: pd.DataFrame, *candidates: str) -> int | None:
+    wanted = {_normalize_header_token(item) for item in candidates}
+    for idx, col in enumerate(df.columns, start=1):
+        if _normalize_header_token(col) in wanted:
+            return idx
+    return None
+
+
+def _find_col_in_row(df: pd.DataFrame, row_idx_0: int, *candidates: str) -> int | None:
+    wanted = {_normalize_header_token(item) for item in candidates}
+    for idx in range(1, len(df.columns) + 1):
+        if _normalize_header_token(_get_cell(df, row_idx_0, idx)) in wanted:
+            return idx
+    return None
+
+
+def _unit_budget_layout(df: pd.DataFrame | None = None) -> Dict[str, int]:
+    layout = {
+        "unit_header_start": 17,
+        "budget_variance": 8,
+        "group": 10,
+        "gmp": 11,
+        "fee": 12,
+        "wip": 13,
+        "raw_budget_total": 16,
+    }
+    if df is None or len(df) == 0:
+        return layout
+
+    co_header = _safe_string(_get_cell(df, 0, 8)).lower()
+    actual_year_header = _safe_string(_get_cell(df, 0, 10))
+    tbd_header = _safe_string(_get_cell(df, 0, 11))
+    if co_header == "c/o date" and actual_year_header == "实际结算年份" and tbd_header == "TBD Acceptance Date":
+        return {
+            "unit_header_start": 21,
+            "budget_variance": 12,
+            "group": 14,
+            "gmp": 15,
+            "fee": 16,
+            "wip": 17,
+            "raw_budget_total": 20,
+        }
+    if co_header == "c/o date" or actual_year_header == "实际结算年份":
+        return {
+            "unit_header_start": 20,
+            "budget_variance": 11,
+            "group": 13,
+            "gmp": 14,
+            "fee": 15,
+            "wip": 16,
+            "raw_budget_total": 19,
+        }
+    return layout
+
+
+def _unit_budget_classification_layout(df: pd.DataFrame | None = None) -> Dict[str, int | None]:
+    layout: Dict[str, int | None] = {
+        "unit_code": 2,
+        "co_date": None,
+        "actual_settlement_date": None,
+        "actual_settlement_year": None,
+        "budget_variance": None,
+        "tbd_acceptance_date": None,
+        "group": None,
+        "gmp": None,
+        "fee": None,
+        "wip": None,
+    }
+    if df is None or len(df) == 0:
+        return layout
+
+    layout["co_date"] = _find_col_in_row(df, 0, "C/O date")
+    layout["actual_settlement_date"] = _find_col_in_row(df, 0, "实际结算日期")
+    layout["actual_settlement_year"] = _find_col_in_row(df, 0, "实际结算年份")
+    layout["budget_variance"] = _find_col_in_row(df, 0, "预算差异")
+    layout["tbd_acceptance_date"] = _find_col_in_row(df, 0, "TBD Acceptance Date")
+    layout["group"] = _find_col_in_row(df, 0, "Group")
+    layout["gmp"] = _find_col_in_row(df, 0, "GMP")
+    layout["fee"] = _find_col_in_row(df, 0, "Fee")
+    layout["wip"] = _find_col_in_row(df, 0, "WIP")
+    return layout
+
+
+def _load_unit_budget_schedule_overrides_from_excel(
+    path: str | Path,
+) -> Dict[str, Dict[str, str]]:
+    workbook_path = Path(path)
+    if not workbook_path.exists():
+        return {}
+
+    wb = load_workbook(workbook_path, data_only=True, read_only=True)
+    try:
+        if not wb.worksheets:
+            return {}
+        ws = wb.worksheets[0]
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            return {}
+
+        header_lookup = {_normalize_header_token(value): idx for idx, value in enumerate(header_row)}
+        unit_idx = header_lookup.get(_normalize_header_token("UnitCode"))
+        co_idx = header_lookup.get(_normalize_header_token("C/O Date"))
+        tbd_idx = header_lookup.get(_normalize_header_token("TBD Acceptance Date"))
+        if unit_idx is None:
+            return {}
+
+        out: Dict[str, Dict[str, str]] = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            unit_code = _safe_string(row[unit_idx] if unit_idx < len(row) else "")
+            if not unit_code:
+                continue
+            out[unit_code] = {
+                "co_date": _format_iso_date_or_blank(row[co_idx] if co_idx is not None and co_idx < len(row) else ""),
+                "tbd_acceptance_date": _format_iso_date_or_blank(
+                    row[tbd_idx] if tbd_idx is not None and tbd_idx < len(row) else ""
+                ),
+            }
+        return out
+    finally:
+        wb.close()
+
+
+def _load_default_unit_budget_schedule_overrides() -> Dict[str, Dict[str, str]]:
+    return _load_unit_budget_schedule_overrides_from_excel(SANDY_COVE_DATES_FILE)
+
+
+def _build_unit_budget_schedule_map(
+    wsb: pd.DataFrame,
+    schedule_overrides: Mapping[str, Mapping[str, str]] | None = None,
+) -> Dict[str, Dict[str, pd.Timestamp | None]]:
+    layout = _unit_budget_classification_layout(wsb)
+    overrides = schedule_overrides or {}
+    schedule: Dict[str, Dict[str, pd.Timestamp | None]] = {}
+    latest_numeric_actual: pd.Timestamp | None = None
+    latest_numeric_tbd: pd.Timestamp | None = None
+
+    for r in range(1, len(wsb)):
+        unit_code = _safe_string(_get_cell(wsb, r, int(layout["unit_code"] or 2)))
+        if not unit_code:
+            continue
+        override_item = overrides.get(unit_code, {})
+        co_col = layout.get("co_date")
+        co_date = override_item.get("co_date", "") or (
+            _safe_string(_get_cell(wsb, r, int(co_col))) if co_col else ""
+        )
+        actual_dt = _normalize_date_value(_co_date_to_actual_settlement_date(co_date))
+        if actual_dt is None:
+            actual_dt = _normalize_date_value(_get_cell(wsb, r, int(layout["actual_settlement_date"] or 9)))
+        tbd_col = layout.get("tbd_acceptance_date")
+        tbd_source = override_item.get("tbd_acceptance_date", "") or (
+            _get_cell(wsb, r, int(tbd_col)) if tbd_col else ""
+        )
+        tbd_dt = _normalize_date_value(tbd_source)
+        schedule[unit_code] = {
+            "actual_settlement_date": actual_dt,
+            "tbd_acceptance_date": tbd_dt,
+        }
+        if _has_digits(unit_code):
+            if actual_dt is not None:
+                latest_numeric_actual = actual_dt if latest_numeric_actual is None else max(latest_numeric_actual, actual_dt)
+            if tbd_dt is not None:
+                latest_numeric_tbd = tbd_dt if latest_numeric_tbd is None else max(latest_numeric_tbd, tbd_dt)
+
+    for unit_code, item in schedule.items():
+        if _has_digits(unit_code):
+            continue
+        if item["actual_settlement_date"] is None:
+            item["actual_settlement_date"] = latest_numeric_actual
+        if item["tbd_acceptance_date"] is None:
+            item["tbd_acceptance_date"] = latest_numeric_tbd
+
+    schedule["__COMMON_FALLBACK__"] = {
+        "actual_settlement_date": latest_numeric_actual,
+        "tbd_acceptance_date": latest_numeric_tbd,
+    }
+    return schedule
+
+
+def _sheet_key(sheet_map: Mapping[str, pd.DataFrame], target: str) -> str:
+    if target in sheet_map:
+        return target
+    lower = target.strip().lower()
+    for key in sheet_map.keys():
+        if key.strip().lower() == lower:
+            return key
+    raise KeyError(f"缺少工作表: {target}")
+
+
+def _ensure_column_count(df: pd.DataFrame, min_cols: int) -> pd.DataFrame:
+    out = df.copy()
+    while len(out.columns) < min_cols:
+        base = f"Unnamed_{len(out.columns) + 1}"
+        name = base
+        n = 2
+        while name in out.columns:
+            name = f"{base}_{n}"
+            n += 1
+        out[name] = ""
+    return out
+
+
+def _ensure_row_count(df: pd.DataFrame, min_rows: int) -> pd.DataFrame:
+    out = df.copy()
+    if len(out) >= min_rows:
+        return out
+    add_n = min_rows - len(out)
+    fill = pd.DataFrame([{col: "" for col in out.columns}] * add_n)
+    out = pd.concat([out, fill], ignore_index=True)
+    return out
+
+
+def _get_cell(df: pd.DataFrame, row_idx_0: int, col_idx_1: int) -> Any:
+    col_idx_0 = col_idx_1 - 1
+    if row_idx_0 < 0 or row_idx_0 >= len(df):
+        return ""
+    if col_idx_0 < 0 or col_idx_0 >= len(df.columns):
+        return ""
+    return df.iat[row_idx_0, col_idx_0]
+
+
+def _column_values_1based(df: pd.DataFrame, col_idx_1: int) -> List[Any]:
+    if len(df) == 0:
+        return []
+    col_idx_0 = col_idx_1 - 1
+    if col_idx_0 < 0 or col_idx_0 >= len(df.columns):
+        return [""] * len(df)
+    return df.iloc[:, col_idx_0].tolist()
+
+
+def _set_cell(df: pd.DataFrame, row_idx_0: int, col_idx_1: int, value: Any) -> pd.DataFrame:
+    out = _ensure_column_count(df, col_idx_1)
+    out = _ensure_row_count(out, row_idx_0 + 1)
+    col_name = out.columns[col_idx_1 - 1]
+    if str(out[col_name].dtype) != "object":
+        out[col_name] = out[col_name].astype(object)
+    out.iat[row_idx_0, col_idx_1 - 1] = value
+    return out
+
+
+def _sheet_delta_stats(before_df: pd.DataFrame, after_df: pd.DataFrame) -> Dict[str, int]:
+    before = _cloud_view(before_df)
+    after = _cloud_view(after_df)
+    all_cols = list(dict.fromkeys(list(before.columns) + list(after.columns)))
+
+    before_n = before.reindex(columns=all_cols).astype("string").fillna("")
+    after_n = after.reindex(columns=all_cols).astype("string").fillna("")
+
+    max_rows = max(len(before_n), len(after_n))
+    before_n = before_n.reindex(range(max_rows), fill_value="")
+    after_n = after_n.reindex(range(max_rows), fill_value="")
+
+    diff_mask = before_n.ne(after_n)
+    return {
+        "changed_rows": int(diff_mask.any(axis=1).sum()),
+        "changed_cells": int(diff_mask.sum().sum()),
+    }
+
+
+def _to_float(value: Any) -> float | None:
+    if pd.isna(value):
+        return None
+    if isinstance(value, str) and value.strip().startswith("="):
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+_finance_classification.configure_classification_dependencies(
+    _build_unit_budget_schedule_map=_build_unit_budget_schedule_map,
+    _contains_general_condition=_contains_general_condition,
+    _ensure_column_count=_ensure_column_count,
+    _extract_tail_int=_extract_tail_int,
+    _find_col_in_headers=_find_col_in_headers,
+    _find_col_in_row=_find_col_in_row,
+    _get_cell=_get_cell,
+    _has_digits=_has_digits,
+    _load_default_unit_budget_schedule_overrides=_load_default_unit_budget_schedule_overrides,
+    _normalize_amount_key=_normalize_amount_key,
+    _normalize_date_value=_normalize_date_value,
+    _normalize_text_key=_normalize_text_key,
+    _safe_string=_safe_string,
+    _sheet_key=_sheet_key,
+    _to_float=_to_float,
+)
+
+_make_final_detail_pair_key = _finance_classification._make_final_detail_pair_key
+_make_payable_racc_key = _finance_classification._make_payable_racc_key
+_make_exp_restore_match_key = _finance_classification._make_exp_restore_match_key
+_build_scoping_status_map = _finance_classification._build_scoping_status_map
+_classify_before_actual_settlement = _finance_classification._classify_before_actual_settlement
+_classify_payable_record = _finance_classification._classify_payable_record
+_classify_final_detail_record = _finance_classification._classify_final_detail_record
+_payable_layout = _finance_classification._payable_layout
+_final_detail_layout = _finance_classification._final_detail_layout
+_resolve_unit_budget_schedule = _finance_classification._resolve_unit_budget_schedule
+_build_final_detail_classification_index = _finance_classification._build_final_detail_classification_index
+_apply_exp_restore_overrides = _finance_classification._apply_exp_restore_overrides
+_merge_restore_extra = _finance_classification._merge_restore_extra
+_build_classification_counts = _finance_classification._build_classification_counts
+_compute_cross_sheet_classifications = _finance_classification._compute_cross_sheet_classifications
+_compute_payable_classifications = _finance_classification._compute_payable_classifications
+_compute_payable_classifications_initial = _finance_classification._compute_payable_classifications_initial
+_compute_final_detail_classifications = _finance_classification._compute_final_detail_classifications
+_compute_final_detail_classifications_initial = _finance_classification._compute_final_detail_classifications_initial
+
+
+def _values_equal(left: Any, right: Any, tol: float = 1e-9) -> bool:
+    ln = _to_float(left)
+    rn = _to_float(right)
+    if ln is not None and rn is not None:
+        return abs(ln - rn) <= tol
+    return _safe_string(left) == _safe_string(right)
+
+
+def _chunked(items: Sequence[dict], size: int) -> Iterable[Sequence[dict]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _contiguous_segments(indices: List[int]) -> List[Tuple[int, int]]:
+    if not indices:
+        return []
+    sorted_idx = sorted(set(indices))
+    segments: List[Tuple[int, int]] = []
+    start = sorted_idx[0]
+    prev = sorted_idx[0]
+    for idx in sorted_idx[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        segments.append((start, prev))
+        start = idx
+        prev = idx
+    segments.append((start, prev))
+    return segments
+
+
+def _ensure_local_store() -> None:
+    DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _slugify_sheet_name(sheet: str) -> str:
+    out = []
+    for ch in sheet:
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out)[:80] or "sheet"
+
+
+def _draft_file(sheet: str) -> Path:
+    return DRAFT_DIR / f"{_slugify_sheet_name(sheet)}.pkl"
+
+
+def save_local_draft(sheet: str, df: pd.DataFrame) -> None:
+    _ensure_local_store()
+    df.to_pickle(_draft_file(sheet))
+
+
+def load_local_draft(sheet: str) -> pd.DataFrame | None:
+    path = _draft_file(sheet)
+    if not path.exists():
+        return None
+    try:
+        return pd.read_pickle(path)
+    except Exception:
+        return None
+
+
+def clear_local_drafts() -> None:
+    if not DRAFT_DIR.exists():
+        return
+    for file in DRAFT_DIR.glob("*.pkl"):
+        file.unlink(missing_ok=True)
+
+
+def save_local_cloud_snapshot(
+    spreadsheet_id: str,
+    cloud_map: Mapping[str, pd.DataFrame],
+    formula_lookup_map: Mapping[str, Dict[Tuple[int, str], str]],
+    cloud_meta: Mapping[str, Any],
+) -> None:
+    _ensure_local_store()
+    payload = {
+        "spreadsheet_id": spreadsheet_id,
+        "cloud_map": dict(cloud_map),
+        "formula_lookup_map": dict(formula_lookup_map),
+        "cloud_meta": dict(cloud_meta),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp = CLOUD_SNAPSHOT_FILE.with_suffix(".tmp")
+    with tmp.open("wb") as fp:
+        pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(CLOUD_SNAPSHOT_FILE)
+
+
+def load_local_cloud_snapshot(
+    spreadsheet_id: str,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[Tuple[int, str], str]], Dict[str, Any]] | None:
+    if not CLOUD_SNAPSHOT_FILE.exists():
+        return None
+    try:
+        with CLOUD_SNAPSHOT_FILE.open("rb") as fp:
+            payload = pickle.load(fp)
+    except Exception:
+        return None
+
+    if not isinstance(payload, Mapping):
+        return None
+    if _safe_string(payload.get("spreadsheet_id")) != _safe_string(spreadsheet_id):
+        return None
+
+    cloud_map = payload.get("cloud_map")
+    formula_lookup_map = payload.get("formula_lookup_map")
+    cloud_meta = payload.get("cloud_meta")
+    if not isinstance(cloud_map, Mapping) or not isinstance(formula_lookup_map, Mapping) or not isinstance(cloud_meta, Mapping):
+        return None
+    meta = dict(cloud_meta)
+    meta["snapshot_source"] = "local"
+    meta["snapshot_saved_at"] = _safe_string(payload.get("saved_at"))
+    return dict(cloud_map), dict(formula_lookup_map), meta
+
+
+def clear_local_cloud_snapshot() -> None:
+    CLOUD_SNAPSHOT_FILE.unlink(missing_ok=True)
+
+
+def load_rule_id_hit_rate_baseline() -> Dict[str, float]:
+    if not RULE_ID_HIT_RATE_BASELINE_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(RULE_ID_HIT_RATE_BASELINE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    if isinstance(payload, Mapping):
+        candidate = payload.get("rule_rates", payload)
+    else:
+        candidate = {}
+
+    if not isinstance(candidate, Mapping):
+        return {}
+
+    baseline: Dict[str, float] = {}
+    for rule_id, rate in candidate.items():
+        key = _safe_string(rule_id)
+        if not key:
+            continue
+        try:
+            numeric_rate = float(rate)
+        except Exception:
+            continue
+        if 0.0 <= numeric_rate <= 1.0:
+            baseline[key] = numeric_rate
+    return baseline
+
+
+def append_audit_log(operator: str, summary: str, details: Sequence[str]) -> None:
+    _ensure_local_store()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"[{now}] operator={operator} | {summary}"]
+    lines.extend([f"  - {line}" for line in details])
+    AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_LOG_FILE.open("a", encoding="utf-8") as fp:
+        fp.write("\n".join(lines) + "\n")
+
+
+def _get_service_account_info() -> Dict[str, Any]:
+    secrets = _safe_secrets()
+
+    if "gcp_service_account" in secrets:
+        return _to_plain_dict(dict(secrets["gcp_service_account"]))
+
+    keys = [
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+        "universe_domain",
+    ]
+    if all(key in secrets for key in keys[:10]):
+        return {key: _get_secret(key) for key in keys if key in secrets}
+
+    fallback_file = str(
+        _get_secret(
+            "SERVICE_ACCOUNT_FILE",
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS", DEFAULT_SERVICE_ACCOUNT_FILE),
+        )
+    ).strip()
+    file_path = Path(fallback_file)
+    if file_path.exists():
+        return json.loads(file_path.read_text(encoding="utf-8"))
+
+    raise RuntimeError(
+        "未找到 Service Account 凭证。请配置 .streamlit/secrets.toml 的 [gcp_service_account] "
+        f"或提供 {DEFAULT_SERVICE_ACCOUNT_FILE}。"
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_sheets_service():
+    creds = Credentials.from_service_account_info(_get_service_account_info(), scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_data(spreadsheet_id: str):
+    service = get_sheets_service()
+    meta_resp = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="properties(title),sheets(properties(title,index))",
+        )
+        .execute()
+    )
+
+    sheet_map: Dict[str, pd.DataFrame] = {}
+    formula_lookup_map: Dict[str, Dict[Tuple[int, str], str]] = {}
+    sheet_order: List[str] = []
+    total_rows = 0
+
+    ordered_sheets = sorted(
+        meta_resp.get("sheets", []), key=lambda s: s.get("properties", {}).get("index", 0)
+    )
+    for sheet in ordered_sheets:
+        title = sheet.get("properties", {}).get("title", "Untitled")
+        sheet_order.append(title)
+
+    # 使用 values.batchGet 替代 includeGridData，避免大表启动卡死。
+    ranges = [_quote_sheet_name(title) for title in sheet_order]
+    display_resp = (
+        service.spreadsheets()
+        .values()
+        .batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+            majorDimension="ROWS",
+            valueRenderOption="FORMATTED_VALUE",
+        )
+        .execute()
+    )
+    display_ranges = display_resp.get("valueRanges", [])
+
+    for idx, title in enumerate(sheet_order):
+        matrix = display_ranges[idx].get("values", []) if idx < len(display_ranges) else []
+        trimmed_display, _ = _trim_display_and_formula_matrices(matrix, [])
+        df = _values_to_dataframe(trimmed_display)
+        # 公式改为按需加载当前Sheet，避免首次全量拉取过慢。
+        formula_lookup_map[title] = {}
+        sheet_map[title] = df
+        total_rows += len(df)
+
+    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    cache_version = hashlib.sha1(
+        f"{fetched_at}|{total_rows}|{','.join(sheet_order)}".encode("utf-8")
+    ).hexdigest()[:12]
+
+    metadata = {
+        "workbook_title": meta_resp.get("properties", {}).get("title", ""),
+        "fetched_at": fetched_at,
+        "cache_version": cache_version,
+        "formula_cache_mode": "lazy",
+        "sheet_order": sheet_order,
+        "sheet_count": len(sheet_order),
+        "total_rows": total_rows,
+    }
+    return sheet_map, formula_lookup_map, metadata
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sheet_formula_lookup(spreadsheet_id: str, sheet_name: str, headers: Sequence[str]):
+    service = get_sheets_service()
+    resp = (
+        service.spreadsheets()
+        .values()
+        .batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=[_quote_sheet_name(sheet_name)],
+            majorDimension="ROWS",
+            valueRenderOption="FORMULA",
+        )
+        .execute()
+    )
+    value_ranges = resp.get("valueRanges", [])
+    matrix = value_ranges[0].get("values", []) if value_ranges else []
+    return _build_formula_lookup_by_headers(headers, matrix)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_formula_lookup_bulk(
+    spreadsheet_id: str,
+    header_specs: Tuple[Tuple[str, Tuple[str, ...]], ...],
+) -> Dict[str, Dict[Tuple[int, str], str]]:
+    if not header_specs:
+        return {}
+
+    service = get_sheets_service()
+    ranges = [_quote_sheet_name(sheet_name) for sheet_name, _ in header_specs]
+    resp = (
+        service.spreadsheets()
+        .values()
+        .batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+            majorDimension="ROWS",
+            valueRenderOption="FORMULA",
+        )
+        .execute()
+    )
+    value_ranges = resp.get("valueRanges", [])
+    out: Dict[str, Dict[Tuple[int, str], str]] = {}
+    for idx, (sheet_name, headers) in enumerate(header_specs):
+        matrix = value_ranges[idx].get("values", []) if idx < len(value_ranges) else []
+        out[sheet_name] = _build_formula_lookup_by_headers(headers, matrix)
+    return out
+
+
+def ensure_uid_anchor(df: pd.DataFrame, uid_column: str) -> Tuple[pd.DataFrame, int]:
+    out = df.copy()
+    generated = 0
+
+    if uid_column not in out.columns:
+        out[uid_column] = ""
+
+    if UID_STATUS_COL not in out.columns:
+        out[UID_STATUS_COL] = ""
+
+    existing = {
+        _safe_string(v)
+        for v in out[uid_column].tolist()
+        if _safe_string(v)
+    }
+
+    for idx in out.index:
+        uid = _safe_string(out.at[idx, uid_column])
+        status = _safe_string(out.at[idx, UID_STATUS_COL])
+
+        if not uid:
+            while True:
+                candidate = f"AIWB-{uuid.uuid4().hex[:12].upper()}"
+                if candidate not in existing:
+                    existing.add(candidate)
+                    uid = candidate
+                    break
+            out.at[idx, uid_column] = uid
+            out.at[idx, UID_STATUS_COL] = UID_PENDING_VALUE
+            generated += 1
+        else:
+            if status not in (UID_PENDING_VALUE, UID_SYNCED_VALUE):
+                out.at[idx, UID_STATUS_COL] = UID_SYNCED_VALUE
+
+    return out, generated
+
+
+def mark_uid_synced(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if UID_STATUS_COL in out.columns:
+        out[UID_STATUS_COL] = out[UID_STATUS_COL].astype("string").replace(UID_PENDING_VALUE, UID_SYNCED_VALUE)
+    return out
+
+
+def apply_shadow_logic(
+    df: pd.DataFrame,
+    revenue_col: str,
+    cost_col: str,
+    profit_col: str,
+    tax_rate_col: str,
+    tax_col: str,
+    tolerance: float = 0.01,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    if SHADOW_CONFLICT_COL not in out.columns:
+        out[SHADOW_CONFLICT_COL] = ""
+
+    out[SHADOW_PY_PROFIT_COL] = pd.NA
+    out[SHADOW_PY_TAX_COL] = pd.NA
+
+    required = [revenue_col, cost_col, profit_col, tax_rate_col, tax_col]
+    if any(col not in out.columns for col in required):
+        out[SHADOW_CONFLICT_COL] = ""
+        return out
+
+    revenue = pd.to_numeric(out[revenue_col], errors="coerce")
+    cost = pd.to_numeric(out[cost_col], errors="coerce")
+    sheet_profit = pd.to_numeric(out[profit_col], errors="coerce")
+
+    tax_rate = pd.to_numeric(out[tax_rate_col], errors="coerce").fillna(0)
+    tax_rate = tax_rate.where(tax_rate <= 1, tax_rate / 100)
+
+    py_profit = revenue.fillna(0) - cost.fillna(0)
+    py_tax = py_profit.clip(lower=0) * tax_rate
+    sheet_tax = pd.to_numeric(out[tax_col], errors="coerce")
+
+    out[SHADOW_PY_PROFIT_COL] = py_profit.round(6)
+    out[SHADOW_PY_TAX_COL] = py_tax.round(6)
+
+    conflict_mask = (
+        (sheet_profit - py_profit).abs().fillna(0) > tolerance
+    ) | ((sheet_tax - py_tax).abs().fillna(0) > tolerance)
+
+    out[SHADOW_CONFLICT_COL] = conflict_mask.map(lambda x: "冲突" if x else "")
+    return out
+
+
+def calculate_diff(
+    original_df: pd.DataFrame,
+    edited_df: pd.DataFrame,
+    uid_column: str,
+    amount_column: str,
+) -> Dict[str, Any]:
+    original = _cloud_view(original_df)
+    edited = _cloud_view(edited_df)
+
+    if uid_column not in original.columns or uid_column not in edited.columns:
+        raise ValueError(f"缺少主键列 {uid_column}")
+
+    original_uid = original[uid_column].astype("string").fillna("").str.strip()
+    edited_uid = edited[uid_column].astype("string").fillna("").str.strip()
+
+    duplicate_uid_count = int(edited_uid[edited_uid != ""].duplicated().sum())
+    invalid_uid_rows = int((edited_uid == "").sum())
+
+    original_idx = original.copy()
+    edited_idx = edited.copy()
+    original_idx[uid_column] = original_uid
+    edited_idx[uid_column] = edited_uid
+    original_idx = original_idx[original_idx[uid_column] != ""].drop_duplicates(uid_column, keep="first")
+    edited_idx = edited_idx[edited_idx[uid_column] != ""].drop_duplicates(uid_column, keep="first")
+
+    original_set = set(original_idx[uid_column].tolist())
+    edited_set = set(edited_idx[uid_column].tolist())
+
+    added = edited_set - original_set
+    deleted = original_set - edited_set
+    common = sorted(original_set & edited_set)
+
+    compare_cols = [c for c in sorted(set(original_idx.columns) | set(edited_idx.columns)) if c != uid_column]
+
+    modified_rows = 0
+    if common:
+        o = original_idx.set_index(uid_column).reindex(common).reindex(columns=compare_cols).astype("string").fillna("").apply(lambda s: s.str.strip())
+        e = edited_idx.set_index(uid_column).reindex(common).reindex(columns=compare_cols).astype("string").fillna("").apply(lambda s: s.str.strip())
+        modified_rows = int((o != e).any(axis=1).sum())
+
+    before_amount = float(pd.to_numeric(original.get(amount_column, pd.Series(dtype="float64")), errors="coerce").fillna(0).sum())
+    after_amount = float(pd.to_numeric(edited.get(amount_column, pd.Series(dtype="float64")), errors="coerce").fillna(0).sum())
+
+    return {
+        "added_rows": len(added),
+        "modified_rows": modified_rows,
+        "deleted_rows": len(deleted),
+        "amount_delta": after_amount - before_amount,
+        "before_amount_total": before_amount,
+        "after_amount_total": after_amount,
+        "invalid_uid_rows": invalid_uid_rows,
+        "duplicate_uid_count": duplicate_uid_count,
+        "original_rows": len(original),
+        "edited_rows": len(edited),
+    }
+
+
+def build_sheet_delta_payload(
+    sheet_name: str,
+    original_df: pd.DataFrame,
+    edited_df: pd.DataFrame,
+    uid_column: str,
+    amount_column: str,
+    entity_column: str,
+) -> Dict[str, Any]:
+    original = _cloud_view(original_df)
+    edited = _cloud_view(edited_df)
+
+    if uid_column not in edited.columns:
+        raise ValueError(f"工作表 {sheet_name} 缺少主键列 {uid_column}")
+
+    uid_series = edited[uid_column].astype("string").fillna("").str.strip()
+    dup_count = int(uid_series[uid_series != ""].duplicated().sum())
+    if dup_count > 0:
+        raise ValueError(f"工作表 {sheet_name} 存在 {dup_count} 个重复 {uid_column}，请先修复")
+
+    headers = list(edited.columns)
+    col_index = {col: idx + 1 for idx, col in enumerate(headers)}
+    uid_col_index = col_index[uid_column]
+
+    original_uid_series = (
+        original[uid_column].astype("string").fillna("").str.strip()
+        if uid_column in original.columns
+        else pd.Series([""] * len(original))
+    )
+
+    original_row_map: Dict[str, Tuple[int, pd.Series]] = {}
+    for pos, uid in enumerate(original_uid_series.tolist()):
+        if uid and uid not in original_row_map:
+            original_row_map[uid] = (pos + 2, original.iloc[pos])
+
+    pending_col = edited_df.get(UID_STATUS_COL, pd.Series([""] * len(edited_df)))
+
+    updates: List[dict] = []
+    changed_rows = 0
+    changed_cells = 0
+    new_rows = 0
+    pending_uid_updates = 0
+
+    amount_delta_total = 0.0
+    entity_amount_delta: Dict[str, float] = {}
+
+    append_row_num = len(original) + 2
+    seen_uid: set[str] = set()
+
+    for idx in range(len(edited)):
+        row = edited.iloc[idx]
+        uid = _safe_string(row.get(uid_column, ""))
+        if not uid:
+            continue
+        seen_uid.add(uid)
+
+        force_uid_sync = _safe_string(pending_col.iloc[idx]) == UID_PENDING_VALUE
+
+        if uid in original_row_map:
+            row_num, old_row = original_row_map[uid]
+            changed_idx: List[int] = []
+            value_by_index: Dict[int, Any] = {}
+
+            for col in headers:
+                new_val = row.get(col, "")
+                old_val = old_row[col] if col in original.columns else ""
+                if not _values_equal(old_val, new_val):
+                    col_i = col_index[col]
+                    changed_idx.append(col_i)
+                    value_by_index[col_i] = _serialize_for_api(new_val)
+
+                    if col == amount_column:
+                        old_num = _to_float(old_val) or 0.0
+                        new_num = _to_float(new_val) or 0.0
+                        delta = new_num - old_num
+                        amount_delta_total += delta
+                        entity = _safe_string(row.get(entity_column, "")) or "(未分类)"
+                        entity_amount_delta[entity] = entity_amount_delta.get(entity, 0.0) + delta
+
+            if force_uid_sync and uid_col_index not in value_by_index:
+                changed_idx.append(uid_col_index)
+                value_by_index[uid_col_index] = uid
+                pending_uid_updates += 1
+
+            if changed_idx:
+                changed_rows += 1
+                for start_i, end_i in _contiguous_segments(changed_idx):
+                    values = [
+                        value_by_index.get(col_i, _serialize_for_api(row.iloc[col_i - 1]))
+                        for col_i in range(start_i, end_i + 1)
+                    ]
+                    updates.append(
+                        {
+                            "range": (
+                                f"{_quote_sheet_name(sheet_name)}!"
+                                f"{_column_number_to_a1(start_i)}{row_num}:"
+                                f"{_column_number_to_a1(end_i)}{row_num}"
+                            ),
+                            "majorDimension": "ROWS",
+                            "values": [values],
+                        }
+                    )
+                    changed_cells += (end_i - start_i + 1)
+
+        else:
+            row_num = append_row_num
+            append_row_num += 1
+            new_rows += 1
+            changed_rows += 1
+
+            row_values = [_serialize_for_api(row.get(col, "")) for col in headers]
+            updates.append(
+                {
+                    "range": (
+                        f"{_quote_sheet_name(sheet_name)}!"
+                        f"A{row_num}:{_column_number_to_a1(len(headers))}{row_num}"
+                    ),
+                    "majorDimension": "ROWS",
+                    "values": [row_values],
+                }
+            )
+            changed_cells += len(headers)
+
+            if amount_column in headers:
+                delta = _to_float(row.get(amount_column, "")) or 0.0
+                amount_delta_total += delta
+                entity = _safe_string(row.get(entity_column, "")) or "(未分类)"
+                entity_amount_delta[entity] = entity_amount_delta.get(entity, 0.0) + delta
+
+    deleted_rows = len(set(original_row_map.keys()) - seen_uid)
+
+    return {
+        "sheet": sheet_name,
+        "updates": updates,
+        "stats": {
+            "changed_rows": changed_rows,
+            "changed_cells": changed_cells,
+            "new_rows": new_rows,
+            "deleted_rows": deleted_rows,
+            "pending_uid_updates": pending_uid_updates,
+            "amount_delta": amount_delta_total,
+            "entity_amount_delta": entity_amount_delta,
+        },
+    }
+
+
+def build_commit_bundle(
+    original_map: Mapping[str, pd.DataFrame],
+    edited_map: Mapping[str, pd.DataFrame],
+    target_sheets: Sequence[str],
+    uid_column: str,
+    amount_column: str,
+    entity_column: str,
+) -> Dict[str, Any]:
+    all_updates: List[dict] = []
+    per_sheet: List[Dict[str, Any]] = []
+
+    summary = {
+        "target_sheet_count": len(target_sheets),
+        "changed_rows": 0,
+        "changed_cells": 0,
+        "new_rows": 0,
+        "deleted_rows": 0,
+        "pending_uid_updates": 0,
+        "amount_delta": 0.0,
+    }
+
+    audit_lines: List[str] = []
+
+    for sheet in target_sheets:
+        payload = build_sheet_delta_payload(
+            sheet_name=sheet,
+            original_df=original_map.get(sheet, pd.DataFrame()),
+            edited_df=edited_map.get(sheet, pd.DataFrame()),
+            uid_column=uid_column,
+            amount_column=amount_column,
+            entity_column=entity_column,
+        )
+        stats = payload["stats"]
+        updates = payload["updates"]
+
+        per_sheet.append({"sheet": sheet, **stats, "update_count": len(updates)})
+        all_updates.extend(updates)
+
+        summary["changed_rows"] += int(stats["changed_rows"])
+        summary["changed_cells"] += int(stats["changed_cells"])
+        summary["new_rows"] += int(stats["new_rows"])
+        summary["deleted_rows"] += int(stats["deleted_rows"])
+        summary["pending_uid_updates"] += int(stats["pending_uid_updates"])
+        summary["amount_delta"] += float(stats["amount_delta"])
+
+        entity_delta: Dict[str, float] = stats["entity_amount_delta"]
+        if entity_delta:
+            for entity, delta in sorted(entity_delta.items(), key=lambda x: abs(x[1]), reverse=True):
+                audit_lines.append(
+                    f"实体 {entity}：金额差异合计 {delta:,.2f}（sheet={sheet}）"
+                )
+        else:
+            audit_lines.append(
+                f"sheet={sheet}：变更 {stats['changed_rows']} 行，新增 {stats['new_rows']} 行"
+            )
+
+    return {
+        "updates": all_updates,
+        "summary": summary,
+        "per_sheet": per_sheet,
+        "audit_lines": audit_lines,
+    }
+
+
+def _sync_unit_master_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    out = {k: v.copy() for k, v in sheet_map.items()}
+    wsb_key = _sheet_key(out, "Unit Budget")
+    layout = _unit_budget_layout(out[wsb_key])
+    wsb = _ensure_column_count(out[wsb_key], layout["unit_header_start"])
+    units: set[str] = set()
+
+    # 继承 Unit Budget 第1行 Unit 列区以后已有 Unit Header。
+    for col_i in range(layout["unit_header_start"], len(wsb.columns) + 1):
+        h = _safe_string(wsb.columns[col_i - 1])
+        if h and h.upper() != "UNIT CODE":
+            units.add(h)
+
+    # 追加来自其他表指定列的 Unit。
+    scan_specs = [
+        ("Payable", 38),
+        ("Final Detail", 21),
+        ("Draw request report", 8),
+    ]
+    for name, col in scan_specs:
+        try:
+            key = _sheet_key(out, name)
+        except KeyError:
+            continue
+        src = _ensure_column_count(out[key], col)
+        for r in range(0, len(src)):
+            val = _safe_string(_get_cell(src, r, col))
+            if val:
+                units.add(val)
+
+    sorted_units = sorted(units)
+
+    # 清空 Unit Budget B3:B（按现有行范围清空）
+    if len(wsb) >= 2:
+        for r in range(1, len(wsb)):
+            wsb = _set_cell(wsb, r, 2, "")
+
+    # 写回 B3 起
+    for idx, unit in enumerate(sorted_units):
+        row_idx = 1 + idx  # sheet row3 => df idx1
+        wsb = _set_cell(wsb, row_idx, 2, unit)
+
+    out[wsb_key] = wsb
+    return out, {"unit_count": len(sorted_units)}
+
+
+def _calculate_unit_budget_cd_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    out = {k: v.copy() for k, v in sheet_map.items()}
+    wsb_key = _sheet_key(out, "Unit Budget")
+    wsb = out[wsb_key].copy()
+    layout = _unit_budget_layout(wsb)
+
+    row_count = len(wsb)
+    col_count = len(wsb.columns)
+    if row_count == 0:
+        return out, {"computed_rows": 0}
+
+    # row1(Unit 列区以后)作为 Unit 对应列头。
+    unit_col_map: Dict[str, int] = {}
+    for j in range(layout["unit_header_start"], col_count + 1):
+        h = _safe_string(wsb.columns[j - 1])
+        if h:
+            unit_col_map[h] = j
+
+    results: List[Tuple[Any, Any]] = []
+
+    # B3:B(last) -> df idx 1..end
+    for i in range(1, row_count):
+        u_code = _safe_string(_get_cell(wsb, i, 2))
+        sum_c = 0.0
+        sum_d = 0.0
+
+        target_col = unit_col_map.get(u_code)
+        if u_code and target_col is not None:
+            # 所有数据行从第2行开始 -> df idx 0..end
+            for r in range(0, row_count):
+                val_k = _to_float(_get_cell(wsb, r, layout["gmp"]))
+                val_m = _safe_string(_get_cell(wsb, r, layout["wip"]))
+                cell_value = _safe_number(_get_cell(wsb, r, target_col))
+
+                if val_k is not None and abs(val_k - 1) < 1e-9:
+                    sum_c += cell_value
+                if val_m.endswith("3"):
+                    sum_d += cell_value
+
+        c_val = "" if abs(sum_c) < 1e-12 else sum_c
+        d_val = "" if abs(sum_d) < 1e-12 else sum_d
+        results.append((c_val, d_val))
+
+    # 写回 C3:D(last) -> df idx 1..end, col3/4
+    for offset, (c_val, d_val) in enumerate(results):
+        row_idx = 1 + offset
+        wsb = _set_cell(wsb, row_idx, 3, c_val)
+        wsb = _set_cell(wsb, row_idx, 4, d_val)
+
+    out[wsb_key] = wsb
+    return out, {"computed_rows": len(results)}
+
+
+def _build_final_detail_summary_rows(
+    units: Sequence[str],
+    row_unit_codes: Sequence[str],
+    row_d_values: Sequence[Any],
+    row_c_values: Sequence[Any],
+    row_p_values: Sequence[Any],
+    row_t_texts: Sequence[str],
+    row_v_texts: Sequence[str],
+) -> List[List[Any]]:
+    summary_by_unit: Dict[str, List[float]] = {}
+    row_count = min(
+        len(row_unit_codes),
+        len(row_d_values),
+        len(row_c_values),
+        len(row_p_values),
+        len(row_t_texts),
+        len(row_v_texts),
+    )
+
+    for i in range(row_count):
+        unit_code = _safe_string(row_unit_codes[i])
+        if not unit_code:
+            continue
+        bucket = summary_by_unit.setdefault(unit_code, [0.0, 0.0, 0.0])
+        bucket[0] += _safe_number(row_d_values[i])
+
+        c_flag = _to_float(row_c_values[i])
+        p_val = _safe_number(row_p_values[i])
+        if c_flag is not None and abs(c_flag - 1) < 1e-9:
+            bucket[1] += p_val
+        if not _safe_string(row_t_texts[i]) and _safe_string(row_v_texts[i]) != "Sharing":
+            bucket[2] += p_val
+
+    summary_rows: List[List[Any]] = []
+    for unit_code in units:
+        if not unit_code:
+            summary_rows.append(["", "", "", ""])
+            continue
+        sum_f, sum_g, sum_h = summary_by_unit.get(unit_code, [0.0, 0.0, 0.0])
+        summary_rows.append(
+            [
+                unit_code,
+                "" if abs(sum_f) < 1e-12 else sum_f,
+                "" if abs(sum_g) < 1e-12 else sum_g,
+                "" if abs(sum_h) < 1e-12 else sum_h,
+            ]
+        )
+    return summary_rows
+
+
+def _collect_rule_ids_from_sheet_map(
+    sheet_map: Mapping[str, pd.DataFrame],
+    target_sheets: Sequence[str] = ("Payable", "Final Detail"),
+) -> List[str]:
+    rule_ids: List[str] = []
+    for sheet_name in target_sheets:
+        try:
+            key = _sheet_key(sheet_map, sheet_name)
+        except KeyError:
+            continue
+        df = sheet_map.get(key, pd.DataFrame())
+        if len(df.columns) < 2:
+            continue
+        for value in df.iloc[:, 1].tolist():
+            text = _safe_string(value)
+            if text:
+                rule_ids.append(text)
+    return rule_ids
+
+
+def _detect_rule_id_hit_rate_alerts(
+    current_rule_ids: Sequence[str],
+    historical_avg_rates: Mapping[str, float],
+    deviation_threshold: float = DEFAULT_RULE_ID_HIT_RATE_ALERT_THRESHOLD,
+) -> List[Dict[str, Any]]:
+    cleaned_rule_ids = [_safe_string(rule_id) for rule_id in current_rule_ids if _safe_string(rule_id)]
+    total = len(cleaned_rule_ids)
+    if total <= 0:
+        return []
+
+    counts: Dict[str, int] = {}
+    for rule_id in cleaned_rule_ids:
+        counts[rule_id] = counts.get(rule_id, 0) + 1
+
+    alerts: List[Dict[str, Any]] = []
+    for rule_id, historical_avg_rate in historical_avg_rates.items():
+        key = _safe_string(rule_id)
+        if not key:
+            continue
+        try:
+            historical_rate = float(historical_avg_rate)
+        except Exception:
+            continue
+        if historical_rate < 0.0 or historical_rate > 1.0:
+            continue
+
+        current_rate = counts.get(key, 0) / total
+        deviation = current_rate - historical_rate
+        if abs(deviation) <= float(deviation_threshold):
+            continue
+
+        alerts.append(
+            {
+                "rule_id": key,
+                "current_rate": current_rate,
+                "historical_avg_rate": historical_rate,
+                "deviation": deviation,
+                "current_count": counts.get(key, 0),
+                "total_count": total,
+            }
+        )
+
+    alerts.sort(key=lambda item: abs(float(item["deviation"])), reverse=True)
+    return alerts
+
+
+def _process_payable_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    out = {k: v.copy() for k, v in sheet_map.items()}
+    wsp_key = _sheet_key(out, "Payable")
+    wss_key = _sheet_key(out, "Scoping")
+    wsf_key = _sheet_key(out, "Final Detail")
+    wsb_key = _sheet_key(out, "Unit Budget")
+
+    wsp = _ensure_column_count(out[wsp_key], 43)
+    wss = _ensure_column_count(out[wss_key], 10)
+    wsf = _ensure_column_count(out[wsf_key], 30)
+    wsb = _ensure_column_count(out[wsb_key], 16)
+
+    scoping_rows = len(wss)
+    mapping = {
+        "Wan Bridge Development LLC": "WBD",
+        "Wan Pacific Real Estate Development LLC": "WPRED",
+        "WB Home LLC": "WBH",
+        "WB Lago Mar Pod 8 Land LLC": "WLM",
+    }
+    categories, classification_extra = _compute_payable_classifications(out)
+    if len(categories) == len(wsp):
+        first_col = wsp.columns[0]
+        wsp[first_col] = categories
+    rule_ids = list(classification_extra.get("rule_ids", []))
+    if len(rule_ids) == len(wsp) and len(wsp.columns) >= 2:
+        second_col = wsp.columns[1]
+        wsp[second_col] = rule_ids
+
+    # 预聚合：code -> (sumE,sumF,sumG) 对应 Scoping C:H 中 E/F/H
+    scope_agg: Dict[int, Tuple[float, float, float]] = {}
+    for r in range(scoping_rows):
+        code = _to_float(_get_cell(wss, r, 3))
+        if code is None:
+            continue
+        key = int(code)
+        cur = scope_agg.get(key, (0.0, 0.0, 0.0))
+        e = cur[0] + _safe_number(_get_cell(wss, r, 5))
+        f = cur[1] + _safe_number(_get_cell(wss, r, 6))
+        g = cur[2] + _safe_number(_get_cell(wss, r, 8))
+        scope_agg[key] = (e, f, g)
+
+    write_rows: List[List[Any]] = []
+    for i in range(len(wsp)):
+        o_text = _safe_string(_get_cell(wsp, i, 15))
+        v_text = _safe_string(_get_cell(wsp, i, 22))
+        am_text = _safe_string(_get_cell(wsp, i, 39))
+
+        j_val = _extract_tail_str(v_text, 4)
+        d_val = _extract_tail_int(am_text, 3)
+        c_val = mapping.get(o_text, "")
+
+        s_e: Any = ""
+        s_f: Any = ""
+        s_g: Any = ""
+        if d_val is not None:
+            sums = scope_agg.get(int(d_val), (0.0, 0.0, 0.0))
+            s_e = "" if abs(sums[0]) < 1e-12 else sums[0]
+            s_f = "" if abs(sums[1]) < 1e-12 else sums[1]
+            s_g = "" if abs(sums[2]) < 1e-12 else sums[2]
+
+        write_rows.append([c_val, d_val if d_val is not None else "", s_e, s_f, s_g, "", "", j_val])
+
+    payable_write_cols = list(wsp.columns[2:10])
+    if len(write_rows) == len(wsp) and len(payable_write_cols) == 8:
+        for col in payable_write_cols:
+            if str(wsp[col].dtype) != "object":
+                wsp[col] = wsp[col].astype(object)
+        wsp.loc[:, payable_write_cols] = pd.DataFrame(write_rows, index=wsp.index, columns=payable_write_cols)
+
+    out[wsp_key] = wsp
+    return out, classification_extra
+
+
+def _process_final_detail_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    out = {k: v.copy() for k, v in sheet_map.items()}
+    wsf_key = _sheet_key(out, "Final Detail")
+    wss_key = _sheet_key(out, "Scoping")
+    wsb_key = _sheet_key(out, "Unit Budget")
+
+    wsf = _ensure_column_count(out[wsf_key], 30)
+    wss = _ensure_column_count(out[wss_key], 10)
+    wsb = _ensure_column_count(out[wsb_key], 16)
+    categories, classification_extra = _compute_final_detail_classifications(out)
+    if len(categories) == len(wsf):
+        first_col = wsf.columns[0]
+        wsf[first_col] = categories
+    rule_ids = list(classification_extra.get("rule_ids", []))
+    if len(rule_ids) == len(wsf) and len(wsf.columns) >= 2:
+        second_col = wsf.columns[1]
+        wsf[second_col] = rule_ids
+
+    # Scoping C:E 聚合到 code -> sum(E)
+    scope_sum_c: Dict[int, float] = {}
+    scope_codes = _column_values_1based(wss, 3)
+    scope_amounts = _column_values_1based(wss, 5)
+    for r in range(len(wss)):
+        code = _to_float(scope_codes[r])
+        if code is None:
+            continue
+        key = int(code)
+        scope_sum_c[key] = scope_sum_c.get(key, 0.0) + _safe_number(scope_amounts[r])
+
+    unit_seen: set[str] = set()
+    z_texts = [_safe_string(value) for value in _column_values_1based(wsf, 26)]
+    o_values = _column_values_1based(wsf, 15)
+    t_values = _column_values_1based(wsf, 20)
+    u_keys = [_safe_string(value) for value in _column_values_1based(wsf, 21)]
+
+    # Row-level C:K. Column B is reserved for Rule_ID in this phase.
+    row_level_write_rows: List[List[Any]] = []
+    for i in range(len(wsf)):
+        z_text = z_texts[i]
+        o_val = o_values[i]
+        t_val = t_values[i]
+        u_key = u_keys[i]
+
+        b_val = _extract_tail_int(z_text, 3)
+        k_val = _extract_year(t_val)
+
+        c_val: Any = ""
+        if b_val is not None:
+            s = scope_sum_c.get(int(b_val), 0.0)
+            c_val = "" if abs(s) < 1e-12 else s
+
+        d_val: Any = ""
+        if u_key and u_key not in unit_seen:
+            y = _extract_year(o_val)
+            d_val = y if y != "" else ""
+            unit_seen.add(u_key)
+
+        row_level_write_rows.append(
+            [
+                c_val,
+                d_val,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                k_val if k_val != "" else "",
+            ]
+        )
+
+    final_detail_row_cols = list(wsf.columns[2:11])
+    if len(row_level_write_rows) == len(wsf) and len(final_detail_row_cols) == 9:
+        for col in final_detail_row_cols:
+            if str(wsf[col].dtype) != "object":
+                wsf[col] = wsf[col].astype(object)
+        wsf.loc[:, final_detail_row_cols] = pd.DataFrame(
+            row_level_write_rows,
+            index=wsf.index,
+            columns=final_detail_row_cols,
+        )
+
+    # Summary block E:H driven by Unit Budget B3:B
+    # 对应 GAS: units from B3:B(lastRowB), fTable from B:V
+    units = [_safe_string(value) for value in _column_values_1based(wsb, 2)[1:]]
+    summary_rows = _build_final_detail_summary_rows(
+        units=units,
+        row_unit_codes=u_keys,
+        row_d_values=_column_values_1based(wsf, 4),
+        row_c_values=_column_values_1based(wsf, 3),
+        row_p_values=_column_values_1based(wsf, 16),
+        row_t_texts=[_safe_string(value) for value in _column_values_1based(wsf, 20)],
+        row_v_texts=[_safe_string(value) for value in _column_values_1based(wsf, 22)],
+    )
+
+    summary_write_cols = list(wsf.columns[4:8])
+    if len(summary_rows) == len(units) and len(summary_write_cols) == 4:
+        summary_df = pd.DataFrame(summary_rows, columns=summary_write_cols, index=range(len(units)))
+        if len(wsf) < len(summary_df):
+            wsf = _ensure_row_count(wsf, len(summary_df))
+        for col in summary_write_cols:
+            if str(wsf[col].dtype) != "object":
+                wsf[col] = wsf[col].astype(object)
+        wsf.loc[summary_df.index, summary_write_cols] = summary_df
+
+    if len(rule_ids) == len(wsf) and len(wsf.columns) >= 2:
+        second_col = wsf.columns[1]
+        wsf[second_col] = rule_ids
+
+    out[wsf_key] = wsf
+    final_extra = dict(classification_extra)
+    final_extra["summary_rows"] = len(units)
+    return out, final_extra
+
+
+def run_apps_shadow_pipeline(
+    edited_map: Mapping[str, pd.DataFrame],
+    uid_column: str,
+    shadow_cfg: Mapping[str, Any],
+) -> Tuple[Dict[str, pd.DataFrame], List[Dict[str, Any]], List[str]]:
+    working = {k: v.copy() for k, v in edited_map.items()}
+    reports: List[Dict[str, Any]] = []
+    audit_lines: List[str] = []
+
+    def apply_and_report(
+        step_name: str,
+        handler,
+        focus_sheets: Sequence[str],
+    ) -> None:
+        nonlocal working
+        resolved_focus: List[str] = []
+        for s in focus_sheets:
+            try:
+                resolved_focus.append(_sheet_key(working, s))
+            except KeyError:
+                continue
+        before = {k: working[k].copy() for k in resolved_focus if k in working}
+        working, extra = handler(working)
+        changed_rows = 0
+        changed_cells = 0
+        touched: List[str] = []
+        for sheet in resolved_focus:
+            if sheet not in working or sheet not in before:
+                continue
+            stats = _sheet_delta_stats(before[sheet], working[sheet])
+            if stats["changed_cells"] > 0:
+                touched.append(sheet)
+                changed_rows += stats["changed_rows"]
+                changed_cells += stats["changed_cells"]
+        reports.append(
+            {
+                "step": step_name,
+                "sheets": "、".join(touched) if touched else "无",
+                "changed_rows": changed_rows,
+                "changed_cells": changed_cells,
+                "extra": extra,
+            }
+        )
+        audit_lines.append(
+            f"{step_name}: sheets={reports[-1]['sheets']}, rows={changed_rows}, cells={changed_cells}, extra={extra}"
+        )
+
+    def apply_from_source_and_report(
+        step_name: str,
+        handler,
+        focus_sheets: Sequence[str],
+        source_map: Mapping[str, pd.DataFrame],
+    ) -> None:
+        nonlocal working
+        resolved_focus: List[str] = []
+        for s in focus_sheets:
+            try:
+                resolved_focus.append(_sheet_key(working, s))
+            except KeyError:
+                continue
+        before = {k: working[k].copy() for k in resolved_focus if k in working}
+        source_copy = {k: v.copy() for k, v in source_map.items()}
+        processed_map, extra = handler(source_copy)
+        for sheet in resolved_focus:
+            if sheet in processed_map:
+                working[sheet] = processed_map[sheet]
+
+        changed_rows = 0
+        changed_cells = 0
+        touched: List[str] = []
+        for sheet in resolved_focus:
+            if sheet not in working or sheet not in before:
+                continue
+            stats = _sheet_delta_stats(before[sheet], working[sheet])
+            if stats["changed_cells"] > 0:
+                touched.append(sheet)
+                changed_rows += stats["changed_rows"]
+                changed_cells += stats["changed_cells"]
+        reports.append(
+            {
+                "step": step_name,
+                "sheets": "、".join(touched) if touched else "无",
+                "changed_rows": changed_rows,
+                "changed_cells": changed_cells,
+                "extra": extra,
+            }
+        )
+        audit_lines.append(
+            f"{step_name}: sheets={reports[-1]['sheets']}, rows={changed_rows}, cells={changed_cells}, extra={extra}"
+        )
+
+    apply_and_report("同步 Unit 列表(B列)", _sync_unit_master_py, ["Unit Budget"])
+    apply_and_report("计算 Unit Budget C/D", _calculate_unit_budget_cd_py, ["Unit Budget"])
+    classification_base = {k: v.copy() for k, v in working.items()}
+    apply_from_source_and_report("核算 Payable C:J", _process_payable_py, ["Payable"], classification_base)
+    apply_from_source_and_report("核算 Final Detail(B:K,E:H)", _process_final_detail_py, ["Final Detail"], classification_base)
+
+    # 每个工作表重新执行 UID 与影子逻辑，保证后续一致性检查。
+    for sheet, df in list(working.items()):
+        prepared, _ = ensure_uid_anchor(df, uid_column)
+        prepared = apply_shadow_logic(
+            prepared,
+            revenue_col=shadow_cfg["revenue_col"],
+            cost_col=shadow_cfg["cost_col"],
+            profit_col=shadow_cfg["profit_col"],
+            tax_rate_col=shadow_cfg["tax_rate_col"],
+            tax_col=shadow_cfg["tax_col"],
+            tolerance=float(shadow_cfg["tolerance"]),
+        )
+        working[sheet] = prepared
+
+    historical_rule_rates = load_rule_id_hit_rate_baseline()
+    if historical_rule_rates:
+        current_rule_ids = _collect_rule_ids_from_sheet_map(working)
+        alerts = _detect_rule_id_hit_rate_alerts(
+            current_rule_ids=current_rule_ids,
+            historical_avg_rates=historical_rule_rates,
+            deviation_threshold=DEFAULT_RULE_ID_HIT_RATE_ALERT_THRESHOLD,
+        )
+        reports.append(
+            {
+                "step": "Rule ID 异常波动预警",
+                "sheets": "Payable、Final Detail",
+                "changed_rows": 0,
+                "changed_cells": 0,
+                "extra": {
+                    "alert_count": len(alerts),
+                    "alerts": alerts,
+                    "baseline_rule_count": len(historical_rule_rates),
+                    "observed_rule_id_count": len(current_rule_ids),
+                },
+            }
+        )
+        if alerts:
+            top_alert = alerts[0]
+            audit_lines.append(
+                "Rule ID 异常波动预警: "
+                f"alert_count={len(alerts)}, "
+                f"top_rule={top_alert['rule_id']}, "
+                f"current_rate={top_alert['current_rate']:.2%}, "
+                f"historical_avg_rate={top_alert['historical_avg_rate']:.2%}, "
+                f"deviation={top_alert['deviation']:.2%}"
+            )
+        else:
+            audit_lines.append(
+                "Rule ID 异常波动预警: alert_count=0, baseline_loaded=1"
+            )
+
+    return working, reports, audit_lines
+
+
+def _safety_check(
+    service,
+    spreadsheet_id: str,
+    guard_sheet_name: str,
+    expected_first_cell: str,
+) -> None:
+    first_row_resp = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{guard_sheet_name}!1:1")
+        .execute()
+    )
+    first_row = first_row_resp.get("values", [[]])[0] if first_row_resp.get("values") else []
+    row_tokens = {str(item).strip() for item in first_row}
+
+    if expected_first_cell and expected_first_cell not in row_tokens:
+        raise RuntimeError(
+            f"安全校验失败：{guard_sheet_name} 首行未检测到 '{expected_first_cell}'，已中止写入。"
+        )
+
+
+def execute_commit(
+    spreadsheet_id: str,
+    bundle: Mapping[str, Any],
+    guard_sheet_name: str,
+    expected_first_cell: str,
+) -> Dict[str, Any]:
+    updates = list(bundle.get("updates", []))
+    if not updates:
+        return {"api_calls": 0, "updated_ranges": 0}
+
+    service = get_sheets_service()
+    _safety_check(service, spreadsheet_id, guard_sheet_name, expected_first_cell)
+
+    api_calls = 1
+    for chunk in _chunked(updates, 500):
+        (
+            service.spreadsheets()
+            .values()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": list(chunk),
+                },
+            )
+            .execute()
+        )
+        api_calls += 1
+
+    return {"api_calls": api_calls, "updated_ranges": len(updates)}
+
+
+def _normalize_label(text: Any) -> str:
+    return re.sub(r"\s+", " ", _safe_string(text)).strip().lower()
+
+
+def _grid_cell(rows: Sequence[Sequence[Any]], row_1: int, col_1: int) -> str:
+    if row_1 < 1 or row_1 > len(rows):
+        return ""
+    row = rows[row_1 - 1]
+    if col_1 < 1 or col_1 > len(row):
+        return ""
+    return _safe_string(row[col_1 - 1])
+
+
+def _find_first_row(rows: Sequence[Sequence[Any]], predicate) -> int | None:
+    for i, row in enumerate(rows, start=1):
+        if predicate(i, row):
+            return i
+    return None
+
+
+def _find_rows_by_item_label(
+    rows: Sequence[Sequence[Any]],
+    item_col_1: int = 3,
+) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+    for row_i in range(1, len(rows) + 1):
+        label = _normalize_label(_grid_cell(rows, row_i, item_col_1))
+        if not label:
+            continue
+        out.setdefault(label, []).append(row_i)
+    return out
+
+
+def _find_year_header_row_109(rows: Sequence[Sequence[Any]]) -> int | None:
+    target = [2021, 2022, 2023, 2024, 2025, 2026]
+    for row_i in range(1, len(rows) + 1):
+        vals = [_extract_year(_grid_cell(rows, row_i, col)) for col in range(6, 12)]
+        if vals == target:
+            return row_i
+    return None
+
+
+def _choose_contract_price_row(rows: Sequence[Sequence[Any]], label_rows: Dict[str, List[int]]) -> int | None:
+    rows_cp = label_rows.get("contract price", [])
+    if not rows_cp:
+        return None
+    for row_i in rows_cp:
+        if _to_float(_grid_cell(rows, row_i, 5)) is not None:
+            return row_i
+    return rows_cp[0]
+
+
+def _find_contract_price_day1_row(rows: Sequence[Sequence[Any]]) -> int | None:
+    for row_i in range(1, len(rows) + 1):
+        label = _normalize_label(_grid_cell(rows, row_i, 4))
+        if label == "contract price (day1):":
+            if _grid_cell(rows, row_i, 5) != "":
+                return row_i
+    return None
+
+
+def _find_budget_cost_row(rows: Sequence[Sequence[Any]], label_rows: Dict[str, List[int]]) -> int | None:
+    for label, row_list in label_rows.items():
+        if "budget cost" in label and "scoping" in label:
+            return row_list[0]
+    return None
+
+
+def _first_present_row(label_rows: Mapping[str, Sequence[int]], *labels: str) -> int | None:
+    for label in labels:
+        row_list = list(label_rows.get(label, []))
+        if row_list:
+            return int(row_list[0])
+    return None
+
+
+def _find_material_margin_rows_109(
+    label_rows: Dict[str, List[int]],
+    row_wbh_cogs: int | None,
+    row_wbh_inv: int | None,
+) -> Tuple[int | None, int | None]:
+    mm_rows = sorted(label_rows.get("material margin", []))
+    if not mm_rows:
+        return None, None
+
+    main_row: int | None = None
+    inv_row: int | None = None
+
+    if row_wbh_cogs is not None:
+        for r in mm_rows:
+            if r > row_wbh_cogs:
+                main_row = r
+                break
+
+    if row_wbh_inv is not None:
+        for r in mm_rows:
+            if r > row_wbh_inv:
+                inv_row = r
+                break
+
+    if main_row is None:
+        main_row = mm_rows[0]
+    if inv_row is None:
+        inv_row = mm_rows[-1] if len(mm_rows) > 1 else mm_rows[0]
+
+    return main_row, inv_row
+
+
+def _load_109_formula_dictionary(path: Path | None = None) -> Dict[str, Any]:
+    dictionary_path = path or FORMULA_DICTIONARY_109_FILE
+    with dictionary_path.open("r", encoding="utf-8") as fh:
+        payload = yaml.safe_load(fh) or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("109公式字典格式无效。")
+    return payload
+
+
+def _year_columns_from_109_dictionary(config: Mapping[str, Any]) -> List[int]:
+    period_axis = dict(config.get("period_axis", {}))
+    years = [int(x) for x in period_axis.get("years", [2021, 2022, 2023, 2024, 2025, 2026])]
+    return list(range(6, 6 + len(years)))
+
+
+def _build_109_manual_input_ranges(
+    rows: Sequence[Sequence[Any]],
+    years: Sequence[int],
+) -> List[str]:
+    if not rows:
+        return []
+
+    label_rows = _find_rows_by_item_label(rows, item_col_1=3)
+    manual_labels = [
+        "budget cost change order",
+        "wb home income",
+        "wb home cogs",
+        "wb home inventory income",
+        "wb home inventory",
+        "owner-unapproved overrun",
+        "cumulative direct cost",
+        "cost of goods sold-audited",
+    ]
+    start_col = _column_number_to_a1(6)
+    end_col = _column_number_to_a1(5 + len(years))
+    ranges: List[str] = []
+    for label in manual_labels:
+        row_list = label_rows.get(label, [])
+        if not row_list:
+            continue
+        row_i = row_list[0]
+        ranges.append(f"{_quote_sheet_name(SHEET_109_NAME)}!{start_col}{row_i}:{end_col}{row_i}")
+    return ranges
+
+
+def _build_109_date_array_formula(func_name: str) -> str:
+    date_floor = "DATE(2021,1,1)"
+    arrays = [
+        'IFERROR(FILTER(Payable!$T:$T,Payable!$T:$T<>""),"")',
+        'IFERROR(FILTER(Payable!$V:$V,Payable!$V:$V<>""),"")',
+        'IFERROR(FILTER(\'Final Detail\'!$O:$O,\'Final Detail\'!$O:$O<>""),"")',
+        'IFERROR(FILTER(\'Draw request report\'!$W:$W,\'Draw request report\'!$W:$W<>""),"")',
+        'IFERROR(FILTER(\'Draw request report\'!$F:$F,\'Draw request report\'!$F:$F<>""),"")',
+        'IFERROR(FILTER(\'Draw Invoice List\'!$B:$B,\'Draw Invoice List\'!$B:$B<>""),"")',
+        'IFERROR(FILTER(\'Transfer Log\'!$C:$C,\'Transfer Log\'!$C:$C<>""),"")',
+        'IFERROR(FILTER(\'Change Order Log\'!$B:$B,\'Change Order Log\'!$B:$B<>""),"")',
+    ]
+    merged = ";".join(arrays)
+    return f"=MAX({date_floor},{func_name}(TOCOL({{{merged}}},1)))"
+
+
+def _a1_to_grid_range(a1: str, sheet_id: int) -> Dict[str, int]:
+    normalized = _normalize_formula_range(a1)
+    if "!" in normalized:
+        _, ref = normalized.split("!", 1)
+    else:
+        ref = normalized
+    match = re.fullmatch(r"([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?", ref)
+    if not match:
+        raise ValueError(f"暂不支持的A1范围: {a1}")
+
+    start_col = _column_a1_to_number(match.group(1)) - 1
+    start_row = int(match.group(2)) - 1
+    end_col = _column_a1_to_number(match.group(3) or match.group(1))
+    end_row = int(match.group(4) or match.group(2))
+    return {
+        "sheetId": int(sheet_id),
+        "startRowIndex": start_row,
+        "endRowIndex": end_row,
+        "startColumnIndex": start_col,
+        "endColumnIndex": end_col,
+    }
+
+
+def _compress_a1_ranges(a1_ranges: Sequence[str]) -> List[str]:
+    grouped: Dict[Tuple[str, int], List[int]] = {}
+    passthrough: List[str] = []
+    for a1 in a1_ranges:
+        normalized = _normalize_formula_range(a1)
+        if "!" in normalized:
+            sheet, ref = normalized.split("!", 1)
+        else:
+            sheet, ref = SHEET_109_NAME, normalized
+        match = re.fullmatch(r"([A-Z]+)(\d+)", ref)
+        if not match:
+            passthrough.append(f"{_quote_sheet_name(sheet)}!{ref}")
+            continue
+        col_n = _column_a1_to_number(match.group(1))
+        row_n = int(match.group(2))
+        grouped.setdefault((sheet, row_n), []).append(col_n)
+
+    out = list(passthrough)
+    for (sheet, row_n), cols in sorted(grouped.items()):
+        for start, end in _contiguous_segments(cols):
+            start_col = _column_number_to_a1(start)
+            end_col = _column_number_to_a1(end)
+            if start == end:
+                out.append(f"{_quote_sheet_name(sheet)}!{start_col}{row_n}")
+            else:
+                out.append(f"{_quote_sheet_name(sheet)}!{start_col}{row_n}:{end_col}{row_n}")
+    return out
+
+
+def _build_repeat_cell_request(grid_range: Mapping[str, int], color: Mapping[str, float]) -> Dict[str, Any]:
+    return {
+        "repeatCell": {
+            "range": dict(grid_range),
+            "cell": {"userEnteredFormat": {"backgroundColor": dict(color)}},
+            "fields": "userEnteredFormat.backgroundColor",
+        }
+    }
+
+
+def _build_number_format_request(
+    grid_range: Mapping[str, int],
+    number_format: Mapping[str, str],
+) -> Dict[str, Any]:
+    return {
+        "repeatCell": {
+            "range": dict(grid_range),
+            "cell": {"userEnteredFormat": {"numberFormat": dict(number_format)}},
+            "fields": "userEnteredFormat.numberFormat",
+        }
+    }
+
+
+def _build_hide_columns_request(
+    sheet_id: int,
+    start_col_1: int,
+    end_col_1_inclusive: int,
+) -> Dict[str, Any]:
+    return {
+        "updateDimensionProperties": {
+            "range": {
+                "sheetId": int(sheet_id),
+                "dimension": "COLUMNS",
+                "startIndex": int(start_col_1 - 1),
+                "endIndex": int(end_col_1_inclusive),
+            },
+            "properties": {"hiddenByUser": True},
+            "fields": "hiddenByUser",
+        }
+    }
+
+
+def _build_109_format_requests(
+    sheet_id: int,
+    row_count: int,
+    column_count: int,
+    manual_ranges: Sequence[str],
+    highlight_ranges: Sequence[str],
+    error_ranges: Sequence[str],
+) -> List[Dict[str, Any]]:
+    requests: List[Dict[str, Any]] = [
+        _build_repeat_cell_request(
+            {
+                "sheetId": int(sheet_id),
+                "startRowIndex": 0,
+                "endRowIndex": int(row_count),
+                "startColumnIndex": 0,
+                "endColumnIndex": int(column_count),
+            },
+            COLOR_FILL_WHITE,
+        )
+    ]
+
+    for a1 in manual_ranges:
+        requests.append(
+            _build_repeat_cell_request(_a1_to_grid_range(a1, sheet_id), COLOR_FILL_LIGHT_GRAY)
+        )
+
+    for a1 in _compress_a1_ranges(highlight_ranges):
+        requests.append(
+            _build_repeat_cell_request(_a1_to_grid_range(a1, sheet_id), COLOR_FILL_LIGHT_YELLOW)
+        )
+
+    for a1 in _compress_a1_ranges(error_ranges):
+        requests.append(
+            _build_repeat_cell_request(_a1_to_grid_range(a1, sheet_id), COLOR_FILL_LIGHT_RED)
+        )
+
+    requests.append(
+        _build_number_format_request(
+            _a1_to_grid_range(f"{_quote_sheet_name(SHEET_109_NAME)}!E12:K13", sheet_id),
+            NUMBER_FORMAT_PERCENT_2,
+        )
+    )
+    return requests
+
+
+def _build_unit_budget_actual_settlement_values(
+    rows: Sequence[Sequence[Any]],
+    overrides: Mapping[str, Mapping[str, str]],
+) -> List[List[Any]]:
+    prepared: List[Tuple[str, Any, str, str, int | str, str]] = []
+    latest_unit_year: int | None = None
+    latest_numeric_actual_dt: pd.Timestamp | None = None
+    latest_numeric_tbd_dt: pd.Timestamp | None = None
+
+    for row in rows[2:]:
+        unit_code = _safe_string(row[1] if len(row) > 1 else "")
+        settlement_year = row[6] if len(row) > 6 else ""
+        override_item = overrides.get(unit_code, {})
+        co_date = override_item.get("co_date", "") or (row[7] if len(row) > 7 else "")
+        tbd_date = override_item.get("tbd_acceptance_date", "") or (row[10] if len(row) > 10 else "")
+        actual_date, actual_year = _derive_unit_budget_actual_settlement_fields(
+            unit_code,
+            settlement_year,
+            co_date,
+            None,
+        )
+        if _has_digits(unit_code):
+            if actual_year != "":
+                year_num = int(actual_year)
+                latest_unit_year = year_num if latest_unit_year is None else max(latest_unit_year, year_num)
+            actual_dt = _normalize_date_value(actual_date)
+            if actual_dt is not None:
+                latest_numeric_actual_dt = actual_dt if latest_numeric_actual_dt is None else max(latest_numeric_actual_dt, actual_dt)
+            tbd_dt = _normalize_date_value(tbd_date)
+            if tbd_dt is not None:
+                latest_numeric_tbd_dt = tbd_dt if latest_numeric_tbd_dt is None else max(latest_numeric_tbd_dt, tbd_dt)
+        prepared.append(
+            (
+                unit_code,
+                settlement_year,
+                _safe_string(co_date),
+                actual_date,
+                actual_year,
+                _safe_string(tbd_date),
+            )
+        )
+
+    values: List[List[Any]] = []
+    latest_actual_text = _format_iso_date_or_blank(latest_numeric_actual_dt)
+    latest_tbd_text = _format_iso_date_or_blank(latest_numeric_tbd_dt)
+    latest_actual_year = latest_numeric_actual_dt.year if latest_numeric_actual_dt is not None else latest_unit_year
+    for unit_code, settlement_year, co_date, actual_date, _, tbd_date in prepared:
+        _, actual_year = _derive_unit_budget_actual_settlement_fields(
+            unit_code,
+            settlement_year,
+            co_date,
+            latest_unit_year,
+        )
+        actual_date_out = actual_date
+        tbd_date_out = tbd_date
+        if not _has_digits(unit_code):
+            if not actual_date_out:
+                actual_date_out = latest_actual_text
+            if actual_year == "" and latest_actual_year is not None:
+                actual_year = latest_actual_year
+            if not tbd_date_out:
+                tbd_date_out = latest_tbd_text
+        values.append([co_date, actual_date_out, actual_year if actual_year != "" else "", tbd_date_out])
+    return values
+
+
+def _build_unit_master_rows_v2(
+    ub_rows: Sequence[Sequence[Any]],
+    fd_rows: Sequence[Sequence[Any]],
+    pay_rows: Sequence[Sequence[Any]]
+) -> List[List[Any]]:
+    if not ub_rows:
+        return []
+
+    # 1. Collect unique Unit Codes from three sources
+    units = set()
+    # Source A: Unit Budget Row 1 starting from Column U (index 20)
+    header_row = ub_rows[0]
+    for idx in range(20, len(header_row)):
+        val = _safe_string(header_row[idx])
+        if val and val.upper() not in ("TOTAL", "SUM"):
+            units.add(val)
+
+    # Source B: Payable Column AL (index 37, skip first row)
+    for r in pay_rows[1:]:
+        if len(r) > 37:
+            val = _safe_string(r[37])
+            if val:
+                units.add(val)
+
+    # Source C: Final Detail Column U (index 20, skip first row)
+    for r in fd_rows[1:]:
+        if len(r) > 20:
+            val = _safe_string(r[20])
+            if val:
+                units.add(val)
+
+    sorted_units = sorted(list(units))
+
+    # 2. Pre-calculate lookup mappings
+    ub_unit_to_col = {}
+    for idx in range(20, len(header_row)):
+        val = _safe_string(header_row[idx])
+        if val:
+            ub_unit_to_col[val] = idx
+
+    ub_unit_to_row = {}
+    for r in ub_rows[1:]:
+        u_code = _safe_string(r[1] if len(r) > 1 else "")
+        if u_code:
+            ub_unit_to_row[u_code] = r
+
+    unit_to_latest_date: Dict[str, pd.Timestamp] = {}
+    for r in fd_rows[1:]:
+        if len(r) > 20:
+            u = _safe_string(r[20])
+            d_raw = r[14] if len(r) > 14 else ""
+            if u and d_raw:
+                dt = _normalize_date_value(d_raw)
+                if dt:
+                    if u not in unit_to_latest_date or dt > unit_to_latest_date[u]:
+                        unit_to_latest_date[u] = dt
+
+    master_header = [
+        "Unit Code", "Total Budget", "GC Budget", "WIP Budget", "Incurred Amount",
+        "Settlement Amount", "Final Date", "C/O date", "实际结算日期", "实际结算年份",
+        "TBD Acceptance Date", "Budget Variance", "Group"
+    ]
+
+    data_rows: List[List[Any]] = []
+    for uc in sorted_units:
+        curr_row_idx = len(data_rows) + 3 # Row 1: Total, Row 2: Header, Data starts at Row 3
+        row_out = ["" for _ in range(13)]
+        row_out[0] = uc
+
+        total_budget = 0.0
+        gc_budget = 0.0
+        wip_budget = 0.0
+
+        col_idx = ub_unit_to_col.get(uc)
+        if col_idx is not None:
+            for r in ub_rows[1:]:
+                cell_val = _to_float(r[col_idx]) if col_idx < len(r) else None
+                if cell_val is not None:
+                    # Column B: Total Budget (sum where Col O/14 == '1')
+                    if len(r) > 14 and _safe_string(r[14]) == "1":
+                        total_budget += cell_val
+                    # Column C: GC Budget (sum where Col P/15 == '2')
+                    if len(r) > 15 and _safe_string(r[15]) == "2":
+                        gc_budget += cell_val
+                    # Column D: WIP Budget (sum where Col Q/16 == '3')
+                    if len(r) > 16 and _safe_string(r[16]) == "3":
+                        wip_budget += cell_val
+
+        row_out[1] = "" if abs(total_budget) < 1e-12 else total_budget
+        row_out[2] = "" if abs(gc_budget) < 1e-12 else gc_budget
+        row_out[3] = "" if abs(wip_budget) < 1e-12 else wip_budget
+
+        # Column E (Incurred Amount): Formula
+        row_out[4] = (
+            f"=SUMIFS(Payable!$U:$U, Payable!$AL:$AL, $A{curr_row_idx}, Payable!$A:$A, \"ROE\") + "
+            f"SUMIFS(Payable!$U:$U, Payable!$AL:$AL, $A{curr_row_idx}, Payable!$A:$A, \"RACC\")"
+        )
+
+        # Column F (Settlement Amount): Formula
+        row_out[5] = (
+            f"=SUMIFS('Final Detail'!$P:$P, 'Final Detail'!$U:$U, $A{curr_row_idx}, 'Final Detail'!$A:$A, \"ROE\") + "
+            f"SUMIFS('Final Detail'!$P:$P, 'Final Detail'!$U:$U, $A{curr_row_idx}, 'Final Detail'!$A:$A, \"ACC\")"
+        )
+
+        # Column G (Final Date)
+        latest_dt = unit_to_latest_date.get(uc)
+        row_out[6] = latest_dt.strftime("%Y-%m-%d") if latest_dt else ""
+
+        # Column L (Budget Variance): =B-C-F
+        row_out[11] = f"=$B{curr_row_idx} - $C{curr_row_idx} - $F{curr_row_idx}"
+
+        # Preserve other fields from Unit Budget if available
+        ub_row = ub_unit_to_row.get(uc)
+        if ub_row:
+            row_out[7] = ub_row[7] if len(ub_row) > 7 else ""
+            row_out[8] = ub_row[8] if len(ub_row) > 8 else ""
+            row_out[9] = ub_row[9] if len(ub_row) > 9 else ""
+            row_out[10] = ub_row[10] if len(ub_row) > 10 else ""
+            row_out[12] = ub_row[12] if len(ub_row) > 12 else ""
+
+        data_rows.append(row_out)
+
+    last_row = len(data_rows) + 2
+    total_row = [""] * 13
+    total_row[0] = "Total"
+    for col_idx_1 in [2, 3, 4, 5, 6, 12]: # B, C, D, E, F, L
+        col_a1 = _column_number_to_a1(col_idx_1)
+        total_row[col_idx_1 - 1] = f"=SUM({col_a1}3:{col_a1}{last_row})"
+
+    return [total_row, master_header] + data_rows
+
+
+def _build_unit_budget_support_requests(
+    unit_budget_sheet_id: int,
+    unit_master_sheet_id: int,
+    row_count: int,
+) -> List[Dict[str, Any]]:
+    end_row = max(int(row_count), 3)
+    requests: List[Dict[str, Any]] = [
+        _build_hide_columns_request(unit_budget_sheet_id, 2, 13),
+        _build_repeat_cell_request(
+            {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 0, "endRowIndex": end_row, "startColumnIndex": 1, "endColumnIndex": 13},
+            COLOR_FILL_WHITE,
+        ),
+        _build_repeat_cell_request(
+            {"sheetId": int(unit_master_sheet_id), "startRowIndex": 0, "endRowIndex": end_row, "startColumnIndex": 0, "endColumnIndex": 12},
+            COLOR_FILL_WHITE,
+        ),
+    ]
+    requests.append(
+        _build_repeat_cell_request(
+            {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8},
+            COLOR_FILL_LIGHT_GRAY,
+        )
+    )
+    requests.append(
+        _build_repeat_cell_request(
+            {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 10, "endColumnIndex": 11},
+            COLOR_FILL_LIGHT_GRAY,
+        )
+    )
+    requests.append(
+        _build_number_format_request(
+            {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 9, "endColumnIndex": 10},
+            NUMBER_FORMAT_YEAR_0,
+        )
+    )
+    requests.append(
+        _build_repeat_cell_request(
+            {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 6, "endColumnIndex": 7},
+            COLOR_FILL_LIGHT_GRAY,
+        )
+    )
+    requests.append(
+        _build_repeat_cell_request(
+            {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 9, "endColumnIndex": 10},
+            COLOR_FILL_LIGHT_GRAY,
+        )
+    )
+    requests.append(
+        _build_number_format_request(
+            {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 8, "endColumnIndex": 9},
+            NUMBER_FORMAT_YEAR_0,
+        )
+    )
+    for grid_range in [
+        {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8},
+        {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 8, "endColumnIndex": 9},
+        {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 10, "endColumnIndex": 11},
+        {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 6, "endColumnIndex": 7},
+        {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8},
+        {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 9, "endColumnIndex": 10},
+    ]:
+        requests.append(_build_number_format_request(grid_range, NUMBER_FORMAT_DATE_ISO))
+    return requests
+
+
+def _get_sheet_properties(service, spreadsheet_id: str, sheet_name: str) -> Dict[str, Any]:
+    meta = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+        )
+        .execute()
+    )
+    for sheet in meta.get("sheets", []):
+        props = dict(sheet.get("properties", {}))
+        if _safe_string(props.get("title")) == sheet_name:
+            return props
+    raise RuntimeError(f"未找到工作表: {sheet_name}")
+
+
+def _apply_109_formatting(
+    service,
+    spreadsheet_id: str,
+    manual_ranges: Sequence[str],
+    highlight_ranges: Sequence[str],
+    error_ranges: Sequence[str],
+) -> int:
+    props = _get_sheet_properties(service, spreadsheet_id, SHEET_109_NAME)
+    grid = dict(props.get("gridProperties", {}))
+    requests = _build_109_format_requests(
+        sheet_id=int(props.get("sheetId", 0)),
+        row_count=int(grid.get("rowCount", 1000)),
+        column_count=int(grid.get("columnCount", 26)),
+        manual_ranges=manual_ranges,
+        highlight_ranges=highlight_ranges,
+        error_ranges=error_ranges,
+    )
+    (
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        )
+        .execute()
+    )
+    return 1
+
+
+def _ensure_109_log_sheet(service, spreadsheet_id: str) -> bool:
+    meta = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title))",
+        )
+        .execute()
+    )
+    titles = {
+        _safe_string(sheet.get("properties", {}).get("title"))
+        for sheet in meta.get("sheets", [])
+    }
+    if SHEET_109_LOG_NAME in titles:
+        return False
+
+    (
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": SHEET_109_LOG_NAME}}}]},
+        )
+        .execute()
+    )
+    return True
+
+
+def _ensure_named_sheet(service, spreadsheet_id: str, sheet_name: str) -> bool:
+    meta = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title))",
+        )
+        .execute()
+    )
+    titles = {
+        _safe_string(sheet.get("properties", {}).get("title"))
+        for sheet in meta.get("sheets", [])
+    }
+    if sheet_name in titles:
+        return False
+
+    (
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+        )
+        .execute()
+    )
+    return True
+
+
+def _append_109_log_entry(
+    service,
+    spreadsheet_id: str,
+    mode: str,
+    formula_count: int,
+    changed_cells: Sequence[str],
+    highlighted_cells: Sequence[str],
+    verify: Mapping[str, Any],
+    note: str,
+) -> int:
+    created = _ensure_109_log_sheet(service, spreadsheet_id)
+    header = [
+        "timestamp",
+        "operator",
+        "mode",
+        "formula_count",
+        "changed_count",
+        "highlighted_count",
+        "changed_cells",
+        "verify_matched",
+        "verify_total",
+        "note",
+    ]
+    if created:
+        (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{SHEET_109_LOG_NAME}!A1:J1",
+                valueInputOption="RAW",
+                body={"values": [header]},
+            )
+            .execute()
+        )
+
+    operator = (
+        _safe_string(_get_secret("OPERATOR_EMAIL"))
+        or _safe_string(os.getenv("USER_EMAIL"))
+        or _safe_string(_get_secret("OPERATOR_NAME"))
+        or _safe_string(os.getenv("USER"))
+        or "system"
+    )
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        operator,
+        mode,
+        int(formula_count),
+        len(changed_cells),
+        len(highlighted_cells),
+        ", ".join(_normalize_formula_range(a1) for a1 in highlighted_cells[:80]),
+        int(verify.get("matched", 0)),
+        int(verify.get("total", 0)),
+        note,
+    ]
+    (
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{SHEET_109_LOG_NAME}!A:J",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        )
+        .execute()
+    )
+    return 1
+
+
+def _load_109_rows(service, spreadsheet_id: str) -> List[List[Any]]:
+    resp = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{SHEET_109_NAME}!A:R")
+        .execute()
+    )
+    return resp.get("values", [])
+
+
+def _ensure_unit_budget_actual_settlement_columns(service, spreadsheet_id: str) -> bool:
+    changed = False
+    rows = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range="'Unit Budget'!A1:K2")
+        .execute()
+        .get("values", [])
+    )
+
+    sheet_id = int(_get_sheet_properties(service, spreadsheet_id, "Unit Budget").get("sheetId", 0))
+    if not (
+        _grid_cell(rows, 2, 8) == "C/O date"
+        and _grid_cell(rows, 2, 9) == "实际结算日期"
+        and _grid_cell(rows, 2, 10) == "实际结算年份"
+    ):
+        (
+            service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "insertDimension": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "dimension": "COLUMNS",
+                                    "startIndex": 7,
+                                    "endIndex": 10,
+                                },
+                                "inheritFromBefore": False,
+                            }
+                        }
+                    ]
+                },
+            )
+            .execute()
+        )
+        (
+            service.spreadsheets()
+            .values()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": [
+                        {
+                            "range": "'Unit Budget'!H2:J2",
+                            "majorDimension": "ROWS",
+                            "values": [["C/O date", "实际结算日期", "实际结算年份"]],
+                        }
+                    ],
+                },
+            )
+            .execute()
+        )
+        changed = True
+        rows = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range="'Unit Budget'!A1:K2")
+            .execute()
+            .get("values", [])
+        )
+
+    if _grid_cell(rows, 2, 11) != "TBD Acceptance Date":
+        (
+            service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "insertDimension": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "dimension": "COLUMNS",
+                                    "startIndex": 10,
+                                    "endIndex": 11,
+                                },
+                                "inheritFromBefore": False,
+                            }
+                        }
+                    ]
+                },
+            )
+            .execute()
+        )
+        (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range="'Unit Budget'!K2",
+                valueInputOption="USER_ENTERED",
+                body={"values": [["TBD Acceptance Date"]]},
+            )
+            .execute()
+        )
+        changed = True
+    return changed
+
+
+def _refresh_unit_budget_actual_settlement_columns(service, spreadsheet_id: str) -> int:
+    overrides = _load_default_unit_budget_schedule_overrides()
+    rows = (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range="'Unit Budget'!A:K",
+            valueRenderOption="UNFORMATTED_VALUE",
+        )
+        .execute()
+        .get("values", [])
+    )
+    if len(rows) <= 2:
+        return 0
+
+    values = _build_unit_budget_actual_settlement_values(rows, overrides)
+
+    (
+        service.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {
+                        "range": f"'Unit Budget'!H3:K{len(values) + 2}",
+                        "majorDimension": "ROWS",
+                        "values": values,
+                    }
+                ],
+            },
+        )
+        .execute()
+    )
+    return len(values)
+
+
+def _sync_unit_master_sheet(service, spreadsheet_id: str) -> int:
+    _ensure_named_sheet(service, spreadsheet_id, SHEET_UNIT_MASTER_NAME)
+    ub_rows = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range="'Unit Budget'!A:ZZ")
+        .execute()
+        .get("values", [])
+    )
+    fd_rows = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range="'Final Detail'!A:V")
+        .execute()
+        .get("values", [])
+    )
+    pay_rows = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range="'Payable'!A:AL")
+        .execute()
+        .get("values", [])
+    )
+    values = _build_unit_master_rows_v2(ub_rows, fd_rows, pay_rows)
+    if not values:
+        values = [[
+            "Unit Code", "Total Budget", "GC Budget", "WIP Budget", "Incurred Amount",
+            "Settlement Amount", "Final Date", "C/O date", "实际结算日期", "实际结算年份",
+            "TBD Acceptance Date", "Budget Variance", "Group"
+        ]]
+
+    (
+        service.spreadsheets()
+        .values()
+        .clear(spreadsheetId=spreadsheet_id, range=f"{_quote_sheet_name(SHEET_UNIT_MASTER_NAME)}!A:M")
+        .execute()
+    )
+    (
+        service.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{_quote_sheet_name(SHEET_UNIT_MASTER_NAME)}!A1:M{len(values)}",
+            valueInputOption="USER_ENTERED",
+            body={"values": values},
+        )
+        .execute()
+    )
+    return len(values)
+
+
+def _apply_unit_budget_support_formatting(service, spreadsheet_id: str) -> int:
+    unit_budget_props = _get_sheet_properties(service, spreadsheet_id, "Unit Budget")
+    unit_master_props = _get_sheet_properties(service, spreadsheet_id, SHEET_UNIT_MASTER_NAME)
+    row_count = max(
+        int(dict(unit_budget_props.get("gridProperties", {})).get("rowCount", 1000)),
+        int(dict(unit_master_props.get("gridProperties", {})).get("rowCount", 1000)),
+    )
+    requests = _build_unit_budget_support_requests(
+        unit_budget_sheet_id=int(unit_budget_props.get("sheetId", 0)),
+        unit_master_sheet_id=int(unit_master_props.get("sheetId", 0)),
+        row_count=row_count,
+    )
+    (
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        )
+        .execute()
+    )
+    return len(requests)
+
+
+def _ensure_109_contract_amount_row(service, spreadsheet_id: str) -> bool:
+    rows = _load_109_rows(service, spreadsheet_id)
+    label_rows = _find_rows_by_item_label(rows, item_col_1=3)
+    contract_amount_rows = list(label_rows.get("contract amount", []))
+    sheet_id = int(_get_sheet_properties(service, spreadsheet_id, SHEET_109_NAME).get("sheetId", 0))
+
+    if contract_amount_rows:
+        row_contract_amount = int(contract_amount_rows[0])
+        if row_contract_amount > 1:
+            above_row = rows[row_contract_amount - 2] if row_contract_amount - 2 < len(rows) else []
+            if all(_safe_string(cell) == "" for cell in above_row):
+                (
+                    service.spreadsheets()
+                    .batchUpdate(
+                        spreadsheetId=spreadsheet_id,
+                        body={
+                            "requests": [
+                                {
+                                    "deleteDimension": {
+                                        "range": {
+                                            "sheetId": sheet_id,
+                                            "dimension": "ROWS",
+                                            "startIndex": int(row_contract_amount - 2),
+                                            "endIndex": int(row_contract_amount - 1),
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                    .execute()
+                )
+                return True
+        return False
+
+    insert_before = _first_present_row(label_rows, "contract change order", "budget surplus")
+    if insert_before is None:
+        return False
+    above_row = rows[insert_before - 2] if insert_before > 1 and insert_before - 2 < len(rows) else []
+    if insert_before > 1 and all(_safe_string(cell) == "" for cell in above_row):
+        return False
+    (
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": int(insert_before - 1),
+                                "endIndex": int(insert_before),
+                            },
+                            "inheritFromBefore": False,
+                        }
+                    }
+                ]
+            },
+        )
+        .execute()
+    )
+    return True
+
+
+def _load_109_validation_numbers(service, spreadsheet_id: str) -> Dict[str, float | None]:
+    ranges = ["109!E3", "109!E4", "109!E5", "109!E12", "109!E13", "109!E37"]
+    resp = (
+        service.spreadsheets()
+        .values()
+        .batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+            valueRenderOption="UNFORMATTED_VALUE",
+        )
+        .execute()
+    )
+    out: Dict[str, float | None] = {}
+    for vr in resp.get("valueRanges", []):
+        rng = _normalize_formula_range(str(vr.get("range", "")))
+        vals = vr.get("values", [])
+        raw = vals[0][0] if vals and vals[0] else None
+        out[rng] = _to_float(raw)
+    return out
+
+
+def _build_109_error_ranges_from_values(value_map: Mapping[str, float | None]) -> List[str]:
+    errors: List[str] = []
+    e3 = value_map.get("109!E3")
+    e4 = value_map.get("109!E4")
+    e5 = value_map.get("109!E5")
+    e12 = value_map.get("109!E12")
+    e13 = value_map.get("109!E13")
+    e37 = value_map.get("109!E37")
+    if e3 is not None and e4 is not None and e5 is not None and abs((e3 - e4) - e5) > 0.01:
+        errors.append(f"{_quote_sheet_name(SHEET_109_NAME)}!E5")
+    if e12 is not None and e12 > 1.0 + 1e-9:
+        errors.append(f"{_quote_sheet_name(SHEET_109_NAME)}!E12")
+    if e13 is not None:
+        if e13 > 1.0 + 1e-9:
+            errors.append(f"{_quote_sheet_name(SHEET_109_NAME)}!E13")
+        elif e12 is not None and abs(e13 - e12) > 1e-6:
+            errors.append(f"{_quote_sheet_name(SHEET_109_NAME)}!E13")
+    if e37 is not None and e12 is not None and abs(e37 - e12) > 1e-6:
+        errors.append(f"{_quote_sheet_name(SHEET_109_NAME)}!E37")
+    return errors
+
+
+def _build_109_formula_plan_from_grid(
+    rows: Sequence[Sequence[Any]],
+    config: Mapping[str, Any] | None = None,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if not rows:
+        raise RuntimeError("109工作表为空，无法生成公式清单。")
+
+    cfg = dict(config or _load_109_formula_dictionary())
+    label_rows = _find_rows_by_item_label(rows, item_col_1=3)
+    year_row = _find_year_header_row_109(rows)
+
+    row_contract_change = _first_present_row(
+        label_rows,
+        "contract change order",
+        "budget surplus",
+    )
+    row_contract_amount = _first_present_row(label_rows, "contract amount")
+    # Identify both Budget Surplus rows (Row 15 for TP, Row 24 for EAC)
+    surplus_row_candidates = label_rows.get("budget surplus", [])
+    row_surplus_tp = surplus_row_candidates[0] if len(surplus_row_candidates) > 0 else None
+    row_surplus_eac = surplus_row_candidates[1] if len(surplus_row_candidates) > 1 else None
+    
+    # Backward compatibility for row_contract_change (Row 15)
+    row_contract_change = row_surplus_tp
+
+    if row_contract_amount is None and row_contract_change is not None and row_contract_change > 1:
+        row_contract_amount = row_contract_change - 1
+    row_contract_price = _first_present_row(
+        label_rows,
+        "contract change amount",
+        "contract price",
+    )
+    if row_contract_price is None:
+        row_contract_price = _choose_contract_price_row(rows, label_rows)
+    row_contract_price_day1 = _find_contract_price_day1_row(rows)
+    row_poc = (label_rows.get("percentage of completion") or [None])[0]
+    row_cr = (label_rows.get("completion rate for the period") or [None])[0]
+    row_initial_budget = (label_rows.get("day 1 budget") or [None])[0]
+    row_overrun = (label_rows.get("owner-unapproved overrun") or [None])[0]
+    row_budget = _first_present_row(label_rows, "dynamic budget (eac)", "scoping budget cost")
+    row_cum_direct_cost = (label_rows.get("cumulative direct cost") or [None])[0]
+    row_cogs_calc = (label_rows.get("cost of goods sold-company") or [None])[0]
+    row_cogs_aud = (label_rows.get("cost of goods sold-audited") or [None])[0]
+    row_cogs = (label_rows.get("cost of goods sold") or [None])[0]
+    row_revenue_company = (label_rows.get("general conditions fee-company") or [None])[0]
+    row_revenue_aud = (label_rows.get("general conditions fee-audited") or [None])[0]
+    row_revenue = (label_rows.get("general conditions fee") or [None])[0]
+    row_gp_company = (label_rows.get("gross profit-company") or [None])[0]
+    row_gp = (label_rows.get("gross profit") or [None])[0]
+    row_ar_incurred = (label_rows.get("accounts receivable-incurred") or [None])[0]
+    row_ar_aud = (label_rows.get("accounts receivable-audited") or [None])[0]
+    row_ar_company = (label_rows.get("accounts receivable-company") or [None])[0]
+    row_ar = (label_rows.get("accounts receivable") or [None])[0]
+    row_wbh_income = (label_rows.get("wb home income") or [None])[0]
+    row_wbh_cogs = (label_rows.get("wb home cogs") or [None])[0]
+    row_inv_income = (label_rows.get("wb home inventory income") or [None])[0]
+    row_inv = (label_rows.get("wb home inventory") or [None])[0]
+    row_inv_income_rev = (label_rows.get("wb home inventory income-reverse") or [None])[0]
+    row_inv_rev = (label_rows.get("wb home inventory-reverse") or [None])[0]
+    row_roe_total = (label_rows.get("total roe cost") or [None])[0]
+    row_roe_wbhome = (label_rows.get("roe cost - wb home") or [None])[0]
+    row_roe_wpred = (label_rows.get("roe cost - wpred") or [None])[0]
+    row_acc_expenses = (label_rows.get("accrued expenses") or [None])[0]
+    row_racc_reversed = (label_rows.get("reversed accrued expenses") or [None])[0]
+    row_income_total = (label_rows.get("total income cost") or [None])[0]
+    row_wbh_total = (label_rows.get("wb. home material margin total") or [None])[0]
+    row_main_mm, row_inv_mm = _find_material_margin_rows_109(label_rows, row_wbh_cogs, row_inv)
+
+    required_rows = {
+        "年度表头(2021-2026)": year_row,
+        "Contract Amount": row_contract_amount,
+        "Contract price": row_contract_price,
+        "Contract price (Day1)": row_contract_price_day1,
+        "Contract Change Order": row_surplus_tp, # Row 15
+        "Percentage of Completion": row_poc,
+        "Completion Rate for the Period": row_cr,
+        "Initial Budget": row_initial_budget,
+        "Owner-unapproved Overrun": row_overrun,
+        "Budget Cost(分母EAC)": row_budget,
+        "Cumulative Direct Cost": row_cum_direct_cost,
+        "Cost of Goods Sold-Company": row_cogs_calc,
+        "General Conditions fee-Company": row_revenue_company,
+        "Gross Profit-Company": row_gp_company,
+        "Accounts Receivable-Incurred": row_ar_incurred,
+        "Accounts Receivable-Audited": row_ar_aud,
+        "Accounts Receivable-Company": row_ar_company,
+        "Accounts Receivable": row_ar,
+        "WB Home Income": row_wbh_income,
+        "WB Home COGS": row_wbh_cogs,
+        "WB Home Inventory Income": row_inv_income,
+        "WB Home Inventory": row_inv,
+        "WB Home Inventory Income-Reverse": row_inv_income_rev,
+        "WB Home Inventory-Reverse": row_inv_rev,
+        "WB. Home Material Margin Total": row_wbh_total,
+        "Total ROE Cost": row_roe_total,
+        "ROE Cost - WB Home": row_roe_wbhome,
+        "ROE Cost - WPRED": row_roe_wpred,
+        "Accrued Expenses": row_acc_expenses,
+        "Reversed Accrued Expenses": row_racc_reversed,
+        "Total Income Cost": row_income_total,
+        "Material Margin(main)": row_main_mm,
+        "Material Margin(inventory)": row_inv_mm,
+    }
+    missing = [name for name, row_i in required_rows.items() if row_i is None]
+    if missing:
+        raise RuntimeError("109关键行定位失败: " + "、".join(missing))
+
+    plan: List[Dict[str, str]] = []
+
+    def add_cell_formula(cell: str, formula: str, logic: str) -> None:
+        plan.append(
+            {
+                "sheet": SHEET_109_NAME,
+                "cell": cell,
+                "range": f"{_quote_sheet_name(SHEET_109_NAME)}!{cell}",
+                "formula": formula,
+                "logic": logic,
+            }
+        )
+
+    def add_formula(col_i: int, row_i: int, formula: str, logic: str) -> None:
+        col = _column_number_to_a1(col_i)
+        sheet_name = "109"
+        plan.append(
+            {
+                "sheet": sheet_name,
+                "cell": f"{col}{row_i}",
+                "range": f"{_quote_sheet_name(sheet_name)}!{col}{row_i}",
+                "formula": formula,
+                "logic": logic,
+            }
+        )
+
+    start_year_expr = "YEAR($K$2)"
+    add_cell_formula("K2", _build_109_date_array_formula("MIN"), "Start date=外部来源主日期最早值，下限2021-01-01")
+    add_cell_formula("K3", _build_109_date_array_formula("MAX"), "End date=外部来源主日期最晚值，下限2021-01-01")
+    add_cell_formula("C5", '=IFERROR(COUNTA(FILTER(\'Unit Budget\'!$B$3:$B,REGEXMATCH(\'Unit Budget\'!$B$3:$B,"[0-9]"))),0)', "Units=Unit Budget B列带数字的Unit个数")
+    add_cell_formula("C3", '=IFERROR($E$3-$E$5,"")', "Budget(Day1)=设定1总金额-设定2总金额")
+    add_cell_formula("E3", "=SUMIFS('Unit Budget'!$T:$T,'Unit Budget'!$O:$O,1)", "Contract price (Day1)=Unit Budget 原始预算值中 GMP=1 合计")
+    add_cell_formula("E4", '=IFERROR($E$3-$E$5,"")', "Budget cost(Excl GC-Day 1)=设定1总金额-设定2总金额")
+    add_cell_formula("E5", "=SUMIFS('Unit Budget'!$T:$T,'Unit Budget'!$P:$P,2)", "General Conditions fee=Unit Budget 原始预算值中 Fee=2 合计")
+    add_cell_formula("E12", '=IFERROR(ROUND(MAX(F12:K12),8),"")', "POC Total=累计完工百分比最大值，保留8位小数")
+    add_cell_formula("E13", '=IFERROR(ROUND(SUM(F13:K13),8),"")', "Completion Rate Total=F:K累计，保留8位小数")
+    add_cell_formula("A12", "累计完工百分比", "A列中文名")
+    add_cell_formula("A13", "当期完工比例", "A列中文名")
+    add_formula(1, row_contract_amount, "合同金额", "A列中文名")  # type: ignore[arg-type]
+    add_formula(1, row_contract_change, "预算结余", "A列中文名")  # type: ignore[arg-type]
+    add_formula(1, row_contract_price, "合同变动金额", "A列中文名")  # type: ignore[arg-type]
+    add_formula(1, row_revenue_company, "当期计算收入", "A列中文名")  # type: ignore[arg-type]
+    add_formula(1, row_revenue_aud, "审计确认金额", "A列中文名")  # type: ignore[arg-type]
+    add_formula(1, row_revenue, "当期确认收入", "A列中文名")  # type: ignore[arg-type]
+    add_formula(3, row_contract_amount, "Contract Amount", "英文名")  # type: ignore[arg-type]
+    add_formula(3, row_contract_change, "Budget Surplus", "英文名")  # type: ignore[arg-type]
+    add_formula(3, row_contract_price, "Contract Change Amount", "英文名")  # type: ignore[arg-type]
+    add_formula(5, row_contract_amount, f'=IFERROR(SUM(F{row_contract_amount}:K{row_contract_amount}),"")', "Contract Amount Total=F:K合计")  # type: ignore[arg-type]
+    add_formula(5, row_contract_change, f'=IFERROR(SUM(F{row_contract_change}:K{row_contract_change}),"")', "Budget Surplus Total=F:K合计")  # type: ignore[arg-type]
+    add_formula(5, row_cum_direct_cost, f'=IFERROR(K{row_cum_direct_cost},"")', "Cumulative Direct Cost Total=末期年度累计值") # type: ignore[arg-type]
+    add_formula(5, row_budget, f'=IFERROR(K{row_budget},"")', "Dynamic Budget Total=末期年度累计值") # type: ignore[arg-type]
+    add_formula(5, row_cogs_calc, f'=IFERROR(SUM(F{row_cogs_calc}:K{row_cogs_calc}),"")', "Incurred Cost Calc Total=F:K合计") # type: ignore[arg-type]
+    add_formula(5, row_contract_price, f'=IFERROR(INDEX(F{row_contract_price}:K{row_contract_price},1,MAX(FILTER(COLUMN(F{row_contract_price}:K{row_contract_price})-COLUMN(F{row_contract_price})+1,F{row_contract_price}:K{row_contract_price}<>""))),"")', "Contract Change Amount Total=最后一个非空年度值")  # type: ignore[arg-type]
+    add_formula(5, row_revenue_company, f'=IFERROR(SUM(F{row_revenue_company}:K{row_revenue_company}),"")', "General Conditions fee-Company Total=F:K合计")  # type: ignore[arg-type]
+    add_formula(5, row_revenue_aud, f'=IFERROR(SUM(F{row_revenue_aud}:K{row_revenue_aud}),"")', "General Conditions fee-Audited Total=F:K合计")  # type: ignore[arg-type]
+    add_formula(5, row_revenue, f'=IFERROR(SUM(F{row_revenue}:K{row_revenue}),"")', "General Conditions fee Total=F:K合计")  # type: ignore[arg-type]
+    add_formula(5, row_wbh_income, f'=IFERROR(SUM(F{row_wbh_income}:K{row_wbh_income}),"")', "WB Home Income Total=F:K合计") # type: ignore[arg-type]
+
+    for offset, col_i in enumerate(range(6, 12)):  # F:K
+        col = _column_number_to_a1(col_i)
+        prev_col = _column_number_to_a1(col_i - 1) if offset > 0 else ""
+        year_ref = f"{col}${year_row}"
+
+        add_formula(
+            col_i,
+            row_contract_amount,  # type: ignore[arg-type]
+            f'=IF({col}$10={start_year_expr},-$E$3,0)',
+            "Contract Amount=起始年填入-E3，其余填入0以保证后续累计计算",
+        )
+        add_formula(
+            col_i,
+            row_surplus_tp,  # type: ignore[arg-type]
+            f"=SUMIFS('Unit Master'!$L:$L,'Unit Master'!$J:$J,{year_ref})",
+            "Budget Surplus (TP)=Unit Master按实际结算年份(J列)汇总预算差异(L列)",
+        )
+        if row_surplus_eac is not None:
+            add_formula(
+                col_i,
+                row_surplus_eac,  # type: ignore[arg-type]
+                f"=SUMIFS('Unit Master'!$L:$L,'Unit Master'!$J:$J,{year_ref})",
+                "Budget Surplus (EAC)=Unit Master按实际结算年份(J列)汇总预算差异(L列)",
+            )
+        if offset == 0:
+            contract_price_formula = (
+                f'=IF({col}$10<{start_year_expr},"",IF({col}$10={start_year_expr},{col}{row_contract_amount}+{col}{row_surplus_tp},""))'
+            )
+        else:
+            contract_price_formula = (
+                f'=IF({col}$10<{start_year_expr},"",'
+                f'IF({col}$10={start_year_expr},{col}{row_contract_amount}+{col}{row_surplus_tp},'
+                f'IFERROR({prev_col}{row_contract_price}+{col}{row_surplus_tp},"")))'
+            )
+        add_formula(
+            col_i,
+            row_contract_price,  # type: ignore[arg-type]
+            contract_price_formula,
+            "Contract Change Amount=起始年合同金额+预算结余，之后按年滚动累计预算结余",
+        )
+        
+        # Row 23: Initial Budget (Dynamic Start Date)
+        add_formula(
+            col_i,
+            row_initial_budget,  # type: ignore[arg-type]
+            f"=IF({col}$10={start_year_expr},$C$3,0)",
+            "Initial Budget=起始年填入C3，其余填入0以保证后续累计计算",
+        )
+        
+        # Row 26: Dynamic Budget (EAC) - Formula: I26 = I23 - I24 + I25 + H26
+        sur_ref = row_surplus_eac if row_surplus_eac else row_surplus_tp
+        if offset == 0:
+            budget_formula = f"={col}{row_initial_budget}-{col}{sur_ref}+{col}{row_overrun}"
+        else:
+            budget_formula = f"={col}{row_initial_budget}-{col}{sur_ref}+{col}{row_overrun}+{prev_col}{row_budget}"
+        add_formula(col_i, row_budget, budget_formula, "Dynamic Budget (EAC)=I23 - I24 + I25 + Prev_Value") # type: ignore[arg-type]
+
+        # Row 27: Cumulative Direct Cost = (ROE + Accrued) + Prev_Cumulative
+        if offset == 0:
+            cum_cost_formula = f"={col}{row_roe_total}+{col}{row_acc_expenses}"
+        else:
+            cum_cost_formula = f"={col}{row_roe_total}+{col}{row_acc_expenses}+{prev_col}{row_cum_direct_cost}"
+            
+        add_formula(
+            col_i,
+            row_cum_direct_cost, # type: ignore[arg-type]
+            cum_cost_formula,
+            "Cumulative Direct Cost=本期变动(ROE+ACC)+前期累计"
+        )
+        # Row 28: Incurred Cost (Calculated) - From Payable
+        add_formula(
+            col_i, 
+            row_cogs_calc, # type: ignore[arg-type]
+            f"=IFERROR(SUMIFS(Payable!$AB:$AB,Payable!$E:$E,1,Payable!$J:$J,{year_ref})-SUMIFS(Payable!$AB:$AB,Payable!$E:$E,1,Payable!$O:$O,\"WB Home LLC\",Payable!$J:$J,{year_ref}),\"\")",
+            "Incurred Cost (Calculated)=Payable汇总"
+        )
+        
+        # Row 29: Cost of Goods Sold-Audited (Strictly Manual - No Formula added here)
+        
+        # Row 30: Incurred Cost (Confirmed) - Audit First, else Cumulative Delta
+        if offset == 0:
+            cogs_confirmed_formula = f'=IF({col}{row_cogs_aud}<>"",{col}{row_cogs_aud},IFERROR({col}{row_cum_direct_cost},""))'
+        else:
+            cogs_confirmed_formula = f'=IF({col}{row_cogs_aud}<>"",{col}{row_cogs_aud},IFERROR({col}{row_cum_direct_cost}-SUM($F${row_cogs}:{prev_col}{row_cogs}),\"\"))'
+
+        add_formula(
+            col_i,
+            row_cogs, # type: ignore[arg-type]
+            cogs_confirmed_formula,
+            "Incurred Cost (Confirmed)=有审计取审计，否则按累计成本扣减以前年度确认成本"
+        )
+
+        # Row 12: POC = SUM(Confirmed Cost) / Dynamic Budget
+        add_formula(
+            col_i,
+            row_poc, # type: ignore[arg-type]
+            f"=IFERROR(ROUND(SUM($F${row_cogs}:{col}{row_cogs})/{col}{row_budget},8),\"\")",
+            "POC=累计Confirmed Cost / Dynamic Budget"
+        )
+        if offset == 0:
+            cr_formula = f"=IFERROR(ROUND({col}{row_poc},8),\"\")"
+        else:
+            cr_formula = f"=IFERROR(ROUND({col}{row_poc}-{prev_col}{row_poc},8),\"\")"
+        add_formula(
+            col_i,
+            row_cr,  # type: ignore[arg-type]
+            cr_formula,
+            "Completion Rate=本期POC-上期POC",
+        )
+
+        if offset == 0:
+            rev_formula = f'=IF({col}$10<{start_year_expr},"",IFERROR({col}{row_contract_price}*{col}{row_poc},""))'
+        else:
+            rev_formula = (
+                f'=IF({col}$10<{start_year_expr},"",'
+                f'IF({col}$10={start_year_expr},'
+                f'IFERROR({col}{row_contract_price}*{col}{row_poc},""),'
+                f'IFERROR({col}{row_contract_price}*{col}{row_poc}-SUM($F${row_revenue_company}:{prev_col}{row_revenue_company}),"")))'
+            )
+        add_formula(
+            col_i,
+            row_revenue_company,  # type: ignore[arg-type]
+            rev_formula,
+            "GC fee-Company=累计完工比例*合同变动金额-以前年度当期计算收入累计",
+        )
+        add_formula(
+            col_i,
+            row_ar_incurred,  # type: ignore[arg-type]
+            f"=IFERROR(-{col}{row_revenue_company},\"\")",
+            "AR-Incurred=-GC fee-Company",
+        )
+        add_formula(
+            col_i,
+            row_gp_company,  # type: ignore[arg-type]
+            f"=IFERROR({col}{row_revenue_company}-{col}{row_cogs},\"\")",
+            "Gross Profit-Company=GC fee-Company-COGS",
+        )
+        add_formula(
+            col_i,
+            row_main_mm,  # type: ignore[arg-type]
+            f"=IFERROR({col}{row_wbh_income}-{col}{row_wbh_cogs},\"\")",
+            "WB Home主分支Material Margin=Income-COGS",
+        )
+        add_formula(
+            col_i,
+            row_inv_mm,  # type: ignore[arg-type]
+            f"=IFERROR({col}{row_inv_income}-{col}{row_inv},\"\")",
+            "Inventory分支Material Margin=Inventory Income-Inventory",
+        )
+        if offset == 0:
+            inv_income_rev_formula = "=\"\""
+            inv_rev_formula = "=\"\""
+            ar_formula = f"=IFERROR({col}{row_ar_company},\"\")"
+        else:
+            inv_income_rev_formula = f"=IF({prev_col}{row_inv_income}=\"\",\"\",-{prev_col}{row_inv_income})"
+            inv_rev_formula = f"=IF({prev_col}{row_inv}=\"\",\"\",-{prev_col}{row_inv})"
+            ar_formula = f"=IFERROR({prev_col}{row_ar}+{col}{row_ar_company},\"\")"
+
+        add_formula(
+            col_i,
+            row_inv_income_rev,  # type: ignore[arg-type]
+            inv_income_rev_formula,
+            "WB Home Inventory Income-Reverse=-上年Inventory Income(首年留空)",
+        )
+        add_formula(
+            col_i,
+            row_inv_rev,  # type: ignore[arg-type]
+            inv_rev_formula,
+            "WB Home Inventory-Reverse=-上年Inventory(首年留空)",
+        )
+        add_formula(
+            col_i,
+            row_wbh_total,  # type: ignore[arg-type]
+            (
+                f"=IFERROR({col}{row_main_mm}+{col}{row_inv_mm}"
+                f"+IF({col}{row_inv_income_rev}=\"\",0,{col}{row_inv_income_rev})"
+                f"+IF({col}{row_inv_rev}=\"\",0,{col}{row_inv_rev}),\"\")"
+            ),
+            "WB Home Material Margin Total=主分支+Inventory分支+Reverse影响",
+        )
+        add_formula(
+            col_i,
+            row_ar_company,  # type: ignore[arg-type]
+            f"=IF({col}{row_ar_aud}=\"\",{col}{row_ar_incurred},{col}{row_ar_aud})",
+            "AR-Company=有Audited取Audited，否则取AR-Incurred",
+        )
+        add_formula(
+            col_i,
+            row_ar, # type: ignore[arg-type]
+            ar_formula,
+            "Accounts Receivable=累计AR-Company"
+        )
+        
+        # Row 31: Total ROE Cost
+        add_formula(
+            col_i,
+            row_roe_total, # type: ignore[arg-type]
+            f"=SUMIFS(Payable!$U:$U, Payable!$A:$A, \"ROE\", Payable!$J:$J, {year_ref})",
+            "Total ROE Cost=Payable全表ROE汇总"
+        )
+        
+        # Row 32: ROE Cost - WB Home
+        add_formula(
+            col_i,
+            row_roe_wbhome, # type: ignore[arg-type]
+            f"=SUMIFS(Payable!$U:$U, Payable!$A:$A, \"ROE\", Payable!$O:$O, \"WB Home LLC\", Payable!$J:$J, {year_ref})",
+            "ROE Cost - WB Home=Payable中ROE且Vendor为WB Home LLC汇总"
+        )
+        
+        # Row 33: ROE Cost - WPRED
+        add_formula(
+            col_i,
+            row_roe_wpred, # type: ignore[arg-type]
+            f"=SUMIFS(Payable!$U:$U, Payable!$A:$A, \"ROE\", Payable!$O:$O, \"Wan Pacific Real Estate Development LLC\", Payable!$J:$J, {year_ref})",
+            "ROE Cost - WPRED=Payable中ROE且Vendor为WPRED汇总"
+        )
+        
+        # Row 34: Accrued Expenses
+        add_formula(
+            col_i,
+            row_acc_expenses, # type: ignore[arg-type]
+            f"=SUMIFS('Final Detail'!$P:$P, 'Final Detail'!$A:$A, \"ACC\", 'Final Detail'!$F:$F, {year_ref})",
+            "Accrued Expenses=Final Detail中ACC汇总"
+        )
+        
+        # Row 35: Reversed Accrued Expenses (Negative)
+        add_formula(
+            col_i,
+            row_racc_reversed, # type: ignore[arg-type]
+            f"=-SUMIFS(Payable!$U:$U, Payable!$A:$A, \"RACC\", Payable!$J:$J, {year_ref})",
+            "Reversed Accrued Expenses=Payable中RACC汇总(负数)"
+        )
+        
+        # Row 36: Total Income Cost
+        add_formula(
+            col_i,
+            row_income_total, # type: ignore[arg-type]
+            f"=SUMIFS(Payable!$U:$U, Payable!$A:$A, \"Income\", Payable!$J:$J, {year_ref})",
+            "Total Income Cost=Payable中Income汇总"
+        )
+
+    # Summary cells
+    add_cell_formula("G3", f"=IFERROR($E${row_revenue},\"\")", "Summary Revenue")
+    add_cell_formula("G5", f"=IFERROR($E${row_gp},\"\")", "Summary GP")
+    add_cell_formula("I5", f"=IFERROR($E${row_main_mm},\"\")", "Summary WB Home")
+
+    meta = {
+        "sheet": "109",
+        "year_row": year_row,
+        "dictionary_version": _safe_string(cfg.get("version", "")),
+        "open_items": list(cfg.get("open_items", [])),
+        "formula_count": len(plan),
+        "key_rows": {k: int(v) for k, v in required_rows.items() if v is not None},
+    }
+    return plan, meta
+
+
+def generate_109_formula_plan(spreadsheet_id: str) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    service = get_sheets_service()
+    _ensure_unit_budget_actual_settlement_columns(service, spreadsheet_id)
+    _refresh_unit_budget_actual_settlement_columns(service, spreadsheet_id)
+    _sync_unit_master_sheet(service, spreadsheet_id)
+    _apply_unit_budget_support_formatting(service, spreadsheet_id)
+    _ensure_109_contract_amount_row(service, spreadsheet_id)
+    resp = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range="109!A:ZZ")
+        .execute()
+    )
+    rows = resp.get("values", [])
+    return _build_109_formula_plan_from_grid(rows, _load_109_formula_dictionary())
+
+
+def _verify_formula_plan(
+    service,
+    spreadsheet_id: str,
+    plan: Sequence[Mapping[str, str]],
+) -> Dict[str, Any]:
+    ranges = [str(item.get("range", "")) for item in plan if item.get("range")]
+    expected = {
+        _normalize_formula_range(str(item["range"])): _normalize_formula_text_for_compare(
+            item.get("formula", "")
+        )
+        for item in plan
+        if item.get("range")
+    }
+    matched = 0
+    mismatches: List[Dict[str, str]] = []
+
+    for chunk_ranges in _chunked(ranges, 200):
+        resp = (
+            service.spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=spreadsheet_id,
+                ranges=list(chunk_ranges),
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+        )
+        for vr in resp.get("valueRanges", []):
+            a1 = _normalize_formula_range(str(vr.get("range", "")))
+            vals = vr.get("values", [])
+            actual = _normalize_formula_text_for_compare(vals[0][0] if vals and vals[0] else "")
+            exp = expected.get(a1, "")
+            if actual == exp:
+                matched += 1
+            else:
+                mismatches.append({"range": a1, "expected": exp, "actual": actual})
+
+    return {"matched": matched, "total": len(ranges), "mismatches": mismatches}
+
+
+def execute_109_formula_plan(
+    spreadsheet_id: str,
+    plan: Sequence[Mapping[str, str]],
+) -> Dict[str, Any]:
+    updates = [
+        {
+            "range": str(item["range"]),
+            "majorDimension": "ROWS",
+            "values": [[str(item["formula"])]],
+        }
+        for item in plan
+        if item.get("range") and item.get("formula")
+    ]
+    if not updates:
+        return {
+            "api_calls": 0,
+            "updated_ranges": 0,
+            "verify": {"matched": 0, "total": 0, "mismatches": []},
+            "skipped_noop": False,
+            "format_calls": 0,
+            "log_rows_appended": 0,
+            "highlighted_cells": [],
+        }
+
+    service = get_sheets_service()
+    cfg = _load_109_formula_dictionary()
+    rows_109 = _load_109_rows(service, spreadsheet_id)
+    manual_ranges = _build_109_manual_input_ranges(
+        rows_109,
+        list(dict(cfg.get("period_axis", {})).get("years", [2021, 2022, 2023, 2024, 2025, 2026])),
+    )
+    label_rows = _find_rows_by_item_label(rows_109, item_col_1=3)
+    row_revenue_aud = (label_rows.get("general conditions fee-audited") or [None])[0]
+    manual_ranges = list(manual_ranges) + [f"{_quote_sheet_name(SHEET_109_NAME)}!C2", f"{_quote_sheet_name(SHEET_109_NAME)}!G2"]
+    if row_revenue_aud is not None:
+        manual_ranges.append(f"{_quote_sheet_name(SHEET_109_NAME)}!F{row_revenue_aud}:K{row_revenue_aud}")
+    precheck = _verify_formula_plan(service, spreadsheet_id, plan)
+    changed_norm = {_safe_string(item.get("range")) for item in precheck.get("mismatches", [])}
+    changed_updates = [
+        item for item in updates if _normalize_formula_range(str(item.get("range", ""))) in changed_norm
+    ]
+    if precheck.get("total", 0) and precheck.get("matched", 0) == precheck.get("total", 0):
+        highlighted_cells: List[str] = []
+        error_ranges = _build_109_error_ranges_from_values(_load_109_validation_numbers(service, spreadsheet_id))
+        format_calls = _apply_109_formatting(service, spreadsheet_id, manual_ranges, highlighted_cells, error_ranges)
+        log_rows_appended = _append_109_log_entry(
+            service,
+            spreadsheet_id,
+            mode="noop_rehighlight",
+            formula_count=len(plan),
+            changed_cells=[],
+            highlighted_cells=highlighted_cells,
+            verify=precheck,
+            note="109公式已一致，仅刷新109颜色与日志。",
+        )
+        return {
+            "api_calls": 0,
+            "updated_ranges": 0,
+            "verify": precheck,
+            "skipped_noop": True,
+            "format_calls": format_calls,
+            "log_rows_appended": log_rows_appended,
+            "highlighted_cells": highlighted_cells,
+        }
+
+    api_calls = 0
+    for chunk in _chunked(changed_updates, 500):
+        (
+            service.spreadsheets()
+            .values()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": list(chunk),
+                },
+            )
+            .execute()
+        )
+        api_calls += 1
+
+    verify = _verify_formula_plan(service, spreadsheet_id, plan)
+    highlighted_cells = [str(item.get("range", "")) for item in changed_updates]
+    error_ranges = _build_109_error_ranges_from_values(_load_109_validation_numbers(service, spreadsheet_id))
+    format_calls = _apply_109_formatting(service, spreadsheet_id, manual_ranges, highlighted_cells, error_ranges)
+    log_rows_appended = _append_109_log_entry(
+        service,
+        spreadsheet_id,
+        mode="updated",
+        formula_count=len(plan),
+        changed_cells=highlighted_cells,
+        highlighted_cells=highlighted_cells,
+        verify=verify,
+        note=f"109公式已更新 {len(highlighted_cells)} 个单元格，并刷新109颜色。",
+    )
+    return {
+        "api_calls": api_calls,
+        "updated_ranges": len(changed_updates),
+        "verify": verify,
+        "skipped_noop": False,
+        "format_calls": format_calls,
+        "log_rows_appended": log_rows_appended,
+        "highlighted_cells": highlighted_cells,
+    }
+
+
+def _merge_draft_with_cloud(base_df: pd.DataFrame, draft_df: pd.DataFrame, uid_column: str) -> pd.DataFrame:
+    if draft_df.empty:
+        return base_df.copy()
+
+    merged = draft_df.copy()
+
+    for col in base_df.columns:
+        if col not in merged.columns:
+            merged[col] = ""
+
+    if uid_column in base_df.columns and uid_column in merged.columns:
+        draft_uids = set(
+            merged[uid_column].astype("string").fillna("").str.strip().tolist()
+        )
+        missing_rows = base_df[
+            ~base_df[uid_column].astype("string").fillna("").str.strip().isin(draft_uids)
+        ]
+        if not missing_rows.empty:
+            merged = pd.concat([merged, missing_rows], ignore_index=True)
+
+    ordered = list(base_df.columns) + [c for c in merged.columns if c not in base_df.columns]
+    merged = merged.reindex(columns=ordered)
+    return merged
+
+
+def _prepare_sheet_df(
+    cloud_df: pd.DataFrame,
+    uid_column: str,
+    shadow_cfg: Mapping[str, Any],
+) -> pd.DataFrame:
+    prepared, _ = ensure_uid_anchor(cloud_df, uid_column)
+    prepared = apply_shadow_logic(
+        prepared,
+        revenue_col=shadow_cfg["revenue_col"],
+        cost_col=shadow_cfg["cost_col"],
+        profit_col=shadow_cfg["profit_col"],
+        tax_rate_col=shadow_cfg["tax_rate_col"],
+        tax_col=shadow_cfg["tax_col"],
+        tolerance=float(shadow_cfg["tolerance"]),
+    )
+    return prepared
+
+
+def _has_pending_uid(df: pd.DataFrame) -> bool:
+    if UID_STATUS_COL not in df.columns:
+        return False
+    return bool((df[UID_STATUS_COL].astype("string") == UID_PENDING_VALUE).any())
+
+
+def _find_dirty_sheets(
+    original_map: Mapping[str, pd.DataFrame],
+    edited_map: Mapping[str, pd.DataFrame],
+) -> List[str]:
+    dirty: List[str] = []
+    for sheet in sorted(set(original_map.keys()) | set(edited_map.keys())):
+        original = original_map.get(sheet, pd.DataFrame())
+        edited = edited_map.get(sheet, pd.DataFrame())
+        if _df_signature(original) != _df_signature(edited) or _has_pending_uid(edited):
+            dirty.append(sheet)
+    return dirty
+
+
+def _initialize_state(
+    cloud_map: Mapping[str, pd.DataFrame],
+    cloud_meta: Mapping[str, Any],
+    uid_column: str,
+    shadow_cfg: Mapping[str, Any],
+) -> None:
+    if "api_calls_estimated" not in st.session_state:
+        st.session_state["api_calls_estimated"] = 0
+
+    tracked_version = st.session_state.get("tracked_cloud_cache_version")
+    if tracked_version != cloud_meta["cache_version"]:
+        st.session_state["tracked_cloud_cache_version"] = cloud_meta["cache_version"]
+        st.session_state["api_calls_estimated"] += 1
+
+    if "original_df_map" in st.session_state and "edited_df_map" in st.session_state:
+        return
+
+    original_map: Dict[str, pd.DataFrame] = {}
+    edited_map: Dict[str, pd.DataFrame] = {}
+    draft_sig_map: Dict[str, str] = {}
+
+    for sheet, cloud_df in cloud_map.items():
+        base = _prepare_sheet_df(cloud_df, uid_column, shadow_cfg)
+        original_map[sheet] = base.copy()
+
+        draft_df = load_local_draft(sheet)
+        if draft_df is not None:
+            merged = _merge_draft_with_cloud(base, draft_df, uid_column)
+            merged, _ = ensure_uid_anchor(merged, uid_column)
+            merged = apply_shadow_logic(
+                merged,
+                revenue_col=shadow_cfg["revenue_col"],
+                cost_col=shadow_cfg["cost_col"],
+                profit_col=shadow_cfg["profit_col"],
+                tax_rate_col=shadow_cfg["tax_rate_col"],
+                tax_col=shadow_cfg["tax_col"],
+                tolerance=float(shadow_cfg["tolerance"]),
+            )
+            edited_map[sheet] = merged
+        else:
+            edited_map[sheet] = base.copy()
+
+        draft_sig_map[sheet] = _df_signature(edited_map[sheet])
+
+    st.session_state["original_df_map"] = original_map
+    st.session_state["edited_df_map"] = edited_map
+    st.session_state["draft_signature_map"] = draft_sig_map
+    st.session_state["local_cache_version"] = cloud_meta["cache_version"]
+    st.session_state["last_sync_time"] = "尚未同步"
+
+
+def _reload_from_cloud(
+    cloud_map: Mapping[str, pd.DataFrame],
+    cloud_meta: Mapping[str, Any],
+    uid_column: str,
+    shadow_cfg: Mapping[str, Any],
+) -> None:
+    clear_local_drafts()
+
+    original_map: Dict[str, pd.DataFrame] = {}
+    edited_map: Dict[str, pd.DataFrame] = {}
+    draft_sig_map: Dict[str, str] = {}
+
+    for sheet, cloud_df in cloud_map.items():
+        base = _prepare_sheet_df(cloud_df, uid_column, shadow_cfg)
+        original_map[sheet] = base.copy()
+        edited_map[sheet] = base.copy()
+        draft_sig_map[sheet] = _df_signature(base)
+
+    st.session_state["original_df_map"] = original_map
+    st.session_state["edited_df_map"] = edited_map
+    st.session_state["draft_signature_map"] = draft_sig_map
+    st.session_state["local_cache_version"] = cloud_meta["cache_version"]
+
+
+def _persist_sheet_draft_if_changed(sheet: str, df: pd.DataFrame) -> None:
+    new_sig = _df_signature(df)
+    sig_map = st.session_state.setdefault("draft_signature_map", {})
+    old_sig = sig_map.get(sheet)
+    if old_sig == new_sig:
+        return
+
+    save_local_draft(sheet, df)
+    sig_map[sheet] = new_sig
+    st.session_state["last_draft_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _render_status_board(local_cache_version: str, cloud_meta: Mapping[str, Any]) -> None:
+    st.subheader("状态看板")
+    api_used = int(st.session_state.get("api_calls_estimated", 0))
+    api_left = max(0, DAILY_API_QUOTA_ESTIMATE - api_used)
+    last_sync = st.session_state.get("last_sync_time", "尚未同步")
+    last_draft_saved = st.session_state.get("last_draft_saved_at", "尚未落盘")
+    snapshot_source = _safe_string(cloud_meta.get("snapshot_source", "")) or "unknown"
+    snapshot_source_text = {
+        "local": "本地快照",
+        "cloud": "云端拉取",
+        "unknown": "未知",
+    }.get(snapshot_source, snapshot_source)
+    snapshot_saved_at = _safe_string(cloud_meta.get("snapshot_saved_at", ""))
+    snapshot_saved_text = snapshot_saved_at if snapshot_saved_at else "未记录"
+    formula_mode = _safe_string(cloud_meta.get("formula_cache_mode", "lazy")) or "lazy"
+    formula_mode_text = "完整(全量公式)" if formula_mode == "full" else "极速(按需公式)"
+
+    st.metric("本地缓存版本", local_cache_version)
+    st.metric("API 剩余配额(估算)", f"{api_left}", delta=f"已用 {api_used}")
+    st.metric("最后同步时间", last_sync)
+    st.metric("本地草稿落盘", last_draft_saved)
+    st.metric("数据来源", snapshot_source_text)
+    st.metric("公式模式", formula_mode_text)
+
+    st.caption(
+        f"工作簿: {cloud_meta.get('workbook_title', '')} | "
+        f"工作表数: {cloud_meta.get('sheet_count', 0)} | "
+        f"总行数: {cloud_meta.get('total_rows', 0)} | "
+        f"拉取时间: {cloud_meta.get('fetched_at', '')} | "
+        f"快照保存: {snapshot_saved_text}"
+    )
+
+
+def _render_sheet_map_doc() -> None:
+    with st.expander("Sheet用途与表间关系", expanded=False):
+        st.write("`Scoping`：规则主数据，给 `Payable` / `Final Detail` 提供 code 汇总基准。")
+        st.write("`Unit Budget`：Unit 主表。来源整合后写 `B列`，再按 Q列后 Unit 头回算 `C/D`。")
+        st.write("`Payable`：写入 `C:J` 的核算输出，依赖 `Scoping` 与自身 O/V/AM 字段。")
+        st.write("`Final Detail`：先写 `B:K` 明细核算，再写 `E:H` 的 Unit 汇总。")
+        st.write("`Draw request report`：作为 Unit 来源之一参与 Unit 主表同步。")
+
+
+def _render_diff_summary(bundle: Mapping[str, Any]) -> None:
+    summary = bundle["summary"]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("变更行", int(summary["changed_rows"]))
+    m2.metric("变更单元格", int(summary["changed_cells"]))
+    m3.metric("新增行", int(summary["new_rows"]))
+    m4.metric("金额差异合计", f"{float(summary['amount_delta']):,.2f}")
+
+    st.write(
+        f"目标工作表: {summary['target_sheet_count']} | "
+        f"待同步UID: {summary['pending_uid_updates']} | "
+        f"检测到删除行: {summary['deleted_rows']}（仅审计，不执行删除）"
+    )
+
+    per_sheet_df = pd.DataFrame(bundle["per_sheet"])
+    if not per_sheet_df.empty:
+        st.dataframe(per_sheet_df, use_container_width=True, hide_index=True)
+
+    st.subheader("审计预览")
+    for line in bundle.get("audit_lines", [])[:30]:
+        st.write(f"- {line}")
+
+
+def _get_shadow_config() -> Dict[str, Any]:
+    return {
+        "revenue_col": str(_get_secret("SHADOW_REVENUE_COL", "Revenue")).strip(),
+        "cost_col": str(_get_secret("SHADOW_COST_COL", "Cost")).strip(),
+        "profit_col": str(_get_secret("SHADOW_PROFIT_COL", "Profit")).strip(),
+        "tax_rate_col": str(_get_secret("SHADOW_TAX_RATE_COL", "TaxRate")).strip(),
+        "tax_col": str(_get_secret("SHADOW_TAX_COL", "Tax")).strip(),
+        "tolerance": float(_get_secret("SHADOW_TOLERANCE", 0.01)),
+    }
+
+
+def _build_editor_styler(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def style_row(row: pd.Series) -> List[str]:
+        if _safe_string(row.get(SHADOW_CONFLICT_COL, "")) == "冲突":
+            styles = []
+            for col in row.index:
+                if col in (SHADOW_CONFLICT_COL, SHADOW_PY_PROFIT_COL, SHADOW_PY_TAX_COL):
+                    styles.append("background-color: #ffd8d8")
+                else:
+                    styles.append("")
+            return styles
+        return [""] * len(row)
+
+    return df.style.apply(style_row, axis=1)
+
+
+def main() -> None:
+    st.set_page_config(page_title="AiWB 财务 War Room", layout="wide")
+    st.markdown(
+        """
+<style>
+    .stApp {
+        zoom: 0.8;
+    }
+    div[data-testid="stButton"] button[kind="primary"] {
+        background-color: #d92d20;
+        border: 1px solid #b42318;
+        color: #ffffff;
+        font-weight: 700;
+    }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    spreadsheet_id = str(_get_secret("SPREADSHEET_ID", os.getenv("SPREADSHEET_ID", ""))).strip()
+    uid_column = str(_get_secret("UID_COLUMN", DEFAULT_UID_COLUMN)).strip()
+    amount_column = str(_get_secret("AMOUNT_COLUMN", DEFAULT_AMOUNT_COLUMN)).strip()
+    entity_column = str(_get_secret("ENTITY_COLUMN", DEFAULT_ENTITY_COLUMN)).strip()
+    guard_sheet_name = str(_get_secret("GUARD_SHEET_NAME", DEFAULT_GUARD_SHEET)).strip()
+    expected_first_cell = str(_get_secret("EXPECTED_FIRST_CELL", DEFAULT_EXPECTED_FIRST_CELL)).strip()
+
+    operator_email_default = str(_get_secret("OPERATOR_EMAIL", os.getenv("USER_EMAIL", ""))).strip()
+    operator_name_default = str(_get_secret("OPERATOR_NAME", os.getenv("USER", "unknown"))).strip()
+
+    wbd_options = _parse_options(_get_secret("WBD_OPTIONS"), ["Pending", "Done", "Hold"])
+    wbh_options = _parse_options(_get_secret("WBH_OPTIONS"), ["Open", "Closed", "N/A"])
+
+    shadow_cfg = _get_shadow_config()
+
+    if not spreadsheet_id:
+        st.error("未配置 SPREADSHEET_ID。请在 .streamlit/secrets.toml 或环境变量中设置。")
+        st.stop()
+
+    if "boot_cloud_load_requested" not in st.session_state:
+        st.session_state["boot_cloud_load_requested"] = False
+
+    force_cloud_refresh = bool(st.session_state.pop("force_cloud_refresh", False))
+    has_cloud_snapshot = (
+        st.session_state.get("cloud_snapshot_spreadsheet_id") == spreadsheet_id
+        and "cloud_snapshot_map" in st.session_state
+        and "cloud_snapshot_formula_map" in st.session_state
+        and "cloud_snapshot_meta" in st.session_state
+    )
+
+    if not has_cloud_snapshot and not force_cloud_refresh:
+        local_snapshot = load_local_cloud_snapshot(spreadsheet_id)
+        if local_snapshot is not None:
+            cloud_map, formula_lookup_map, cloud_meta = local_snapshot
+            cloud_meta = dict(cloud_meta)
+            cloud_meta["snapshot_source"] = "local"
+            st.session_state["cloud_snapshot_spreadsheet_id"] = spreadsheet_id
+            st.session_state["cloud_snapshot_map"] = cloud_map
+            st.session_state["cloud_snapshot_formula_map"] = formula_lookup_map
+            st.session_state["cloud_snapshot_meta"] = cloud_meta
+            has_cloud_snapshot = True
+
+    # 避免启动阶段因大表拉取而白屏卡住：先展示可见页面，再由用户触发加载。
+    if not has_cloud_snapshot and not force_cloud_refresh and not st.session_state["boot_cloud_load_requested"]:
+        st.title("AiWB 财务 War Room")
+        st.caption("首次进入请先加载云端数据。若网络波动，可重试。")
+        if st.button("开始加载 Google Sheets 数据", type="primary", use_container_width=True):
+            st.session_state["boot_cloud_load_requested"] = True
+            st.rerun()
+        st.info("提示：请直接打开 `http://localhost:8503`，不要使用 `view-source:` 页面。")
+        st.stop()
+
+    if force_cloud_refresh or not has_cloud_snapshot:
+        try:
+            with st.spinner("正在拉取 Google Sheets 数据，请稍候..."):
+                cloud_map, formula_lookup_map, cloud_meta = load_data(spreadsheet_id)
+                cloud_meta = dict(cloud_meta)
+                cloud_meta["snapshot_source"] = "cloud"
+                cloud_meta["snapshot_saved_at"] = datetime.now(timezone.utc).isoformat()
+        except HttpError as err:
+            st.session_state["boot_cloud_load_requested"] = False
+            st.error(f"加载工作簿失败: {err}")
+            st.stop()
+        except Exception as err:
+            st.session_state["boot_cloud_load_requested"] = False
+            st.error(f"初始化失败: {err}")
+            st.stop()
+
+        st.session_state["cloud_snapshot_spreadsheet_id"] = spreadsheet_id
+        st.session_state["cloud_snapshot_map"] = cloud_map
+        st.session_state["cloud_snapshot_formula_map"] = formula_lookup_map
+        st.session_state["cloud_snapshot_meta"] = cloud_meta
+        save_local_cloud_snapshot(spreadsheet_id, cloud_map, formula_lookup_map, cloud_meta)
+        st.session_state["boot_cloud_load_requested"] = False
+    else:
+        cloud_map = st.session_state["cloud_snapshot_map"]
+        formula_lookup_map = st.session_state["cloud_snapshot_formula_map"]
+        cloud_meta = st.session_state["cloud_snapshot_meta"]
+
+    st.session_state["formula_lookup_map"] = formula_lookup_map
+
+    _initialize_state(cloud_map, cloud_meta, uid_column, shadow_cfg)
+
+    original_map: MutableMapping[str, pd.DataFrame] = st.session_state["original_df_map"]
+    edited_map: MutableMapping[str, pd.DataFrame] = st.session_state["edited_df_map"]
+
+    sheet_order = [name for name in cloud_meta.get("sheet_order", []) if name in edited_map]
+    if not sheet_order:
+        st.warning("该工作簿没有可展示的工作表。")
+        st.stop()
+
+    active_sheet = st.session_state.get("active_sheet", sheet_order[0])
+    if active_sheet not in sheet_order:
+        active_sheet = sheet_order[0]
+        st.session_state["active_sheet"] = active_sheet
+
+    # 公式按需加载：仅在当前Sheet首次查看时拉取，避免全工作簿公式全量下载。
+    formula_map_state: Dict[str, Dict[Tuple[int, str], str]] = st.session_state.setdefault(
+        "formula_lookup_map", {}
+    )
+    if not formula_map_state.get(active_sheet):
+        active_headers = [
+            str(c) for c in _cloud_view(edited_map.get(active_sheet, pd.DataFrame())).columns.tolist()
+        ]
+        if active_headers:
+            try:
+                with st.spinner(f"正在加载 {active_sheet} 公式..."):
+                    formula_map_state[active_sheet] = load_sheet_formula_lookup(
+                        spreadsheet_id,
+                        active_sheet,
+                        tuple(active_headers),
+                    )
+                st.session_state["formula_lookup_map"] = formula_map_state
+                cloud_meta_state = dict(st.session_state.get("cloud_snapshot_meta", cloud_meta))
+                if _safe_string(cloud_meta_state.get("formula_cache_mode", "")) != "full":
+                    cloud_meta_state["formula_cache_mode"] = "lazy"
+                    st.session_state["cloud_snapshot_meta"] = cloud_meta_state
+            except Exception as err:
+                # 公式加载失败不阻断编辑，仅提示并允许继续使用值视图。
+                st.warning(f"当前Sheet公式加载失败（可继续编辑数值）: {err}")
+                formula_map_state[active_sheet] = {}
+                st.session_state["formula_lookup_map"] = formula_map_state
+
+    if "left_panel_collapsed" not in st.session_state:
+        st.session_state["left_panel_collapsed"] = False
+
+    if st.session_state["left_panel_collapsed"]:
+        left_col, right_col = st.columns([0.13, 3.87], gap="small")
+    else:
+        left_col, right_col = st.columns([1.08, 2.92], gap="large")
+
+    with left_col:
+        if st.session_state["left_panel_collapsed"]:
+            if st.button(">>", key="expand_left_panel", use_container_width=True):
+                st.session_state["left_panel_collapsed"] = False
+                st.rerun()
+        else:
+            st.title("AiWB 财务 War Room")
+            st.caption("架构: Data Adapter -> Shadow Logic -> Consistency Checker")
+            if st.button("<< 收起左栏", key="collapse_left_panel", use_container_width=True):
+                st.session_state["left_panel_collapsed"] = True
+                st.rerun()
+
+            st.subheader("控制区")
+
+            operator_email = st.text_input(
+                "操作人邮箱",
+                value=st.session_state.get("operator_email", operator_email_default),
+                placeholder="name@company.com",
+            )
+            operator_name = st.text_input(
+                "操作人显示名",
+                value=st.session_state.get("operator_name", operator_name_default),
+                placeholder="frank",
+            )
+            st.session_state["operator_email"] = operator_email.strip()
+            st.session_state["operator_name"] = operator_name.strip()
+
+            if st.button("从云端重载并清空本地草稿", use_container_width=True):
+                _reload_from_cloud(cloud_map, cloud_meta, uid_column, shadow_cfg)
+                st.success("已从云端重载并清空草稿。")
+                st.rerun()
+
+            if st.button("强制刷新云端缓存", use_container_width=True):
+                load_data.clear()
+                load_sheet_formula_lookup.clear()
+                load_formula_lookup_bulk.clear()
+                clear_local_cloud_snapshot()
+                st.session_state["force_cloud_refresh"] = True
+                st.info("已清除缓存，下次会重新全量拉取。")
+                st.rerun()
+
+            if st.button("切换完整模式（预加载全部公式）", use_container_width=True):
+                try:
+                    header_specs: List[Tuple[str, Tuple[str, ...]]] = []
+                    for s in sheet_order:
+                        cols = tuple(str(c) for c in _cloud_view(edited_map.get(s, pd.DataFrame())).columns.tolist())
+                        header_specs.append((s, cols))
+
+                    with st.spinner("正在预加载全部工作表公式..."):
+                        full_map = load_formula_lookup_bulk(spreadsheet_id, tuple(header_specs))
+
+                    formula_map = st.session_state.get("formula_lookup_map", {})
+                    formula_map.update(full_map)
+                    st.session_state["formula_lookup_map"] = formula_map
+                    st.session_state["cloud_snapshot_formula_map"] = formula_map
+
+                    cloud_meta_state = dict(st.session_state.get("cloud_snapshot_meta", cloud_meta))
+                    cloud_meta_state["formula_cache_mode"] = "full"
+                    cloud_meta_state["formula_prefetched_at"] = datetime.now(timezone.utc).isoformat()
+                    st.session_state["cloud_snapshot_meta"] = cloud_meta_state
+                    save_local_cloud_snapshot(
+                        spreadsheet_id,
+                        st.session_state.get("cloud_snapshot_map", cloud_map),
+                        formula_map,
+                        cloud_meta_state,
+                    )
+                    st.success("已切换为完整模式：全工作表公式已预加载。")
+                    st.rerun()
+                except Exception as err:
+                    st.error(f"预加载全部公式失败: {err}")
+
+            if st.button("运行Python核算流水线（Apps迁移）", use_container_width=True):
+                try:
+                    before_map = {k: v.copy() for k, v in edited_map.items()}
+                    new_map, pipeline_report, pipeline_audit_lines = run_apps_shadow_pipeline(
+                        edited_map=edited_map,
+                        uid_column=uid_column,
+                        shadow_cfg=shadow_cfg,
+                    )
+                    edited_map.clear()
+                    edited_map.update(new_map)
+                    st.session_state["edited_df_map"] = dict(edited_map)
+
+                    changed_sheets: List[str] = []
+                    for s in new_map.keys():
+                        stats = _sheet_delta_stats(before_map.get(s, pd.DataFrame()), new_map[s])
+                        if stats["changed_cells"] > 0:
+                            changed_sheets.append(s)
+                            _persist_sheet_draft_if_changed(s, new_map[s])
+
+                    st.session_state["pipeline_report"] = pipeline_report
+                    st.session_state["pipeline_audit_lines"] = pipeline_audit_lines
+                    st.success(f"核算流水线执行完成，变更工作表: {', '.join(changed_sheets) if changed_sheets else '无'}")
+                    st.rerun()
+                except Exception as err:
+                    st.error(f"流水线执行失败: {err}")
+
+            st.subheader("109公式引擎（模式C）")
+            st.caption("点击后将直接同步109公式到 Google Sheet，并刷新109颜色与 `AiWB_109_Log`。")
+
+            if st.button("生成并同步109公式到Google Sheet", type="primary", use_container_width=True):
+                try:
+                    plan_109, meta_109 = generate_109_formula_plan(spreadsheet_id)
+                    st.session_state["formula_plan_109"] = plan_109
+                    st.session_state["formula_plan_109_meta"] = meta_109
+                    result_109 = execute_109_formula_plan(spreadsheet_id, plan_109)
+                    st.session_state["formula_plan_109_result"] = result_109
+
+                    verify = result_109.get("verify", {})
+                    matched = int(verify.get("matched", 0))
+                    total = int(verify.get("total", 0))
+                    skipped_noop = bool(result_109.get("skipped_noop", False))
+                    highlighted_cells = list(result_109.get("highlighted_cells", []))
+                    st.session_state["api_calls_estimated"] += int(result_109.get("api_calls", 0))
+                    st.session_state["last_sync_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    mismatch_list = verify.get("mismatches", [])
+                    if skipped_noop:
+                        st.info(
+                            f"109公式已一致，无需重写；已清空109旧色、重画手工区，并重标 {len(highlighted_cells)} 个公式格。"
+                        )
+                    elif mismatch_list:
+                        st.warning(
+                            f"109公式已执行同步，但回读校验未全部通过：{matched}/{total} 匹配。"
+                        )
+                        st.dataframe(
+                            pd.DataFrame(mismatch_list).head(30),
+                            use_container_width=True,
+                            hide_index=True,
+                            height=220,
+                        )
+                    else:
+                        st.success(
+                            f"109公式已同步并校验通过：{matched}/{total}。已高亮 {len(highlighted_cells)} 个单元格，并追加日志。"
+                        )
+
+                    load_data.clear()
+                    load_sheet_formula_lookup.clear()
+                    clear_local_cloud_snapshot()
+                    st.session_state["force_cloud_refresh"] = True
+                except Exception as err:
+                    st.error(f"生成并同步109公式失败: {err}")
+
+            formula_plan_109 = st.session_state.get("formula_plan_109", [])
+            formula_plan_109_meta = st.session_state.get("formula_plan_109_meta", {})
+            formula_plan_109_result = st.session_state.get("formula_plan_109_result", {})
+            if formula_plan_109:
+                st.caption(
+                    f"109定位行: {len(formula_plan_109_meta.get('key_rows', {}))} | "
+                    f"公式条数: {formula_plan_109_meta.get('formula_count', len(formula_plan_109))} | "
+                    f"字典版本: {formula_plan_109_meta.get('dictionary_version', 'unknown')}"
+                )
+                preview_df = pd.DataFrame(formula_plan_109)[["cell", "formula", "logic"]]
+                st.dataframe(preview_df, use_container_width=True, hide_index=True, height=280)
+                if formula_plan_109_result:
+                    st.caption(
+                        f"最近109同步: 高亮 {len(formula_plan_109_result.get('highlighted_cells', []))} 格 | "
+                        f"日志新增 {formula_plan_109_result.get('log_rows_appended', 0)} 行 | "
+                        f"颜色刷新 {formula_plan_109_result.get('format_calls', 0)} 次"
+                    )
+
+            dirty_sheets = _find_dirty_sheets(original_map, edited_map)
+            st.write(f"待同步工作表数: {len(dirty_sheets)}")
+            if dirty_sheets:
+                st.caption("、".join(dirty_sheets))
+
+            pipeline_report = st.session_state.get("pipeline_report")
+            if pipeline_report:
+                st.subheader("流水线报告")
+                st.dataframe(pd.DataFrame(pipeline_report), use_container_width=True, hide_index=True)
+
+            _render_sheet_map_doc()
+
+            latest_bundle = st.session_state.get("latest_diff_bundle")
+            if latest_bundle:
+                s = latest_bundle["summary"]
+                st.subheader("最近一次审计")
+                st.write(
+                    f"变更行 {s['changed_rows']} | 变更单元格 {s['changed_cells']} | "
+                    f"新增行 {s['new_rows']}"
+                )
+
+            sync_scope = st.radio(
+                "回写范围",
+                options=["当前 Sheet", "所有待同步 Sheet"],
+                horizontal=True,
+            )
+
+            if st.button("同步至 Google Sheet", type="primary", use_container_width=True):
+                target_sheets = [active_sheet] if sync_scope == "当前 Sheet" else dirty_sheets
+
+                if not target_sheets:
+                    st.info("当前没有待同步变更。")
+                else:
+                    try:
+                        bundle = build_commit_bundle(
+                            original_map=original_map,
+                            edited_map=edited_map,
+                            target_sheets=target_sheets,
+                            uid_column=uid_column,
+                            amount_column=amount_column,
+                            entity_column=entity_column,
+                        )
+                        st.session_state["pending_commit"] = {
+                            "target_sheets": target_sheets,
+                            "bundle": bundle,
+                        }
+                        st.session_state["latest_diff_bundle"] = bundle
+                        st.session_state["show_confirm"] = True
+                    except Exception as err:
+                        st.error(f"提交前校验失败: {err}")
+
+            st.markdown("---")
+            _render_status_board(st.session_state["local_cache_version"], cloud_meta)
+
+    active_sheet = st.session_state.get("active_sheet", active_sheet)
+
+    with right_col:
+        st.markdown("**工作表按钮**")
+        for row_start in range(0, len(sheet_order), 4):
+            row_sheets = sheet_order[row_start : row_start + 4]
+            row_cols = st.columns(len(row_sheets))
+            for idx, sheet_name in enumerate(row_sheets):
+                btype = "primary" if sheet_name == active_sheet else "secondary"
+                with row_cols[idx]:
+                    if st.button(
+                        sheet_name,
+                        key=f"right_sheet_btn_{row_start}_{idx}_{sheet_name}",
+                        type=btype,
+                        use_container_width=True,
+                    ):
+                        st.session_state["active_sheet"] = sheet_name
+                        st.rerun()
+
+        st.markdown("---")
+
+        active_df = edited_map.get(active_sheet, pd.DataFrame()).copy()
+        active_df, _ = ensure_uid_anchor(active_df, uid_column)
+        active_df = apply_shadow_logic(
+            active_df,
+            revenue_col=shadow_cfg["revenue_col"],
+            cost_col=shadow_cfg["cost_col"],
+            profit_col=shadow_cfg["profit_col"],
+            tax_rate_col=shadow_cfg["tax_rate_col"],
+            tax_col=shadow_cfg["tax_col"],
+            tolerance=float(shadow_cfg["tolerance"]),
+        )
+
+        visible_columns = [c for c in active_df.columns if not _is_internal_col(str(c))]
+        row_count = len(active_df)
+        formula_lookup_map = st.session_state.get("formula_lookup_map", {})
+        active_formula_lookup = formula_lookup_map.get(active_sheet, {})
+
+        inspector_col1, inspector_col2 = st.columns([1.4, 1.0])
+        with inspector_col1:
+            selected_col = st.selectbox(
+                "公式列",
+                options=visible_columns if visible_columns else ["(无列)"],
+                key=f"formula_col_{active_sheet}",
+                disabled=not bool(visible_columns),
+            )
+        with inspector_col2:
+            selected_row = int(
+                st.number_input(
+                    "公式行(编辑区行号)",
+                    min_value=1,
+                    max_value=max(1, row_count),
+                    value=1,
+                    step=1,
+                    key=f"formula_row_{active_sheet}",
+                    disabled=row_count == 0,
+                )
+            )
+
+        selected_formula = ""
+        if row_count > 0 and visible_columns:
+            row_idx = max(0, min(selected_row - 1, row_count - 1))
+            cell_value = active_df.iloc[row_idx].get(selected_col, "")
+            cell_text = _safe_string(cell_value)
+            if cell_text.startswith("="):
+                selected_formula = cell_text
+            else:
+                selected_formula = active_formula_lookup.get((row_idx, selected_col), "")
+
+        formula_text = selected_formula if selected_formula else "（该单元格无公式）"
+        st.subheader(f"编辑区: {active_sheet} | 公式: {formula_text}")
+
+        column_config: Dict[str, Any] = {
+            UID_STATUS_COL: st.column_config.TextColumn("UID状态", help="缺失UID已自动补齐并标记待同步"),
+            SHADOW_CONFLICT_COL: st.column_config.TextColumn("影子冲突", help="Python计算与Sheet公式结果不一致"),
+            SHADOW_PY_PROFIT_COL: st.column_config.NumberColumn("Python利润", format="%.2f"),
+            SHADOW_PY_TAX_COL: st.column_config.NumberColumn("Python税额", format="%.2f"),
+        }
+
+        if "WBD" in active_df.columns:
+            column_config["WBD"] = st.column_config.SelectboxColumn(
+                "WBD", options=wbd_options, help="实体字段，仅允许下拉。"
+            )
+        if "WBH" in active_df.columns:
+            column_config["WBH"] = st.column_config.SelectboxColumn(
+                "WBH", options=wbh_options, help="实体字段，仅允许下拉。"
+            )
+
+        disabled_cols = [UID_STATUS_COL, SHADOW_CONFLICT_COL, SHADOW_PY_PROFIT_COL, SHADOW_PY_TAX_COL]
+
+        editor_output = st.data_editor(
+            _build_editor_styler(active_df),
+            key=f"editor_{active_sheet}",
+            num_rows="dynamic",
+            height=920,
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+            disabled=[c for c in disabled_cols if c in active_df.columns],
+        )
+
+        editor_output, _ = ensure_uid_anchor(editor_output, uid_column)
+        editor_output = apply_shadow_logic(
+            editor_output,
+            revenue_col=shadow_cfg["revenue_col"],
+            cost_col=shadow_cfg["cost_col"],
+            profit_col=shadow_cfg["profit_col"],
+            tax_rate_col=shadow_cfg["tax_rate_col"],
+            tax_col=shadow_cfg["tax_col"],
+            tolerance=float(shadow_cfg["tolerance"]),
+        )
+
+        edited_map[active_sheet] = editor_output.copy()
+        st.session_state["edited_df_map"] = dict(edited_map)
+        _persist_sheet_draft_if_changed(active_sheet, editor_output)
+
+        conflict_count = int((editor_output.get(SHADOW_CONFLICT_COL, pd.Series(dtype="string")) == "冲突").sum())
+        if conflict_count > 0:
+            st.error(f"检测到 {conflict_count} 行影子逻辑冲突（红色标记列）。")
+            conflict_rows = editor_output[editor_output[SHADOW_CONFLICT_COL] == "冲突"].head(300)
+            st.dataframe(
+                conflict_rows.style.apply(
+                    lambda _: ["background-color: #ffd8d8"] * len(conflict_rows.columns),
+                    axis=1,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if hasattr(st, "dialog"):
+
+        @st.dialog("同步确认与审计")
+        def confirm_dialog() -> None:
+            pending = st.session_state.get("pending_commit")
+            if not pending:
+                st.write("当前没有待提交内容。")
+                return
+
+            target_sheets = pending["target_sheets"]
+            bundle = pending["bundle"]
+            _render_diff_summary(bundle)
+
+            has_conflict = False
+            for sheet in target_sheets:
+                df = edited_map.get(sheet, pd.DataFrame())
+                if SHADOW_CONFLICT_COL in df.columns and (df[SHADOW_CONFLICT_COL] == "冲突").any():
+                    has_conflict = True
+                    break
+
+            if has_conflict:
+                st.error("存在影子逻辑冲突，建议先修复后再同步。")
+
+            cancel_col, commit_col = st.columns(2)
+
+            if cancel_col.button("取消", use_container_width=True):
+                st.session_state["show_confirm"] = False
+                st.rerun()
+
+            if commit_col.button(
+                "确认同步",
+                type="primary",
+                use_container_width=True,
+                disabled=False,
+            ):
+                try:
+                    result = execute_commit(
+                        spreadsheet_id=spreadsheet_id,
+                        bundle=bundle,
+                        guard_sheet_name=guard_sheet_name,
+                        expected_first_cell=expected_first_cell,
+                    )
+
+                    for sheet in target_sheets:
+                        synced_df = mark_uid_synced(edited_map[sheet])
+                        edited_map[sheet] = synced_df.copy()
+                        original_map[sheet] = synced_df.copy()
+                        _persist_sheet_draft_if_changed(sheet, synced_df)
+
+                    st.session_state["edited_df_map"] = dict(edited_map)
+                    st.session_state["original_df_map"] = dict(original_map)
+                    st.session_state["api_calls_estimated"] += int(result["api_calls"])
+                    st.session_state["local_cache_version"] = hashlib.sha1(
+                        datetime.now(timezone.utc).isoformat().encode("utf-8")
+                    ).hexdigest()[:12]
+                    st.session_state["last_sync_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state["show_confirm"] = False
+
+                    summary = bundle["summary"]
+                    summary_text = (
+                        f"sheets={summary['target_sheet_count']}, changed_rows={summary['changed_rows']}, "
+                        f"changed_cells={summary['changed_cells']}, amount_delta={summary['amount_delta']:.2f}"
+                    )
+                    op_email = st.session_state.get("operator_email", "").strip()
+                    op_name = st.session_state.get("operator_name", "").strip()
+                    if op_email and op_name:
+                        op_identity = f"{op_email} ({op_name})"
+                    elif op_email:
+                        op_identity = op_email
+                    elif op_name:
+                        op_identity = op_name
+                    else:
+                        op_identity = "unknown"
+                    append_audit_log(
+                        operator=op_identity,
+                        summary=summary_text,
+                        details=bundle.get("audit_lines", []),
+                    )
+
+                    st.success(f"同步成功：增量更新范围 {result['updated_ranges']} 个")
+                    st.rerun()
+                except Exception as err:
+                    st.error(f"同步失败: {err}")
+
+        if st.session_state.get("show_confirm"):
+            confirm_dialog()
+
+
+if __name__ == "__main__":
+    main()

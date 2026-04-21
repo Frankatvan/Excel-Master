@@ -1,0 +1,19 @@
+# 凭证与密钥
+credentials.json
+client_secret_*.json
+.env
+.env.*
+!.env.example
+*.pkl
+.aiwb_local/
+.streamlit/secrets.toml
+
+# 依赖与临时文件
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+dist/
+build/
+.pytest_cache/
+.next/
