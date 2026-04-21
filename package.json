@@ -1,0 +1,11 @@
+{
+  "name": "excel-master-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cd excel-master-app && npm run dev",
+    "build": "cd excel-master-app && npm run build",
+    "install": "cd excel-master-app && npm install",
+    "start": "cd excel-master-app && npm start"
+  }
+}
