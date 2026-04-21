@@ -1,6 +1,5 @@
 import NextAuth from "next-auth"
 import GoogleProvider from "next-auth/providers/google"
-import EmailProvider from "next-auth/providers/email"
 import { google } from "googleapis"
 import { createClient } from '@supabase/supabase-js'
 
@@ -13,7 +12,6 @@ async function verifySheetAccess(email: string): Promise<boolean> {
   console.log(`[Auth] Verifying access for: ${normalizedEmail}`);
 
   try {
-    // 1. 优先查询数据库缓存 (whitelisted_users)
     const { data: cachedUser } = await supabase
       .from("whitelisted_users")
       .select("email")
@@ -25,7 +23,6 @@ async function verifySheetAccess(email: string): Promise<boolean> {
       return true;
     }
 
-    // 2. 缓存未命中，穿透到 Google Drive API
     const auth = new google.auth.GoogleAuth({
       credentials: {
         client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -46,7 +43,6 @@ async function verifySheetAccess(email: string): Promise<boolean> {
     );
 
     if (hasAccess) {
-      // 3. 同步回数据库缓存
       await supabase.from("whitelisted_users").upsert({ 
         email: normalizedEmail, 
         last_synced_at: new Date().toISOString() 
@@ -68,17 +64,6 @@ export const authOptions = {
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-    }),
-    EmailProvider({
-      server: {
-        host: process.env.EMAIL_SERVER_HOST,
-        port: Number(process.env.EMAIL_SERVER_PORT || 587),
-        auth: {
-          user: process.env.EMAIL_SERVER_USER,
-          pass: process.env.EMAIL_SERVER_PASSWORD,
-        },
-      },
-      from: process.env.EMAIL_FROM,
     }),
   ],
   callbacks: {
