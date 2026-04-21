@@ -1,11 +1,33 @@
 {
-  "name": "excel-master-bridge",
-  "version": "1.0.0",
+  "name": "excel-master-app",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "cd excel-master-app && npm run dev",
-    "build": "cd excel-master-app && npm run build",
-    "install": "cd excel-master-app && npm install",
-    "start": "cd excel-master-app && npm start"
+    "dev": "next dev excel-master-app",
+    "build": "next build excel-master-app",
+    "start": "next start excel-master-app",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.104.0",
+    "googleapis": "^171.4.0",
+    "next": "16.2.4",
+    "next-auth": "^4.24.14",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "dotenv": "^17.4.2",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.4",
+    "jest": "^30.3.0",
+    "tailwindcss": "^4",
+    "ts-jest": "^29.4.9",
+    "typescript": "^5"
   }
 }

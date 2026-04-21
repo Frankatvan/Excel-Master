@@ -1,8 +1,7 @@
 {
   "version": 2,
-  "buildCommand": "cd excel-master-app && npm run build",
-  "installCommand": "cd excel-master-app && npm install",
-  "outputDirectory": "excel-master-app/.next",
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
   "framework": "nextjs",
   "regions": ["sfo1"]
 }
