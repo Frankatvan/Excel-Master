@@ -4,6 +4,3 @@ create table if not exists internal_companies (
   normalized_name text not null unique,
   created_at timestamptz not null default now()
 );
-
-create unique index if not exists internal_companies_normalized_name_idx
-  on internal_companies (normalized_name);

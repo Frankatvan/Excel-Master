@@ -11,6 +11,38 @@ function normalizeInternalCompanyName(value) {
   return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function validateInternalCompanyWorkbookHeaders(headers) {
+  const hasCompanyColumn = headers.some((header) => String(header ?? "").trim() === "Company");
+
+  if (!hasCompanyColumn) {
+    throw new Error('Internal companies workbook must include a "Company" column.');
+  }
+}
+
+function buildInternalCompanyRegistryRows(rows) {
+  const deduped = new Map();
+  let sawCompanyColumn = false;
+
+  for (const row of rows) {
+    if (Object.prototype.hasOwnProperty.call(row, "Company")) {
+      sawCompanyColumn = true;
+    }
+
+    const companyName = String(row.Company || "").trim();
+    if (!companyName) continue;
+    deduped.set(normalizeInternalCompanyName(companyName), companyName);
+  }
+
+  if (!sawCompanyColumn) {
+    throw new Error('Internal companies workbook must include a "Company" column.');
+  }
+
+  return Array.from(deduped.entries()).map(([normalized_name, company_name]) => ({
+    company_name,
+    normalized_name,
+  }));
+}
+
 async function main() {
   loadEnv();
 
@@ -29,21 +61,14 @@ async function main() {
 
   const workbook = xlsx.readFile(workbookPath);
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const headerRows = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  validateInternalCompanyWorkbookHeaders(headerRows[0] || []);
   const rows = xlsx.utils.sheet_to_json(sheet, { defval: "" });
-  const deduped = new Map();
-
-  for (const row of rows) {
-    const companyName = String(row.Company || "").trim();
-    if (!companyName) continue;
-    deduped.set(normalizeInternalCompanyName(companyName), companyName);
-  }
+  const deduped = buildInternalCompanyRegistryRows(rows);
 
   const supabase = createClient(supabaseUrl, supabaseServiceKey);
   const { error } = await supabase.from("internal_companies").upsert(
-    Array.from(deduped.entries()).map(([normalized_name, company_name]) => ({
-      company_name,
-      normalized_name,
-    })),
+    deduped,
     { onConflict: "normalized_name" },
   );
 
@@ -51,7 +76,7 @@ async function main() {
     throw error;
   }
 
-  console.log(`Imported ${deduped.size} internal companies.`);
+  console.log(`Imported ${deduped.length} internal companies.`);
 }
 
 main().catch((error) => {
