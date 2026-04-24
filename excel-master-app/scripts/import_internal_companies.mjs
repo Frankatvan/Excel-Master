@@ -21,20 +21,11 @@ function validateInternalCompanyWorkbookHeaders(headers) {
 
 function buildInternalCompanyRegistryRows(rows) {
   const deduped = new Map();
-  let sawCompanyColumn = false;
 
   for (const row of rows) {
-    if (Object.prototype.hasOwnProperty.call(row, "Company")) {
-      sawCompanyColumn = true;
-    }
-
     const companyName = String(row.Company || "").trim();
     if (!companyName) continue;
     deduped.set(normalizeInternalCompanyName(companyName), companyName);
-  }
-
-  if (!sawCompanyColumn) {
-    throw new Error('Internal companies workbook must include a "Company" column.');
   }
 
   return Array.from(deduped.entries()).map(([normalized_name, company_name]) => ({
@@ -66,14 +57,16 @@ async function main() {
   const rows = xlsx.utils.sheet_to_json(sheet, { defval: "" });
   const deduped = buildInternalCompanyRegistryRows(rows);
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey);
-  const { error } = await supabase.from("internal_companies").upsert(
-    deduped,
-    { onConflict: "normalized_name" },
-  );
+  if (deduped.length > 0) {
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    const { error } = await supabase.from("internal_companies").upsert(
+      deduped,
+      { onConflict: "normalized_name" },
+    );
 
-  if (error) {
-    throw error;
+    if (error) {
+      throw error;
+    }
   }
 
   console.log(`Imported ${deduped.length} internal companies.`);

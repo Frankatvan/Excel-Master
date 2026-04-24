@@ -44,6 +44,10 @@ describe("internal company registry helpers", () => {
     ]);
   });
 
+  it("accepts a header-only workbook shape as an empty import", () => {
+    expect(buildInternalCompanyRegistryRows([])).toEqual([]);
+  });
+
   it("fails loudly when the workbook is missing the Company column", () => {
     expect(() => validateInternalCompanyWorkbookHeaders(["Vendor", "Other"])).toThrow(
       'Internal companies workbook must include a "Company" column.',

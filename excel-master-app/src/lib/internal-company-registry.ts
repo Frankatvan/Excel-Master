@@ -36,20 +36,11 @@ export function buildInternalCompanyRegistryRows(
   rows: readonly InternalCompanyImportRow[],
 ): InternalCompanyRegistryRow[] {
   const deduped = new Map<string, string>();
-  let sawCompanyColumn = false;
 
   for (const row of rows) {
-    if (Object.prototype.hasOwnProperty.call(row, "Company")) {
-      sawCompanyColumn = true;
-    }
-
     const companyName = String(row.Company || "").trim();
     if (!companyName) continue;
     deduped.set(normalizeInternalCompanyName(companyName), companyName);
-  }
-
-  if (!sawCompanyColumn) {
-    throw new Error('Internal companies workbook must include a "Company" column.');
   }
 
   return Array.from(deduped.entries()).map(([normalized_name, company_name]) => ({
