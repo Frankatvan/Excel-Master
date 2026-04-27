@@ -10,4 +10,8 @@ logic_path = str(logic_dir)
 if logic_path not in sys.path:
     sys.path.insert(0, logic_path)
 
-from aiwb_finance.external_import_worker import handler  # noqa: E402,F401
+from aiwb_finance.external_import_worker import handler as ExternalImportWorkerHandler  # noqa: E402
+
+
+class handler(ExternalImportWorkerHandler):
+    pass
