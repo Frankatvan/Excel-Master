@@ -1,3 +1,12 @@
+import { buildExternalReconSnapshotV2 } from "@/lib/audit-external-recon";
+import { buildManualInputSnapshot, discoverYearAxis, findRowByLabelPath } from "@/lib/audit-manual-input";
+import { buildFinalDetailCostNameLabel } from "@/lib/audit-external-recon";
+import {
+  isInternalCompanyVendor,
+  normalizeInternalCompanyName,
+  type InternalCompanyRegistryRow,
+} from "@/lib/internal-company-registry";
+
 export const DEFAULT_SPREADSHEET_ID = "1N6iQ3-7H-I_p0p_Pq_G9U8U5k5l-Mv1mKz_N7D_8_8";
 
 export const RECON_STATES = ["Direct", "ROE", "Income", "Consulting"] as const;
@@ -18,38 +27,59 @@ export interface ReconDiscrepancy {
   diff: number;
 }
 
-export interface ExternalReconSnapshot {
-  summary: string;
-  discrepancies: ReconDiscrepancy[];
-  recon_by_cost_state: ReconDiscrepancy[];
-  unit_budget_variances: Array<{
-    unit_code: string;
-    total_budget: number;
-    wip_budget: number;
-    diff: number;
-  }>;
-  invoice_match_overview: {
-    payable_total_invoices: number;
-    final_total_invoices: number;
-    draw_total_invoices: number;
-    matched_to_final: number;
-    matched_to_draw: number;
-    matched_to_both: number;
-    payable_unmatched: number;
-    final_only: number;
-    draw_only: number;
-  };
-}
+export type ExternalReconSnapshot = ReturnType<typeof buildExternalReconSnapshotV2>;
 
 export interface ReclassAuditSnapshot {
   overview: {
+    payable_amount: number;
+    payable_count: number;
+    final_detail_amount: number;
+    final_detail_count: number;
+    diff_count: number;
     old_total: number;
     new_total: number;
     diff_amount: number;
     diff_invoice_count: number;
   };
+  table_summaries: Array<{
+    source_table: "Payable" | "Final Detail";
+    total_amount: number;
+    total_count: number;
+    changed_amount: number;
+    changed_count: number;
+    unchanged_amount: number;
+    unchanged_count: number;
+    before_rows: Array<{
+      cost_state: string;
+      amount: number;
+      count: number;
+    }>;
+    after_rows: Array<{
+      cost_state: string;
+      amount: number;
+      count: number;
+    }>;
+    transition_rows: Array<{
+      old_cost_state: string;
+      new_cost_state: string;
+      amount: number;
+      count: number;
+    }>;
+    internal_company_transition_rows: Array<{
+      company_name: string;
+      old_cost_state: string;
+      new_cost_state: string;
+      amount: number;
+      count: number;
+    }>;
+  }>;
   category_rows: Array<{
     category: string;
+    payable_amount: number;
+    payable_count: number;
+    final_detail_amount: number;
+    final_detail_count: number;
+    diff_count: number;
     old_total: number;
     new_total: number;
     diff_amount: number;
@@ -64,14 +94,26 @@ export interface ReclassAuditSnapshot {
     invoice_count: number;
   }>;
   invoice_rows: Array<{
+    source_table: "Payable" | "Final Detail";
+    row_no: number;
     vendor: string;
     amount: number;
     incurred_date: string;
     unit_code: string;
     cost_code: string;
+    cost_name: string;
     old_cost_state: string;
     new_category: string;
     rule_id: string;
+    match_status?: string;
+    present_in_final_detail?: boolean;
+  }>;
+  internal_company_category_matrix: Array<{
+    company_name: string;
+    category: string;
+    payable_amount: number;
+    final_detail_amount: number;
+    diff_amount: number;
   }>;
   sankey: {
     nodes: Array<{ name: string }>;
@@ -80,6 +122,16 @@ export interface ReclassAuditSnapshot {
 }
 
 export interface Compare109Snapshot {
+  warnings: Array<{
+    code: "MAPPING_AMBIGUITY" | "MAPPING_FALLBACK";
+    message: string;
+  }>;
+  mapping_health?: {
+    fallback_count: number;
+    fallback_fields: string[];
+    mapping_score: number;
+    mapping_field_count: number;
+  };
   metric_rows: Array<{
     label: string;
     year_rows: Array<{
@@ -88,6 +140,7 @@ export interface Compare109Snapshot {
       company: number;
       audit: number;
       diff: number;
+      has_value: boolean;
     }>;
   }>;
 }
@@ -95,7 +148,15 @@ export interface Compare109Snapshot {
 export interface ScopingLogicRow {
   group_number: string;
   group_name: string;
-  statuses: string[];
+  statuses: {
+    gmp: string;
+    final_gmp: string;
+    fee: string;
+    wip: string;
+    wtc: string;
+    gc: string;
+    tbd: string;
+  };
   budget: number;
   incurred_amount: number;
 }
@@ -106,6 +167,7 @@ export interface AuditSnapshot {
   workflow_stage: string;
   audit_tabs: {
     external_recon: ExternalReconSnapshot;
+    manual_input: ReturnType<typeof buildManualInputSnapshot>;
     reclass_audit: ReclassAuditSnapshot;
     compare_109: Compare109Snapshot;
     scoping_logic: ScopingLogicRow[];
@@ -134,8 +196,45 @@ function parseNumber(value: SpreadsheetCell): number {
   return 0;
 }
 
+function hasNumericCell(value: SpreadsheetCell): boolean {
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (typeof value !== "string") {
+    return false;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || !/[0-9]/.test(trimmed)) {
+    return false;
+  }
+  const parsed = Number.parseFloat(trimmed.replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(parsed);
+}
+
 function findHeaderRowIndex(rows: SpreadsheetRow[], needle: string): number {
   return rows.findIndex((row) => row.some((cell) => String(cell || "").trim() === needle));
+}
+
+function normalizeHeaderToken(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[()（）]/g, "")
+    .replace(/[^a-z0-9\u4e00-\u9fa5 ]+/g, "");
+}
+
+function findColumnByHeader(headerRow: SpreadsheetRow, aliases: string[], fallbackIndex: number): number {
+  const normalizedAliases = new Set(aliases.map((alias) => normalizeHeaderToken(alias)));
+  const matchedIndex = headerRow.findIndex((cell) => normalizedAliases.has(normalizeHeaderToken(cell)));
+  return matchedIndex >= 0 ? matchedIndex : fallbackIndex;
+}
+
+function findOptionalColumnByHeader(headerRow: SpreadsheetRow, aliases: string[]): number | null {
+  const normalizedAliases = new Set(aliases.map((alias) => normalizeHeaderToken(alias)));
+  const matchedIndex = headerRow.findIndex((cell) => normalizedAliases.has(normalizeHeaderToken(cell)));
+  return matchedIndex >= 0 ? matchedIndex : null;
 }
 
 function looksLikeHeaderRow(row: SpreadsheetRow | undefined, labels: string[]): boolean {
@@ -183,18 +282,7 @@ function readFirstNonEmpty(row: SpreadsheetRow, indexes: number[]): string {
 }
 
 function readOldCostState(row: SpreadsheetRow): string {
-  const explicitValue = readFirstNonEmpty(row, [42, 43]);
-  if (explicitValue) {
-    return explicitValue;
-  }
-
-  for (let index = row.length - 1; index >= 0; index -= 1) {
-    const value = readCell(row, index, "").trim();
-    if (value) {
-      return value;
-    }
-  }
-  return "";
+  return readCell(row, 42, "").trim();
 }
 
 function readPayableUnitCode(row: SpreadsheetRow): string {
@@ -205,6 +293,14 @@ function readPayableCostCode(row: SpreadsheetRow): string {
   return readFirstNonEmpty(row, [38, 37, 35]);
 }
 
+function readPayableVendor(row: SpreadsheetRow): string {
+  return readFirstNonEmpty(row, [14]);
+}
+
+function readPayableAmount(row: SpreadsheetRow): number {
+  return parseNumber(row[20]);
+}
+
 function getPayableDataRows(rows: SpreadsheetRow[]): SpreadsheetRow[] {
   return stripHeaderRow(rows, ["Category", "Rule_ID", "Vendor", "Amount", "Cost State"]);
 }
@@ -213,83 +309,168 @@ function getFinalDetailDataRows(rows: SpreadsheetRow[]): SpreadsheetRow[] {
   return stripHeaderRow(rows, ["Category", "Rule_ID", "Final Date", "Incurred Date", "Cost State", "Amount"]);
 }
 
-function buildInvoiceMatchOverview(
-  payableRows: SpreadsheetRow[],
-  finalDetailRows: SpreadsheetRow[],
-  drawRequestRows: SpreadsheetRow[],
-): ExternalReconSnapshot["invoice_match_overview"] {
-  const payableData = getPayableDataRows(payableRows).filter((row) => readCell(row, 14, "").trim() || readCell(row, 20, "").trim());
-  const finalData = getFinalDetailDataRows(finalDetailRows).filter(
-    (row) => readCell(row, 20, "").trim() || readCell(row, 27, "").trim(),
-  );
-  const drawHeaderIndex = findHeaderRowIndex(drawRequestRows, "Sql");
-  const drawData = (drawHeaderIndex >= 0 ? drawRequestRows.slice(drawHeaderIndex + 1) : drawRequestRows).filter(
-    (row) => readCell(row, 7, "").trim() || readCell(row, 25, "").trim(),
-  );
+function readFinalDetailVendor(row: SpreadsheetRow): string {
+  return readFirstNonEmpty(row, [29, 28]);
+}
 
-  const finalKeys = new Set(
-    finalData.map((row) =>
-      buildInvoiceMatchKey([
-        row[27],
-        row[19],
-        row[20],
-        row[21],
-        row[25],
-      ]),
-    ),
-  );
-  const drawKeys = new Set(
-    drawData.map((row) =>
-      buildInvoiceMatchKey([
-        row[25],
-        row[14],
-        row[7],
-        row[21],
-        row[19],
-      ]),
-    ),
-  );
+function readFinalDetailAmount(row: SpreadsheetRow): number {
+  return parseNumber(row[27]);
+}
 
-  let matchedToFinal = 0;
-  let matchedToDraw = 0;
-  let matchedToBoth = 0;
-  let payableUnmatched = 0;
+function readFinalDetailUnitCode(row: SpreadsheetRow): string {
+  return readFirstNonEmpty(row, [20, 21, 19]);
+}
 
-  for (const row of payableData) {
-    const key = buildInvoiceMatchKey([
-      row[20],
-      row[21],
-      row[37],
-      row[15],
-      row[38],
-    ]);
-    const hasFinal = finalKeys.has(key);
-    const hasDraw = drawKeys.has(key);
-    if (hasFinal) {
-      matchedToFinal += 1;
-    }
-    if (hasDraw) {
-      matchedToDraw += 1;
-    }
-    if (hasFinal && hasDraw) {
-      matchedToBoth += 1;
-    }
-    if (!hasFinal && !hasDraw) {
-      payableUnmatched += 1;
-    }
-  }
+function readFinalDetailCostCode(row: SpreadsheetRow): string {
+  return readFirstNonEmpty(row, [25]);
+}
 
-  return {
-    payable_total_invoices: payableData.length,
-    final_total_invoices: finalData.length,
-    draw_total_invoices: drawData.length,
-    matched_to_final: matchedToFinal,
-    matched_to_draw: matchedToDraw,
-    matched_to_both: matchedToBoth,
-    payable_unmatched: payableUnmatched,
-    final_only: Math.max(finalData.length - matchedToFinal, 0),
-    draw_only: Math.max(drawData.length - matchedToDraw, 0),
-  };
+function readFinalDetailActivityNo(row: SpreadsheetRow): string {
+  return readFirstNonEmpty(row, [22]);
+}
+
+function readFinalDetailActivity(row: SpreadsheetRow): string {
+  return readFirstNonEmpty(row, [23]);
+}
+
+function readFinalDetailRuleId(row: SpreadsheetRow): string {
+  return readCell(row, 1, "").trim();
+}
+
+function readFinalDetailCategory(row: SpreadsheetRow): string {
+  return readCell(row, 0, "").trim();
+}
+
+function readFinalDetailCostState(row: SpreadsheetRow): string {
+  return readCell(row, 24, "").trim();
+}
+
+function normalizeReclassCategory(value: SpreadsheetCell): string {
+  const text = String(value ?? "").trim();
+  return text || "未分配";
+}
+
+function sortReclassState(left: string, right: string): number {
+  if (left === "未分配") return 1;
+  if (right === "未分配") return -1;
+  return left.localeCompare(right);
+}
+
+function addAmountCount<T extends { amount: number; count: number }>(
+  map: Map<string, T>,
+  key: string,
+  create: () => T,
+  amount: number,
+) {
+  const entry = map.get(key) || create();
+  entry.amount += amount;
+  entry.count += 1;
+  map.set(key, entry);
+}
+
+function buildReclassTableSummaries(
+  invoiceRows: ReclassAuditSnapshot["invoice_rows"],
+  internalCompanies: readonly InternalCompanyRegistryRow[],
+): ReclassAuditSnapshot["table_summaries"] {
+  return (["Payable", "Final Detail"] as const).map((sourceTable) => {
+    const rows = invoiceRows.filter((row) => row.source_table === sourceTable);
+    const beforeMap = new Map<string, { cost_state: string; amount: number; count: number }>();
+    const afterMap = new Map<string, { cost_state: string; amount: number; count: number }>();
+    const transitionMap = new Map<
+      string,
+      { old_cost_state: string; new_cost_state: string; amount: number; count: number }
+    >();
+    const internalTransitionMap = new Map<
+      string,
+      { company_name: string; old_cost_state: string; new_cost_state: string; amount: number; count: number }
+    >();
+
+    let totalAmount = 0;
+    let changedAmount = 0;
+    let changedCount = 0;
+
+    rows.forEach((row) => {
+      const oldCostState = normalizeReclassCategory(row.old_cost_state);
+      const newCostState = normalizeReclassCategory(row.new_category);
+      const amount = Number(row.amount || 0);
+
+      totalAmount += amount;
+      addAmountCount(beforeMap, oldCostState, () => ({ cost_state: oldCostState, amount: 0, count: 0 }), amount);
+      addAmountCount(afterMap, newCostState, () => ({ cost_state: newCostState, amount: 0, count: 0 }), amount);
+      addAmountCount(
+        transitionMap,
+        `${oldCostState}=>${newCostState}`,
+        () => ({
+          old_cost_state: oldCostState,
+          new_cost_state: newCostState,
+          amount: 0,
+          count: 0,
+        }),
+        amount,
+      );
+
+      if (oldCostState !== newCostState) {
+        changedAmount += amount;
+        changedCount += 1;
+      }
+
+      if (row.vendor && isInternalCompanyVendor(row.vendor, internalCompanies)) {
+        const normalizedVendor = normalizeInternalCompanyName(row.vendor);
+        const companyName =
+          internalCompanies.find((company) => company.normalized_name === normalizedVendor)?.company_name || row.vendor;
+        addAmountCount(
+          internalTransitionMap,
+          `${companyName}::${oldCostState}=>${newCostState}`,
+          () => ({
+            company_name: companyName,
+            old_cost_state: oldCostState,
+            new_cost_state: newCostState,
+            amount: 0,
+            count: 0,
+          }),
+          amount,
+        );
+      }
+    });
+
+    const sortTransition = <
+      T extends { old_cost_state: string; new_cost_state: string; company_name?: string; amount: number; count: number },
+    >(
+      left: T,
+      right: T,
+    ) => {
+      if (left.company_name && right.company_name && left.company_name !== right.company_name) {
+        return left.company_name.localeCompare(right.company_name);
+      }
+      const oldStateOrder = sortReclassState(left.old_cost_state, right.old_cost_state);
+      return oldStateOrder !== 0 ? oldStateOrder : sortReclassState(left.new_cost_state, right.new_cost_state);
+    };
+
+    const totalCount = rows.length;
+    const unchangedAmount = totalAmount - changedAmount;
+
+    return {
+      source_table: sourceTable,
+      total_amount: Number(totalAmount.toFixed(2)),
+      total_count: totalCount,
+      changed_amount: Number(changedAmount.toFixed(2)),
+      changed_count: changedCount,
+      unchanged_amount: Number(unchangedAmount.toFixed(2)),
+      unchanged_count: totalCount - changedCount,
+      before_rows: [...beforeMap.values()]
+        .map((row) => ({ ...row, amount: Number(row.amount.toFixed(2)) }))
+        .sort((left, right) => sortReclassState(left.cost_state, right.cost_state)),
+      after_rows: [...afterMap.values()]
+        .map((row) => ({ ...row, amount: Number(row.amount.toFixed(2)) }))
+        .sort((left, right) => sortReclassState(left.cost_state, right.cost_state)),
+      transition_rows: [...transitionMap.values()]
+        .map((row) => ({ ...row, amount: Number(row.amount.toFixed(2)) }))
+        .sort(sortTransition),
+      internal_company_transition_rows: [...internalTransitionMap.values()]
+        .map((row) => ({ ...row, amount: Number(row.amount.toFixed(2)) }))
+        .sort(sortTransition),
+    };
+  });
 }
 
 export function normalizeSpreadsheetId(spreadsheetId?: string | string[] | null): string {
@@ -305,118 +486,44 @@ export function normalizeSpreadsheetId(spreadsheetId?: string | string[] | null)
 }
 
 export function buildHighlights(kpiRows: SpreadsheetRow[]): HighlightCard[] {
-  const kpiRow = kpiRows[1] || [];
-
   return [
-    { label: "Revenue", value: readCell(kpiRow, 1), color: "blue" },
-    { label: "Actual Cost", value: readCell(kpiRow, 2), color: "indigo" },
-    { label: "Gross Margin", value: readCell(kpiRow, 3), color: "emerald" },
-    { label: "POC (%)", value: readCell(kpiRow, 9), color: "purple" },
+    { label: "Revenue", value: readCell(kpiRows[2], 6), color: "blue" },
+    { label: "Actual Cost", value: readCell(kpiRows[3], 6), color: "indigo" },
+    { label: "Gross Margin", value: readCell(kpiRows[4], 6), color: "emerald" },
+    { label: "POC (%)", value: readCell(kpiRows[12], 4), color: "purple" },
   ];
 }
 
-export function buildReconDiscrepancies(
+function buildReclassAuditSnapshot(
   payableRows: SpreadsheetRow[],
   finalDetailRows: SpreadsheetRow[],
-): ReconDiscrepancy[] {
-  const payableTotals: Record<string, number> = {};
-  const finalTotals: Record<string, number> = {};
-
-  for (const row of payableRows) {
-    const state = readCell(row, 16, "").trim();
-    if (!RECON_STATES.includes(state as (typeof RECON_STATES)[number])) {
-      continue;
-    }
-    payableTotals[state] = (payableTotals[state] || 0) + parseNumber(row[0]);
-  }
-
-  for (const row of finalDetailRows) {
-    const state = readCell(row, 0, "").trim();
-    if (!RECON_STATES.includes(state as (typeof RECON_STATES)[number])) {
-      continue;
-    }
-    finalTotals[state] = (finalTotals[state] || 0) + parseNumber(row[3]);
-  }
-
-  return RECON_STATES.map((state) => {
-    const payable = Number(payableTotals[state] || 0);
-    const final = Number(finalTotals[state] || 0);
-    return {
-      state,
-      payable: Number(payable.toFixed(2)),
-      final: Number(final.toFixed(2)),
-      diff: Number((payable - final).toFixed(2)),
-    };
-  });
-}
-
-function buildCostStateRecon(payableRows: SpreadsheetRow[], finalDetailRows: SpreadsheetRow[]): ReconDiscrepancy[] {
-  const payableTotals: Record<string, number> = {};
-  const finalTotals: Record<string, number> = {};
-
-  for (const row of getPayableDataRows(payableRows)) {
-    const state = readOldCostState(row);
-    if (!RECON_STATES.includes(state as (typeof RECON_STATES)[number])) {
-      continue;
-    }
-    payableTotals[state] = (payableTotals[state] || 0) + parseNumber(row[20]);
-  }
-
-  for (const row of getFinalDetailDataRows(finalDetailRows)) {
-    const state = readCell(row, 0, "").trim();
-    if (!RECON_STATES.includes(state as (typeof RECON_STATES)[number])) {
-      continue;
-    }
-    finalTotals[state] = (finalTotals[state] || 0) + parseNumber(row[27]);
-  }
-
-  return RECON_STATES.map((state) => {
-    const payable = Number((payableTotals[state] || 0).toFixed(2));
-    const final = Number((finalTotals[state] || 0).toFixed(2));
-    return {
-      state,
-      payable,
-      final,
-      diff: Number((payable - final).toFixed(2)),
-    };
-  });
-}
-
-function buildUnitBudgetVariances(unitMasterRows: SpreadsheetRow[]) {
-  const headerIndex = findHeaderRowIndex(unitMasterRows, "Unit Code");
-  const dataRows = headerIndex >= 0 ? unitMasterRows.slice(headerIndex + 1) : unitMasterRows.slice(1);
-
-  return dataRows
-    .map((row) => ({
-      unit_code: readCell(row, 0, "").trim(),
-      total_budget: parseNumber(row[1]),
-      wip_budget: parseNumber(row[3]),
-      diff: Number((parseNumber(row[1]) - parseNumber(row[3])).toFixed(2)),
-    }))
-    .filter((row) => row.unit_code);
-}
-
-function buildExternalReconSnapshot(
-  payableRows: SpreadsheetRow[],
-  finalDetailRows: SpreadsheetRow[],
-  drawRequestRows: SpreadsheetRow[],
-  unitMasterRows: SpreadsheetRow[],
-): ExternalReconSnapshot {
-  return {
-    summary: "Live Sync Successful",
-    discrepancies: buildReconDiscrepancies(payableRows, finalDetailRows),
-    recon_by_cost_state: buildCostStateRecon(payableRows, finalDetailRows),
-    unit_budget_variances: buildUnitBudgetVariances(unitMasterRows),
-    invoice_match_overview: buildInvoiceMatchOverview(payableRows, finalDetailRows, drawRequestRows),
+  internalCompanies: readonly InternalCompanyRegistryRow[],
+): ReclassAuditSnapshot {
+  const overview = {
+    payable_amount: 0,
+    payable_count: 0,
+    final_detail_amount: 0,
+    final_detail_count: 0,
+    diff_amount: 0,
+    diff_count: 0,
+    old_total: 0,
+    new_total: 0,
+    diff_invoice_count: 0,
   };
-}
-
-function buildReclassAuditSnapshot(payableRows: SpreadsheetRow[]): ReclassAuditSnapshot {
-  const overview = { old_total: 0, new_total: 0, diff_amount: 0, diff_invoice_count: 0 };
-  const oldTotals: Record<string, number> = {};
-  const newTotals: Record<string, number> = {};
-  const diffCounts: Record<string, number> = {};
+  const payableTotals: Record<string, number> = {};
+  const payableCounts: Record<string, number> = {};
+  const finalTotals: Record<string, number> = {};
+  const finalCounts: Record<string, number> = {};
   const sankeyLinkTotals = new Map<string, number>();
+  const internalCompanyCategoryTotals = new Map<
+    string,
+    {
+      company_name: string;
+      category: string;
+      payable_amount: number;
+      final_detail_amount: number;
+    }
+  >();
   const ruleMap = new Map<
     string,
     {
@@ -430,69 +537,148 @@ function buildReclassAuditSnapshot(payableRows: SpreadsheetRow[]): ReclassAuditS
   >();
   const invoice_rows: ReclassAuditSnapshot["invoice_rows"] = [];
 
-  for (const row of getPayableDataRows(payableRows)) {
-    const newCategory = readCell(row, 0, "").trim();
+  getPayableDataRows(payableRows).forEach((row, index) => {
+    const newCategory = normalizeReclassCategory(readCell(row, 0, "").trim());
     const ruleId = readCell(row, 1, "").trim();
-    const oldCostState = readOldCostState(row);
-    const amount = parseNumber(row[20]);
+    const oldCostState = normalizeReclassCategory(readOldCostState(row));
+    const amount = readPayableAmount(row);
+    const vendor = readPayableVendor(row);
 
-    if (!oldCostState || !newCategory || ruleId === "R000") {
-      continue;
-    }
-
-    overview.old_total += amount;
-    overview.new_total += amount;
-    oldTotals[oldCostState] = (oldTotals[oldCostState] || 0) + amount;
-    newTotals[newCategory] = (newTotals[newCategory] || 0) + amount;
+    overview.payable_amount += amount;
+    overview.payable_count += 1;
+    payableTotals[newCategory] = (payableTotals[newCategory] || 0) + amount;
+    payableCounts[newCategory] = (payableCounts[newCategory] || 0) + 1;
     const sankeyKey = `${oldCostState}=>${newCategory}`;
     sankeyLinkTotals.set(sankeyKey, (sankeyLinkTotals.get(sankeyKey) || 0) + amount);
 
     if (oldCostState !== newCategory) {
       overview.diff_amount += amount;
-      overview.diff_invoice_count += 1;
-      diffCounts[oldCostState] = (diffCounts[oldCostState] || 0) - amount;
-      diffCounts[newCategory] = (diffCounts[newCategory] || 0) + amount;
+      overview.diff_count += 1;
     }
 
-    const ruleRow = ruleMap.get(ruleId) || {
-      rule_id: ruleId,
-      category: newCategory,
-      old_cost_states: new Set<string>(),
-      amount: 0,
-      diff_amount: 0,
-      invoice_count: 0,
-    };
-    ruleRow.old_cost_states.add(oldCostState);
-    ruleRow.amount += amount;
-    if (oldCostState !== newCategory) {
-      ruleRow.diff_amount += amount;
+    if (vendor && isInternalCompanyVendor(vendor, internalCompanies)) {
+      const normalizedVendor = normalizeInternalCompanyName(vendor);
+      const companyName =
+        internalCompanies.find((company) => company.normalized_name === normalizedVendor)?.company_name || vendor;
+      const internalKey = `${companyName}::${newCategory}`;
+      const internalEntry = internalCompanyCategoryTotals.get(internalKey) || {
+        company_name: companyName,
+        category: newCategory,
+        payable_amount: 0,
+        final_detail_amount: 0,
+      };
+      internalEntry.payable_amount += amount;
+      internalCompanyCategoryTotals.set(internalKey, internalEntry);
     }
-    ruleRow.invoice_count += 1;
-    ruleMap.set(ruleId, ruleRow);
 
     invoice_rows.push({
-      vendor: readCell(row, 14, "").trim(),
+      source_table: "Payable",
+      row_no: index + 1,
+      vendor,
       amount,
       incurred_date: readCell(row, 21, "").trim(),
       unit_code: readPayableUnitCode(row),
       cost_code: readPayableCostCode(row),
+      cost_name: readCell(row, 39, ""),
       old_cost_state: oldCostState,
       new_category: newCategory,
       rule_id: ruleId,
+      match_status: oldCostState === newCategory ? "matched" : "reclassed",
     });
-  }
 
-  const categories = Array.from(new Set([...Object.keys(oldTotals), ...Object.keys(newTotals)]));
+    if (ruleId && ruleId !== "R000") {
+      const ruleRow = ruleMap.get(ruleId) || {
+        rule_id: ruleId,
+        category: newCategory,
+        old_cost_states: new Set<string>(),
+        amount: 0,
+        diff_amount: 0,
+        invoice_count: 0,
+      };
+      ruleRow.old_cost_states.add(oldCostState);
+      ruleRow.amount += amount;
+      if (oldCostState !== newCategory) {
+        ruleRow.diff_amount += amount;
+      }
+      ruleRow.invoice_count += 1;
+      ruleMap.set(ruleId, ruleRow);
+    }
+  });
+
+  getFinalDetailDataRows(finalDetailRows).forEach((row, index) => {
+    const newCategory = normalizeReclassCategory(readFinalDetailCategory(row));
+    const oldCostState = normalizeReclassCategory(readFinalDetailCostState(row));
+    const amount = readFinalDetailAmount(row);
+    const vendor = readFinalDetailVendor(row);
+
+    overview.final_detail_amount += amount;
+    overview.final_detail_count += 1;
+    finalTotals[newCategory] = (finalTotals[newCategory] || 0) + amount;
+    finalCounts[newCategory] = (finalCounts[newCategory] || 0) + 1;
+
+    if (vendor && isInternalCompanyVendor(vendor, internalCompanies)) {
+      const normalizedVendor = normalizeInternalCompanyName(vendor);
+      const companyName =
+        internalCompanies.find((company) => company.normalized_name === normalizedVendor)?.company_name || vendor;
+      const internalKey = `${companyName}::${newCategory}`;
+      const internalEntry = internalCompanyCategoryTotals.get(internalKey) || {
+        company_name: companyName,
+        category: newCategory,
+        payable_amount: 0,
+        final_detail_amount: 0,
+      };
+      internalEntry.final_detail_amount += amount;
+      internalCompanyCategoryTotals.set(internalKey, internalEntry);
+    }
+
+    invoice_rows.push({
+      source_table: "Final Detail",
+      row_no: index + 1,
+      vendor,
+      amount,
+      incurred_date: readCell(row, 19, "").trim(),
+      unit_code: readFinalDetailUnitCode(row),
+      cost_code: readFinalDetailCostCode(row),
+      cost_name: buildFinalDetailCostNameLabel(readFinalDetailActivityNo(row), readFinalDetailActivity(row)),
+      old_cost_state: oldCostState,
+      new_category: newCategory,
+      rule_id: readFinalDetailRuleId(row),
+      match_status: oldCostState === newCategory ? "matched" : "reclassed",
+      present_in_final_detail: true,
+    });
+  });
+
+  const table_summaries = buildReclassTableSummaries(invoice_rows, internalCompanies);
+  overview.old_total = Number(overview.payable_amount.toFixed(2));
+  overview.new_total = Number(overview.final_detail_amount.toFixed(2));
+  overview.diff_amount = Number(table_summaries.reduce((sum, row) => sum + row.changed_amount, 0).toFixed(2));
+  overview.diff_count = table_summaries.reduce((sum, row) => sum + row.changed_count, 0);
+  overview.diff_invoice_count = overview.diff_count;
+
+  const categories = Array.from(new Set([...Object.keys(payableTotals), ...Object.keys(finalTotals)])).sort((a, b) => {
+    if (a === "未分配") return 1;
+    if (b === "未分配") return -1;
+    return a.localeCompare(b);
+  });
   const category_rows = categories.map((category) => {
-    const old_total = Number((oldTotals[category] || 0).toFixed(2));
-    const new_total = Number((newTotals[category] || 0).toFixed(2));
-    const diff_amount = Number((new_total - old_total).toFixed(2));
+    const payable_amount = Number((payableTotals[category] || 0).toFixed(2));
+    const final_detail_amount = Number((finalTotals[category] || 0).toFixed(2));
+    const payable_count = payableCounts[category] || 0;
+    const final_detail_count = finalCounts[category] || 0;
+    const diff_amount = Number((payable_amount - final_detail_amount).toFixed(2));
+    const diff_count = payable_count - final_detail_count;
+
     return {
       category,
-      old_total,
-      new_total,
+      payable_amount,
+      payable_count,
+      final_detail_amount,
+      final_detail_count,
+      diff_count,
+      old_total: payable_amount,
+      new_total: final_detail_amount,
       diff_amount,
-      diff_invoice_count: Math.abs(diffCounts[category] || 0) > 0 ? 1 : 0,
+      diff_invoice_count: Math.abs(diff_count),
     };
   });
 
@@ -530,15 +716,23 @@ function buildReclassAuditSnapshot(payableRows: SpreadsheetRow[]): ReclassAuditS
   });
 
   return {
-    overview: {
-      old_total: Number(overview.old_total.toFixed(2)),
-      new_total: Number(overview.new_total.toFixed(2)),
-      diff_amount: Number(overview.diff_amount.toFixed(2)),
-      diff_invoice_count: overview.diff_invoice_count,
-    },
+    overview,
+    table_summaries,
     category_rows,
     rule_rows,
     invoice_rows,
+    internal_company_category_matrix: [...internalCompanyCategoryTotals.values()]
+      .map((row) => ({
+        ...row,
+        payable_amount: Number(row.payable_amount.toFixed(2)),
+        final_detail_amount: Number(row.final_detail_amount.toFixed(2)),
+        diff_amount: Number((row.payable_amount - row.final_detail_amount).toFixed(2)),
+      }))
+      .sort((left, right) =>
+        left.company_name === right.company_name
+          ? left.category.localeCompare(right.category)
+          : left.company_name.localeCompare(right.company_name),
+      ),
     sankey: {
       nodes,
       links,
@@ -547,26 +741,278 @@ function buildReclassAuditSnapshot(payableRows: SpreadsheetRow[]): ReclassAuditS
 }
 
 const COMPARE_109_ROWS = [
-  { rowIndex: 18, label: "Current Period Revenue" },
-  { rowIndex: 29, label: "Current Period Cost" },
-  { rowIndex: 51, label: "Gross Profit" },
+  {
+    label: "收入",
+    companyLabels: [["General Conditions fee-Company"]],
+    auditLabels: [["General Conditions fee-Audited"]],
+  },
+  {
+    label: "成本",
+    companyLabels: [["Cost of Goods Sold-Company"]],
+    auditLabels: [["Cost of Goods Sold-Audited"], ["Audit Adjustment (Current Period)"]],
+  },
+  {
+    label: "毛利",
+    companyLabels: [["Gross Profit-Company"]],
+    auditLabels: [["Gross Profit-Audit"], ["Gross Profit-Audited"]],
+  },
 ] as const;
 
-export function build109CompareSnapshot(rows109: SpreadsheetRow[]): Compare109Snapshot {
+type YearAxisColumn = {
+  column_index: number;
+  year_label: string;
+  normalized_year: string;
+};
+
+type YearAxisPair = {
+  company_columns: YearAxisColumn[];
+  audit_columns: YearAxisColumn[];
+  warnings: Compare109Snapshot["warnings"];
+};
+
+const LEGACY_COMPANY_YEAR_START_COLUMN = 5;
+const LEGACY_AUDIT_YEAR_START_COLUMN = 12;
+const LEGACY_YEAR_COLUMN_COUNT = 6;
+
+function normalizeYearLabel(value: SpreadsheetCell): string {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  const yearMatch = text.match(/(?:19|20)\d{2}/);
+  if (yearMatch) {
+    return yearMatch[0];
+  }
+  if (/^Y\d+$/i.test(text)) {
+    return text.toUpperCase();
+  }
+  return text.toUpperCase();
+}
+
+function isContiguousColumns(columns: YearAxisColumn[]): boolean {
+  if (columns.length <= 1) {
+    return true;
+  }
+  return columns.every((column, index) =>
+    index === 0 ? true : columns[index - 1].column_index + 1 === column.column_index,
+  );
+}
+
+function duplicateYearLabels(columns: YearAxisColumn[]): string[] {
+  const counts = new Map<string, number>();
+  columns.forEach((column) => {
+    const normalized = column.normalized_year;
+    if (!normalized) {
+      return;
+    }
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  });
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([year]) => year);
+}
+
+function buildLegacyYearAxisPair(rows109: SpreadsheetRow[], warnings: Compare109Snapshot["warnings"]): YearAxisPair {
+  const company_columns = Array.from({ length: LEGACY_YEAR_COLUMN_COUNT }, (_, idx) => {
+    const column_index = LEGACY_COMPANY_YEAR_START_COLUMN + idx;
+    const year_label = readCell(rows109[9], column_index, `Y${idx + 1}`);
+    return {
+      column_index,
+      year_label,
+      normalized_year: normalizeYearLabel(year_label),
+    };
+  });
+
+  const audit_columns = Array.from({ length: LEGACY_YEAR_COLUMN_COUNT }, (_, idx) => {
+    const column_index = LEGACY_AUDIT_YEAR_START_COLUMN + idx;
+    const year_label = readCell(rows109[9], column_index, company_columns[idx]?.year_label || `Y${idx + 1}`);
+    return {
+      column_index,
+      year_label,
+      normalized_year: normalizeYearLabel(year_label),
+    };
+  });
+
+  warnings.push({
+    code: "MAPPING_FALLBACK",
+    message: "主表年度轴未识别，已使用兼容模式。",
+  });
+
+  return { company_columns, audit_columns, warnings };
+}
+
+function discoverCompare109YearAxis(rows109: SpreadsheetRow[]): YearAxisPair {
+  const warnings: Compare109Snapshot["warnings"] = [];
+  const warningSet = new Set<string>();
+  const addWarning = (code: "MAPPING_AMBIGUITY" | "MAPPING_FALLBACK", message: string) => {
+    const key = `${code}:${message}`;
+    if (warningSet.has(key)) {
+      return;
+    }
+    warningSet.add(key);
+    warnings.push({ code, message });
+  };
+
+  const discovered = discoverYearAxis(rows109);
+  if (!discovered) {
+    return buildLegacyYearAxisPair(rows109, warnings);
+  }
+
+  const axisLength = discovered.endColumnIndex - discovered.startColumnIndex + 1;
+  const headerRow = rows109[discovered.rowIndex] || [];
+  const company_columns = Array.from({ length: axisLength }, (_, idx) => {
+    const column_index = discovered.startColumnIndex + idx;
+    const year_label = readCell(headerRow, column_index, `${discovered.years[idx] ?? `Y${idx + 1}`}`);
+    return {
+      column_index,
+      year_label,
+      normalized_year: normalizeYearLabel(year_label),
+    };
+  });
+
+  if (!isContiguousColumns(company_columns)) {
+    addWarning("MAPPING_AMBIGUITY", "Company 年度列不连续，请检查主表表头。");
+  }
+  const companyDuplicateYears = duplicateYearLabels(company_columns);
+  if (companyDuplicateYears.length > 0) {
+    addWarning(
+      "MAPPING_AMBIGUITY",
+      `Company 年度列存在重复标签：${companyDuplicateYears.join(", ")}`,
+    );
+  }
+
+  const audit_columns = company_columns.map((companyColumn, idx) => {
+    const matchedColumns: number[] = [];
+
+    for (let colIndex = companyColumn.column_index + 1; colIndex < headerRow.length; colIndex += 1) {
+      if (normalizeYearLabel(headerRow[colIndex]) === companyColumn.normalized_year) {
+        matchedColumns.push(colIndex);
+      }
+    }
+
+    if (matchedColumns.length > 1) {
+      addWarning(
+        "MAPPING_AMBIGUITY",
+        `Audit 年度列存在重复候选：${companyColumn.year_label}（第 ${idx + 1} 年）。`,
+      );
+    }
+
+    if (matchedColumns.length === 0) {
+      addWarning(
+        "MAPPING_AMBIGUITY",
+        `Audit 年度列缺失：${companyColumn.year_label}，将按 Company 列回退读取。`,
+      );
+    }
+
+    const column_index = matchedColumns[0] ?? companyColumn.column_index;
+
+    const year_label = readCell(headerRow, column_index, companyColumn.year_label);
+    return {
+      column_index,
+      year_label,
+      normalized_year: normalizeYearLabel(year_label),
+    };
+  });
+
+  if (!isContiguousColumns(audit_columns)) {
+    addWarning("MAPPING_AMBIGUITY", "Audit 年度列不连续，请检查主表表头。");
+  }
+  const auditDuplicateYears = duplicateYearLabels(audit_columns);
+  if (auditDuplicateYears.length > 0) {
+    addWarning(
+      "MAPPING_AMBIGUITY",
+      `Audit 年度列存在重复标签：${auditDuplicateYears.join(", ")}`,
+    );
+  }
+
+  if (audit_columns.length !== company_columns.length) {
+    addWarning("MAPPING_AMBIGUITY", "Company 与 Audit 年度列长度不一致。");
+  }
+
+  return { company_columns, audit_columns, warnings };
+}
+
+export function build109CompareSnapshot(
+  rows109: SpreadsheetRow[],
+  mappingHealth?: {
+    fallback_count?: number;
+    fallback_fields?: string[];
+    mapping_score?: number;
+    mapping_field_count?: number;
+  },
+): Compare109Snapshot {
+  const axis = discoverCompare109YearAxis(rows109);
+  const resolveMetricRow = (labels: readonly (readonly string[])[]) => {
+    for (const labelPath of labels) {
+      const rowIndex = findRowByLabelPath(rows109, [...labelPath]);
+      if (rowIndex !== null) {
+        return rowIndex;
+      }
+    }
+    return null;
+  };
+
+  const namedMetricMap = COMPARE_109_ROWS.reduce(
+    (accumulator, { companyLabels, auditLabels, label }) => {
+      const companyRowIndex = resolveMetricRow(companyLabels);
+      const auditRowIndex = resolveMetricRow(auditLabels);
+      const yearMap = axis.company_columns.reduce<
+        Record<string, { company: number; audit: number; diff: number; has_value: boolean }>
+      >(
+        (yearAccumulator, yearColumn, idx) => {
+          const auditColumn = axis.audit_columns[idx] || yearColumn;
+          const companyCell =
+            companyRowIndex === null ? undefined : rows109[companyRowIndex]?.[yearColumn.column_index];
+          const auditCell = auditRowIndex === null ? undefined : rows109[auditRowIndex]?.[auditColumn.column_index];
+          const company = parseNumber(companyCell);
+          const audit = parseNumber(auditCell);
+          const yearKey = `${yearColumn.year_label || `Y${idx + 1}`}::${idx}`;
+          yearAccumulator[yearKey] = {
+            company,
+            audit,
+            diff: Number((company - audit).toFixed(2)),
+            has_value: hasNumericCell(companyCell) || hasNumericCell(auditCell),
+          };
+          return yearAccumulator;
+        },
+        {},
+      );
+      accumulator[label] = yearMap;
+      return accumulator;
+    },
+    {} as Record<string, Record<string, { company: number; audit: number; diff: number; has_value: boolean }>>,
+  );
+
   return {
-    metric_rows: COMPARE_109_ROWS.map(({ rowIndex, label }) => ({
+    warnings: axis.warnings,
+    mapping_health: mappingHealth
+      ? {
+          fallback_count: Number(mappingHealth.fallback_count || 0),
+          fallback_fields: Array.isArray(mappingHealth.fallback_fields)
+            ? mappingHealth.fallback_fields.map((field) => String(field))
+            : [],
+          mapping_score: Number(mappingHealth.mapping_score || 0),
+          mapping_field_count: Number(mappingHealth.mapping_field_count || 0),
+        }
+      : undefined,
+    metric_rows: COMPARE_109_ROWS.map(({ label }) => ({
       label,
-      year_rows: Array.from({ length: 6 }, (_, idx) => {
-        const yearLabel = readCell(rows109[9], 5 + idx, `Y${idx + 1}`);
-        const company = parseNumber(rows109[rowIndex]?.[5 + idx]);
-        const audit = parseNumber(rows109[rowIndex]?.[12 + idx]);
+      year_rows: axis.company_columns.map((yearColumn, idx) => {
+        const yearKey = `${yearColumn.year_label || `Y${idx + 1}`}::${idx}`;
+        const metric = namedMetricMap[label]?.[yearKey] || {
+          company: 0,
+          audit: 0,
+          diff: 0,
+          has_value: false,
+        };
 
         return {
           year_offset: idx,
-          year_label: yearLabel,
-          company,
-          audit,
-          diff: Number((company - audit).toFixed(2)),
+          year_label: yearColumn.year_label || `Y${idx + 1}`,
+          company: metric.company,
+          audit: metric.audit,
+          diff: metric.diff,
+          has_value: metric.has_value,
         };
       }),
     })),
@@ -575,22 +1021,36 @@ export function build109CompareSnapshot(rows109: SpreadsheetRow[]): Compare109Sn
 
 function buildScopingLogicSnapshot(scopingRows: SpreadsheetRow[]): ScopingLogicRow[] {
   const headerIndex = findHeaderRowIndex(scopingRows, "Group Number");
+  const headerRow = headerIndex >= 0 ? scopingRows[headerIndex] || [] : [];
   const dataRows = headerIndex >= 0 ? scopingRows.slice(headerIndex + 1) : scopingRows.slice(1);
+  const finalGmpColumn = findOptionalColumnByHeader(headerRow, ["Final GMP"]);
+  const hasFinalGmpColumn = finalGmpColumn !== null;
+  const groupNumberColumn = findColumnByHeader(headerRow, ["Group Number"], 2);
+  const groupNameColumn = findColumnByHeader(headerRow, ["Group Name"], 3);
+  const gmpColumn = findColumnByHeader(headerRow, ["GMP"], 4);
+  const feeColumn = findColumnByHeader(headerRow, ["Fee"], hasFinalGmpColumn ? 6 : 5);
+  const wipColumn = findColumnByHeader(headerRow, ["WIP"], hasFinalGmpColumn ? 7 : 6);
+  const wtcColumn = findColumnByHeader(headerRow, ["WTC"], hasFinalGmpColumn ? 8 : 7);
+  const gcColumn = findColumnByHeader(headerRow, ["GC"], hasFinalGmpColumn ? 9 : 8);
+  const tbdColumn = findColumnByHeader(headerRow, ["TBD"], hasFinalGmpColumn ? 10 : 9);
+  const budgetColumn = findColumnByHeader(headerRow, ["Budget amount", "Budget"], hasFinalGmpColumn ? 13 : 12);
+  const incurredAmountColumn = findColumnByHeader(headerRow, ["Incurred amount", "Incurred Amount"], hasFinalGmpColumn ? 14 : 13);
 
   return dataRows
     .map((row) => ({
-      group_number: readCell(row, 2, "").trim(),
-      group_name: readCell(row, 3, "").trim(),
-      statuses: [
-        readCell(row, 4, "").trim(),
-        readCell(row, 5, "").trim(),
-        readCell(row, 6, "").trim(),
-        readCell(row, 7, "").trim(),
-        readCell(row, 8, "").trim(),
-        readCell(row, 9, "").trim(),
-      ].filter(Boolean),
-      budget: parseNumber(row[12]),
-      incurred_amount: parseNumber(row[13]),
+      group_number: readCell(row, groupNumberColumn, "").trim(),
+      group_name: readCell(row, groupNameColumn, "").trim(),
+      statuses: {
+        gmp: readCell(row, gmpColumn, "").trim(),
+        final_gmp: readCell(row, finalGmpColumn ?? -1, "").trim(),
+        fee: readCell(row, feeColumn, "").trim(),
+        wip: readCell(row, wipColumn, "").trim(),
+        wtc: readCell(row, wtcColumn, "").trim(),
+        gc: readCell(row, gcColumn, "").trim(),
+        tbd: readCell(row, tbdColumn, "").trim(),
+      },
+      budget: parseNumber(row[budgetColumn]),
+      incurred_amount: parseNumber(row[incurredAmountColumn]),
     }))
     .filter((row) => row.group_number && (row.budget !== 0 || row.incurred_amount !== 0));
 }
@@ -607,7 +1067,7 @@ function inferWorkflowStage(
 
   const has109Diff = compare109.metric_rows.some((metric) => metric.year_rows.some((row) => Math.abs(row.diff) > 1));
   if (has109Diff) {
-    return "109 Compare";
+    return "Main Sheet Compare";
   }
 
   const hasExternalData =
@@ -631,23 +1091,49 @@ export function buildAuditSnapshot({
   payableRows,
   finalDetailRows,
   drawRequestRows = [],
+  unitBudgetRows = [],
   unitMasterRows = [],
   scopingRows = [],
   rows109 = [],
+  internalCompanies = [],
+  mappingHealth,
 }: {
   projectName: string;
   kpiRows: SpreadsheetRow[];
   payableRows: SpreadsheetRow[];
   finalDetailRows: SpreadsheetRow[];
   drawRequestRows?: SpreadsheetRow[];
+  unitBudgetRows?: SpreadsheetRow[];
   unitMasterRows?: SpreadsheetRow[];
   scopingRows?: SpreadsheetRow[];
   rows109?: SpreadsheetRow[];
+  internalCompanies?: Array<{
+    company_name: string;
+    normalized_name: string;
+  }>;
+  mappingHealth?: {
+    fallback_count?: number;
+    fallback_fields?: string[];
+    mapping_score?: number;
+    mapping_field_count?: number;
+  };
 }): AuditSnapshot {
-  const externalRecon = buildExternalReconSnapshot(payableRows, finalDetailRows, drawRequestRows, unitMasterRows);
-  const reclassAudit = buildReclassAuditSnapshot(payableRows);
-  const compare109 = build109CompareSnapshot(rows109);
+  const externalRecon = buildExternalReconSnapshotV2({
+    unitBudgetRows: unitBudgetRows.length ? unitBudgetRows : unitMasterRows,
+    unitMasterRows,
+    payableRows,
+    finalDetailRows,
+    drawRequestRows,
+    internalCompanies,
+  });
+  const reclassAudit = buildReclassAuditSnapshot(payableRows, finalDetailRows, internalCompanies);
+  const compare109 = build109CompareSnapshot(rows109, mappingHealth);
   const scopingLogic = buildScopingLogicSnapshot(scopingRows);
+  const manualInput = buildManualInputSnapshot({
+    rows109,
+    scopingRows,
+    unitMasterRows,
+  });
 
   return {
     project_name: projectName || "Unnamed Project",
@@ -655,6 +1141,7 @@ export function buildAuditSnapshot({
     workflow_stage: inferWorkflowStage(externalRecon, reclassAudit, compare109, scopingLogic),
     audit_tabs: {
       external_recon: externalRecon,
+      manual_input: manualInput,
       reclass_audit: reclassAudit,
       compare_109: compare109,
       scoping_logic: scopingLogic,
