@@ -1162,10 +1162,14 @@ describe("phase 1 workbench page", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "重分类规则" })).toBeTruthy());
     const title = screen.getByText("审计工作台");
     const rulesButton = screen.getByRole("button", { name: "重分类规则" });
+    const operatorGuideLink = screen.getByRole("link", { name: "财务人员操作说明" });
     const addButton = screen.getByRole("button", { name: "添加新项目" });
 
     expect(title.compareDocumentPosition(rulesButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(rulesButton.compareDocumentPosition(addButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(rulesButton.compareDocumentPosition(operatorGuideLink) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(operatorGuideLink.compareDocumentPosition(addButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(operatorGuideLink.getAttribute("href")).toBe("/operator-guide");
+    expect(operatorGuideLink.getAttribute("target")).toBe("_blank");
 
     fireEvent.click(rulesButton);
 

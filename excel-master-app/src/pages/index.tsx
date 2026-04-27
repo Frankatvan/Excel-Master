@@ -912,6 +912,17 @@ function ReclassRulesIcon() {
   );
 }
 
+function OperatorGuideIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M7 3h7l4 4v14H7z" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M14 3v5h4" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10 12h5" strokeLinecap="round" />
+      <path d="M10 16h5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function SnapshotHistoryIcon() {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2178,6 +2189,18 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
               >
                 <ReclassRulesIcon />
               </button>
+            )}
+            {session && (
+              <a
+                href="/operator-guide"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="财务人员操作说明"
+                title="财务人员操作说明"
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-[#C9D8D1] bg-[#FFFDF7] text-[#287A5C] transition hover:bg-[#EEF6F1]"
+              >
+                <OperatorGuideIcon />
+              </a>
             )}
             {session && (
               <button
