@@ -178,6 +178,66 @@ def test_validate_input_runs_after_successful_write():
     assert result["manifest_status"] == "validated"
 
 
+def test_default_batch_update_calls_google_sheets_batch_update(monkeypatch):
+    worker = load_worker_module()
+    calls = []
+
+    class BatchUpdateRequest:
+        def execute(self):
+            return {"spreadsheetId": "sheet-1", "replies": [{}, {}]}
+
+    class Spreadsheets:
+        def batchUpdate(self, *, spreadsheetId, body):
+            calls.append((spreadsheetId, body))
+            return BatchUpdateRequest()
+
+    class Service:
+        def spreadsheets(self):
+            return Spreadsheets()
+
+    monkeypatch.setattr(
+        worker,
+        "_load_runtime_dependencies",
+        lambda: {
+            "get_sheets_service": lambda: Service(),
+            "run_validate_input_data": lambda service, spreadsheet_id: {"unused": spreadsheet_id},
+        },
+    )
+
+    result = worker.default_batch_update("sheet-1", [{"repeatCell": {}}, {"updateCells": {}}])
+
+    assert calls == [("sheet-1", {"requests": [{"repeatCell": {}}, {"updateCells": {}}]})]
+    assert result == {"spreadsheetId": "sheet-1", "replies": [{}, {}], "request_count": 2}
+
+
+def test_default_validate_input_calls_existing_validate_input(monkeypatch):
+    worker = load_worker_module()
+    calls = []
+    service = object()
+
+    def run_validate_input_data(actual_service, spreadsheet_id):
+        calls.append((actual_service, spreadsheet_id))
+        return {"unit_master_rows_written": 3}
+
+    monkeypatch.setattr(
+        worker,
+        "_load_runtime_dependencies",
+        lambda: {
+            "get_sheets_service": lambda: service,
+            "run_validate_input_data": run_validate_input_data,
+        },
+    )
+
+    result = worker.default_validate_input("sheet-1", [{"source_table": "payable"}])
+
+    assert calls == [(service, "sheet-1")]
+    assert result == {
+        "ok": True,
+        "summary": {"unit_master_rows_written": 3},
+        "manifest_count": 1,
+    }
+
+
 def test_validation_failure_preserves_import_requests_but_marks_failed_outcome():
     worker = load_worker_module()
 

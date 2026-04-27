@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 
@@ -230,12 +232,40 @@ def zone_fingerprint(resolved_zone: Mapping[str, Any] | None) -> str | None:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _load_runtime_dependencies() -> dict[str, Any]:
+    logic_dir = Path(__file__).resolve().parents[1]
+    logic_path = str(logic_dir)
+    if logic_path not in sys.path:
+        sys.path.insert(0, logic_path)
+
+    from aiwb_finance.finance_engine import run_validate_input_data
+    from aiwb_finance.finance_utils import get_sheets_service
+
+    return {
+        "get_sheets_service": get_sheets_service,
+        "run_validate_input_data": run_validate_input_data,
+    }
+
+
 def default_batch_update(spreadsheet_id: str, requests: list[dict[str, Any]]) -> Mapping[str, Any]:
-    raise NotImplementedError("Inject a Sheets batch update callable before enabling the worker endpoint")
+    deps = _load_runtime_dependencies()
+    service = deps["get_sheets_service"]()
+    if not requests:
+        return {"request_count": 0, "replies": []}
+
+    result = (
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests})
+        .execute()
+    )
+    return {**dict(result or {}), "request_count": len(requests)}
 
 
 def default_validate_input(spreadsheet_id: str, manifest: list[dict[str, Any]]) -> Mapping[str, Any]:
-    raise NotImplementedError("Inject a validation callable before enabling the worker endpoint")
+    deps = _load_runtime_dependencies()
+    service = deps["get_sheets_service"]()
+    summary = deps["run_validate_input_data"](service, spreadsheet_id)
+    return {"ok": True, "summary": summary, "manifest_count": len(manifest)}
 
 
 class handler(BaseHTTPRequestHandler):

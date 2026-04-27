@@ -49,6 +49,9 @@ describe("deployment packaging guardrails", () => {
         "api/internal/reclassify_job.py": expect.objectContaining({
           maxDuration: expect.any(Number),
         }),
+        "api/external_import_worker.py": expect.objectContaining({
+          maxDuration: expect.any(Number),
+        }),
       }),
     );
   });
