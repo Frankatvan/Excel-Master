@@ -4,10 +4,14 @@ import json
 import os
 import pickle
 import re
+import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import yaml
@@ -16,7 +20,7 @@ from googleapiclient.discovery import build
 from openpyxl import load_workbook
 
 from .finance_mapping import MapperFactory
-from .finance_formulas import FinanceFormulaGenerator
+from .finance_formulas import FinanceFormulaGenerator, FormulaTemplateResolver
 from .finance_formatting import SemanticFormattingEngine
 from .finance_mapping import ExcelSemanticMapper
 
@@ -73,6 +77,8 @@ from .finance_utils import (
     _grid_cell,
     _find_first_row,
     _find_rows_by_item_label,
+    _get_service_account_info,
+    get_sheets_service,
 )
 
 SCOPES = [
@@ -98,6 +104,12 @@ DEFAULT_AMOUNT_COLUMN = "Amount"
 DEFAULT_ENTITY_COLUMN = "WBH"
 DEFAULT_GUARD_SHEET = "Project Ledger"
 DEFAULT_EXPECTED_FIRST_CELL = "Project Ledger"
+MANAGED_109_PROTECTION_DESCRIPTION = "AiWB managed main sheet protection"
+MANAGED_109_FORMULA_LOCK_PREFIX = "AiWB managed formula lock"
+MANAGED_EXTERNAL_PROTECTION_PREFIX = "AiWB managed external protection"
+WORKBENCH_STAGE_PROJECT_CREATED = "project_created"
+MANAGED_DATA_LOCK_PREFIX = "AiWB managed data lock"
+FORMULA_WRITE_CHUNK_SIZE = 200
 
 UID_STATUS_COL = "__AIWB_UID_SYNC_STATUS"
 SHADOW_CONFLICT_COL = "__AIWB_SHADOW_CONFLICT"
@@ -1283,12 +1295,39 @@ def execute_commit(
 
 
 def _find_year_header_row_109(rows: Sequence[Sequence[Any]]) -> int | None:
-    target = [2021, 2022, 2023, 2024, 2025, 2026]
-    for row_i in range(1, len(rows) + 1):
-        vals = [_extract_year(_grid_cell(rows, row_i, col)) for col in range(6, 12)]
-        if vals == target:
-            return row_i
+    axis = _detect_109_year_axis(rows)
+    if axis:
+        return axis[0]
     return None
+
+
+def _detect_109_year_axis(rows: Sequence[Sequence[Any]]) -> Tuple[int, List[int], List[int]] | None:
+    for row_i in range(1, len(rows) + 1):
+        row = rows[row_i - 1] if row_i - 1 < len(rows) else []
+        starts: List[int] = []
+        for start_col in range(1, max(len(row) - 4, 1)):
+            vals = [_extract_year(_grid_cell(rows, row_i, col)) for col in range(start_col, start_col + 6)]
+            if all(isinstance(val, int) for val in vals) and vals == list(range(int(vals[0]), int(vals[0]) + 6)):
+                starts.append(start_col)
+        if starts:
+            primary = list(range(starts[0], starts[0] + 6))
+            audit_start = starts[1] if len(starts) > 1 else starts[0] + 7
+            audit = list(range(audit_start, audit_start + 6))
+            return row_i, primary, audit
+    return None
+
+
+def _build_109_year_axis_config(rows: Sequence[Sequence[Any]]) -> Dict[str, Any]:
+    axis = _detect_109_year_axis(rows)
+    if not axis:
+        return {}
+    _, primary_cols, audit_cols = axis
+    anchor_col = _column_number_to_a1(primary_cols[-1])
+    return {
+        "primary_year_cols": [_column_number_to_a1(col) for col in primary_cols],
+        "audit_year_cols": [_column_number_to_a1(col) for col in audit_cols],
+        "start_year_anchor_cell": f"{anchor_col}2",
+    }
 
 
 def _choose_contract_price_row(rows: Sequence[Sequence[Any]], label_rows: Dict[str, List[int]]) -> int | None:
@@ -1345,6 +1384,386 @@ def _merge_formula_plan_with_semantic_updates(
         merged_by_range[range_ref] = dict(item)
 
     return [merged_by_range[range_ref] for range_ref in ordered_ranges]
+
+
+def _compat_global(name: str) -> Any:
+    wrapper = sys.modules.get("finance_engine")
+    current = globals().get(name)
+    if wrapper is not None and wrapper is not sys.modules.get(__name__) and hasattr(wrapper, name):
+        candidate = getattr(wrapper, name)
+        if candidate is not current:
+            return candidate
+    return current
+
+
+class SnapshotStaleError(RuntimeError):
+    pass
+
+
+class MappingService:
+    @staticmethod
+    def get_project_mappings(project_id: str | None) -> Dict[str, Any]:
+        if not project_id:
+            return {}
+        rows = _compat_global("_supabase_rest_request_json")(
+            resource="sheet_field_mappings",
+            query={
+                "select": "sheet_name,logical_field,column_index",
+                "project_id": f"eq.{project_id}",
+            },
+        )
+        mappings: Dict[str, Dict[str, int]] = {}
+        if not isinstance(rows, Sequence):
+            return {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            sheet_name = _safe_string(row.get("sheet_name"))
+            logical_field = _safe_string(row.get("logical_field"))
+            column_index = row.get("column_index")
+            if not sheet_name or not logical_field:
+                continue
+            try:
+                column_number = int(column_index)
+            except (TypeError, ValueError):
+                continue
+            if column_number < 1:
+                continue
+            mappings.setdefault(sheet_name, {})[logical_field] = column_number
+        return mappings
+
+
+def _safe_json_default(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _safe_json_default(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_json_default(item) for item in value]
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+    return value
+
+
+def _supabase_rest_request_json(
+    *,
+    method: str = "GET",
+    resource: str,
+    query: Mapping[str, Any] | None = None,
+    body: Mapping[str, Any] | None = None,
+    base_url: str | None = None,
+    service_role_key: str | None = None,
+) -> Any:
+    base = (base_url or os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
+    key = service_role_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or ""
+    if not base or not key:
+        return []
+    url = f"{base}/rest/v1/{resource}"
+    if query:
+        url += "?" + urlencode({str(k): str(v) for k, v in query.items()})
+    data = None
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Prefer"] = "return=representation"
+    request = Request(url, data=data, method=method, headers=headers)
+    with urlopen(request, timeout=20) as response:
+        raw = response.read().decode("utf-8")
+    return json.loads(raw) if raw else []
+
+
+def _fetch_project_main_sheet_title(project_id: str | None = None, **_: Any) -> str:
+    if not project_id:
+        return ""
+    try:
+        rows = _compat_global("_supabase_rest_request_json")(
+            resource="projects",
+            query={"select": "sheet_109_title,project_sequence", "id": f"eq.{project_id}", "limit": "1"},
+        )
+    except Exception as exc:
+        if "project_sequence" not in str(exc):
+            raise
+        rows = _compat_global("_supabase_rest_request_json")(
+            resource="projects",
+            query={"select": "sheet_109_title", "id": f"eq.{project_id}", "limit": "1"},
+        )
+    if isinstance(rows, Sequence) and rows and isinstance(rows[0], Mapping):
+        return _safe_string(rows[0].get("sheet_109_title")) or _safe_string(rows[0].get("project_sequence"))
+    return ""
+
+
+def _fetch_project_sequence(project_id: str | None = None, **_: Any) -> str:
+    if not project_id:
+        return ""
+    try:
+        rows = _compat_global("_supabase_rest_request_json")(
+            resource="projects",
+            query={"select": "project_sequence", "id": f"eq.{project_id}", "limit": "1"},
+        )
+        if isinstance(rows, Sequence) and rows and isinstance(rows[0], Mapping):
+            value = _safe_string(rows[0].get("project_sequence"))
+            if value:
+                return value
+    except Exception as exc:
+        if "project_sequence" not in str(exc):
+            raise
+    return _compat_global("_fetch_project_main_sheet_title")(project_id=project_id)
+
+
+def _fetch_current_formula_snapshot_row(
+    *,
+    project_id: str,
+    spreadsheet_id: str,
+    sync_run_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    query = {
+        "select": "*",
+        "project_id": f"eq.{project_id}",
+        "spreadsheet_id": f"eq.{spreadsheet_id}",
+        "order": "captured_at.desc",
+        "limit": "1",
+    }
+    if sync_run_id:
+        query["sync_run_id"] = f"eq.{sync_run_id}"
+    rows = _supabase_rest_request_json(resource="audit_snapshots", query=query)
+    if isinstance(rows, Sequence) and rows and isinstance(rows[0], Mapping):
+        return rows[0]
+    return None
+
+
+def _extract_template_mapping_fields(templates: Sequence[Mapping[str, Any]]) -> Dict[str, List[str]]:
+    required: Dict[str, set[str]] = {}
+    for item in templates:
+        template = str(item.get("formula_template") or item.get("formula") or "")
+        for sheet, field in re.findall(r"\$\{([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)(?::(?:col|range))?\}", template):
+            required.setdefault(sheet, set()).add(field)
+    return {sheet: sorted(fields) for sheet, fields in required.items()}
+
+
+def _render_formula_plan_templates(
+    templates: Sequence[Mapping[str, Any]],
+    mappings: Mapping[str, Any],
+    sheet_title: str,
+) -> List[Dict[str, str]]:
+    resolver = FormulaTemplateResolver()
+    rendered: List[Dict[str, str]] = []
+    for item in templates:
+        cell = _safe_string(item.get("cell"))
+        if not cell:
+            continue
+        sheet = _safe_string(item.get("sheet")) or sheet_title or SHEET_109_NAME
+        col_match = re.match(r"([A-Z]+)", cell.upper())
+        context = {"self_col": col_match.group(1) if col_match else "", "self_row": re.sub(r"[^0-9]", "", cell)}
+        template = _safe_string(item.get("formula_template") or item.get("formula"))
+        formula = resolver.resolve_formula(template, mappings, context=context) if template else ""
+        rendered.append(
+            {
+                "sheet": sheet,
+                "cell": cell,
+                "range": f"{_quote_sheet_name(sheet)}!{cell}",
+                "formula": formula,
+                "logic": _safe_string(item.get("logic")),
+                "formula_template": template,
+            }
+        )
+    return rendered
+
+
+def load_current_snapshot_formula_plan(
+    *,
+    project_id: str,
+    spreadsheet_id: str,
+    sheet_109_title: str | None = None,
+    service: Any = None,
+    sync_run_id: str | None = None,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    del service
+    snapshot = _compat_global("_fetch_current_formula_snapshot_row")(
+        project_id=project_id,
+        spreadsheet_id=spreadsheet_id,
+        sync_run_id=sync_run_id,
+    )
+    if not snapshot:
+        raise RuntimeError("CURRENT_SNAPSHOT_NOT_FOUND")
+    if _safe_string(snapshot.get("sync_run_status") or snapshot.get("status")) not in {"succeeded", "success", "completed"}:
+        raise RuntimeError("CURRENT_SNAPSHOT_NOT_SUCCEEDED")
+    data_json = snapshot.get("data_json") if isinstance(snapshot.get("data_json"), Mapping) else {}
+    templates = list(data_json.get("formula_plan_templates") or [])
+    required_fields = _extract_template_mapping_fields(templates)
+    manifest = data_json.get("formula_mapping_manifest") if isinstance(data_json.get("formula_mapping_manifest"), Mapping) else {}
+    mappings = manifest.get("mappings") if isinstance(manifest.get("mappings"), Mapping) else {}
+    if required_fields and not mappings:
+        raise RuntimeError("CURRENT_SNAPSHOT_MAPPING_MANIFEST_MISSING")
+    resolved_sheet = _safe_string(sheet_109_title) or _compat_global("_fetch_project_main_sheet_title")(project_id=project_id) or SHEET_109_NAME
+    plan = _render_formula_plan_templates(templates, mappings, resolved_sheet)
+    return plan, {
+        "source": "current_snapshot",
+        "snapshot_id": _safe_string(snapshot.get("id")),
+        "sync_run_id": _safe_string(snapshot.get("sync_run_id")),
+        "formula_mapping_project_id": project_id,
+        "sheet": resolved_sheet,
+        "required_mapping_fields": required_fields,
+        "formula_mapping_source": _safe_string(manifest.get("source")) or "snapshot_frozen",
+    }
+
+
+def _resolve_writeback_formula_mappings(
+    *,
+    project_id: str | None = None,
+    snapshot_meta: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    del snapshot_meta
+    return MappingService.get_project_mappings(project_id)
+
+
+def _get_sheet_metadata(service, spreadsheet_id: str, sheet_name: str) -> Dict[str, Any]:
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id, includeGridData=False).execute()
+    for sheet in metadata.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == sheet_name:
+            return {
+                "sheet_id": int(props.get("sheetId", 0)),
+                "row_count": int((props.get("gridProperties") or {}).get("rowCount", 0)),
+                "column_count": int((props.get("gridProperties") or {}).get("columnCount", 0)),
+                "protected_ranges": list(sheet.get("protectedRanges", []) or []),
+            }
+    raise KeyError(sheet_name)
+
+
+def _get_109_sheet_metadata(service, spreadsheet_id: str, sheet_109_title: str = SHEET_109_NAME) -> Dict[str, Any]:
+    return _get_sheet_metadata(service, spreadsheet_id, sheet_109_title)
+
+
+def _validate_formula_row_fingerprints(service, spreadsheet_id: str, plan: Sequence[Mapping[str, Any]]) -> None:
+    ranges: List[str] = []
+    expected_by_range: Dict[str, Sequence[Any]] = {}
+    for item in plan:
+        fingerprint = item.get("row_fingerprint")
+        if not isinstance(fingerprint, Mapping):
+            continue
+        cell_range = _safe_string(item.get("range"))
+        if not cell_range:
+            sheet = _safe_string(item.get("sheet")) or SHEET_109_NAME
+            cell_range = f"{_quote_sheet_name(sheet)}!{_safe_string(item.get('cell'))}"
+        sheet, ref = cell_range.split("!", 1)
+        match = re.fullmatch(r"([A-Z]+)(\d+)(?::[A-Z]+\d+)?", ref)
+        if not match:
+            continue
+        row = match.group(2)
+        label_range = f"{sheet}!C{row}:D{row}"
+        ranges.append(label_range)
+        expected_by_range[_normalize_formula_range(label_range)] = list(fingerprint.get("label_cells") or [])
+    if not ranges:
+        return
+    response = service.spreadsheets().values().batchGet(spreadsheetId=spreadsheet_id, ranges=ranges).execute()
+    for value_range in response.get("valueRanges", []):
+        normalized_range = _normalize_formula_range(value_range.get("range", ""))
+        actual = (value_range.get("values") or [[]])[0]
+        expected = list(expected_by_range.get(normalized_range, []))
+        if list(actual[: len(expected)]) != expected:
+            raise SnapshotStaleError(f"SNAPSHOT_STALE_ERROR: FORMULA_ROW_DRIFT {ranges[0].split('!')[0].strip(chr(39))}!{plan[0].get('cell')}")
+
+
+def validate_snapshot_writeback_consistency(
+    *,
+    service,
+    spreadsheet_id: str,
+    project_id: str,
+    snapshot_meta: Mapping[str, Any],
+    plan: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id, includeGridData=False).execute()
+    existing_sheets = {
+        str((sheet.get("properties") or {}).get("title"))
+        for sheet in metadata.get("sheets", [])
+    }
+    required_fields = snapshot_meta.get("required_mapping_fields") if isinstance(snapshot_meta.get("required_mapping_fields"), Mapping) else {}
+    missing = [sheet for sheet in required_fields if sheet not in existing_sheets]
+    if missing:
+        raise SnapshotStaleError(f"SNAPSHOT_STALE_ERROR: MISSING_SHEETS {', '.join(missing)}")
+
+    mappings = _compat_global("_resolve_writeback_formula_mappings")(project_id=project_id, snapshot_meta=snapshot_meta)
+    discovery_rows = _compat_global("_supabase_rest_request_json")(
+        resource="sheet_discovery_snapshots",
+        query={"sync_run_id": f"eq.{_safe_string(snapshot_meta.get('sync_run_id'))}"},
+    )
+    ranges = []
+    expected_headers: Dict[str, Sequence[Any]] = {}
+    if isinstance(discovery_rows, Sequence):
+        for row in discovery_rows:
+            if not isinstance(row, Mapping):
+                continue
+            sheet_name = _safe_string(row.get("sheet_name"))
+            if sheet_name not in required_fields:
+                continue
+            ranges.append(f"{_quote_sheet_name(sheet_name)}!A1:ZZ1")
+            expected_headers[sheet_name] = list(row.get("header_cells_json") or [])
+    if ranges:
+        response = service.spreadsheets().values().batchGet(spreadsheetId=spreadsheet_id, ranges=ranges).execute()
+        for value_range in response.get("valueRanges", []):
+            sheet_name = str(value_range.get("range", "")).split("!", 1)[0].strip("'")
+            actual = (value_range.get("values") or [[]])[0]
+            expected = list(expected_headers.get(sheet_name, []))
+            if expected and list(actual[: len(expected)]) != expected:
+                raise SnapshotStaleError(f"SNAPSHOT_STALE_ERROR: HEADER_DRIFT {sheet_name}")
+    _validate_formula_row_fingerprints(service, spreadsheet_id, plan)
+    return {"status": "ok", "checked": True}
+
+
+def build_dashboard_summary_payload(
+    *,
+    spreadsheet_id: str,
+    project_id: str,
+    reclassify_summary: Mapping[str, Any],
+    mapping_metrics: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    mapping_metrics = dict(mapping_metrics or {})
+    payable_count = int(reclassify_summary.get("payable_rows_written", 0) or 0)
+    final_detail_count = int(reclassify_summary.get("final_detail_rows_written", 0) or 0)
+    draw_request_count = int(reclassify_summary.get("draw_request_rows_written", 0) or 0)
+    total_reclass_rows = payable_count + final_detail_count + draw_request_count
+    return {
+        "project_name": f"Project {(spreadsheet_id or '')[:8]}",
+        "project_id": project_id,
+        "workflow_stage": "manual_input_ready",
+        "highlights": [
+            {"label": "重分类行数", "value": str(total_reclass_rows), "color": "green" if total_reclass_rows else "slate"},
+            {"label": "Payable", "value": str(payable_count), "color": "slate"},
+            {"label": "Final Detail", "value": str(final_detail_count), "color": "slate"},
+            {"label": "Draw Request", "value": str(draw_request_count), "color": "slate"},
+        ],
+        "mapping_health": {
+            "fallback_count": int(mapping_metrics.get("fallback_count", 0) or 0),
+            "fallback_fields": list(mapping_metrics.get("fallback_fields", []) or []),
+            "mapping_score": float(mapping_metrics.get("mapping_score", 1.0) or 0.0),
+            "mapping_field_count": int(mapping_metrics.get("mapping_field_count", 0) or 0),
+        },
+        "audit_tabs": {
+            "external_recon": {
+                "summary": "后台快照已更新，前端将直接渲染快照摘要。",
+            },
+            "manual_input": {},
+            "reclass_audit": {
+                "overview": {
+                    "payable_count": payable_count,
+                    "final_detail_count": final_detail_count,
+                    "diff_count": int(reclassify_summary.get("draw_request_unmatched_rows", 0) or 0),
+                }
+            },
+            "compare_109": {
+                "warnings": [],
+                "metric_rows": [],
+                "mapping_health": {
+                    "fallback_count": int(mapping_metrics.get("fallback_count", 0) or 0),
+                    "fallback_fields": list(mapping_metrics.get("fallback_fields", []) or []),
+                    "mapping_score": float(mapping_metrics.get("mapping_score", 1.0) or 0.0),
+                    "mapping_field_count": int(mapping_metrics.get("mapping_field_count", 0) or 0),
+                },
+            },
+        },
+    }
 
 
 def build_budgetco_semantic_summary_context(
@@ -1408,11 +1827,27 @@ def build_project_ledger_semantic_context(
 
 def update_109_semantic_logic(
     rows: List[List[Any]],
+    sheet_109_title: str = SHEET_109_NAME,
+    formula_mappings: Mapping[str, Any] | None = None,
 ) -> List[Dict[str, str]]:
     mapper = MapperFactory.create("109", rows)
-    generator = FinanceFormulaGenerator(mapper)
+    config: Dict[str, Any] = _build_109_year_axis_config(rows)
+    if formula_mappings:
+        config["formula_mappings"] = formula_mappings
+    generator = FinanceFormulaGenerator(mapper, config=config)
 
     semantic_updates: List[Dict[str, str]] = []
+
+    def add_update(row_num: int, col: str, formula: str, logic: str) -> None:
+        semantic_updates.append(
+            {
+                "sheet": sheet_109_title,
+                "cell": f"{col}{row_num}",
+                "range": f"{_quote_sheet_name(sheet_109_title)}!{col}{row_num}",
+                "formula": formula,
+                "logic": logic,
+            }
+        )
 
     def maybe_add_formula_update(label: str, col: str, formula_builder, logic: str) -> None:
         try:
@@ -1420,23 +1855,37 @@ def update_109_semantic_logic(
             formula = formula_builder(col)
         except KeyError:
             return
-        semantic_updates.append(
-            {
-                "sheet": SHEET_109_NAME,
-                "cell": f"{col}{row_num}",
-                "range": f"{_quote_sheet_name(SHEET_109_NAME)}!{col}{row_num}",
-                "formula": formula,
-                "logic": logic,
-            }
-        )
+        add_update(row_num, col, formula, logic)
 
-    columns = [chr(i) for i in range(ord("F"), ord("V") + 1)]
+    year_row = _find_year_header_row_109(rows) or 10
+    columns = list(config.get("primary_year_cols") or list("FGHIJK")) + list(config.get("audit_year_cols") or list("MNOPQR"))
     labels = mapper.config.get("labels", {})
     for col in columns:
+        year_ref = f"{col}${year_row}"
         maybe_add_formula_update(labels.get("eac", "Dynamic Budget (EAC)"), col, generator.get_eac_formula, "Semantic EAC formula")
+        maybe_add_formula_update("Cumulative Direct Cost", col, generator.get_cumulative_direct_cost_formula, "Semantic Cumulative Direct Cost formula")
+        maybe_add_formula_update("Cost of Goods Sold-Company", col, generator.get_cogs_company_formula, "Semantic COGS Company formula")
         maybe_add_formula_update(labels.get("poc", "Percentage of Completion"), col, generator.get_poc_formula, "Semantic POC formula")
         maybe_add_formula_update(labels.get("confirmed_cogs", "Cost of Goods Sold"), col, generator.get_confirmed_cogs_formula, "Semantic COGS formula")
         maybe_add_formula_update(labels.get("revenue", "General Conditions fee"), col, generator.get_revenue_formula, "Semantic Revenue formula")
+        maybe_add_formula_update("Gross Profit", col, generator.get_gross_profit_formula, "Semantic Gross Profit formula")
+        try:
+            add_update(mapper.get_row("Total Income Cost"), col, generator.get_income_total_formula(col, year_ref), "Semantic Total Income Cost formula")
+        except KeyError:
+            pass
+        try:
+            add_update(mapper.get_row("GC Income"), col, generator.get_gc_income_formula(col, year_ref), "Semantic GC Income formula")
+        except KeyError:
+            pass
+        try:
+            add_update(
+                mapper.get_row("Actual Warranty Expenses (Reversed)"),
+                col,
+                generator.get_actual_warranty_formula(col, year_ref),
+                "Semantic Actual Warranty Expenses formula",
+            )
+        except KeyError:
+            pass
         maybe_add_formula_update("ROE (Current Period)", col, generator.get_roe_formula, "Semantic ROE formula")
         maybe_add_formula_update("Retention", col, generator.get_retention_formula, "Semantic Retention formula")
         maybe_add_formula_update("Net Profit (Post-Tax)", col, generator.get_net_profit_formula, "Semantic Net Profit formula")
@@ -1494,34 +1943,46 @@ def _year_columns_from_109_dictionary(config: Mapping[str, Any]) -> List[int]:
 def _build_109_manual_input_ranges(
     rows: Sequence[Sequence[Any]],
     years: Sequence[int],
+    sheet_109_title: str = SHEET_109_NAME,
 ) -> List[str]:
     if not rows:
         return []
 
     label_rows = _find_rows_by_item_label(rows, item_col_1=3)
-    manual_labels = [
-        "budget cost change order",
-        "wb home income",
-        "wb home cogs",
-        "wb home inventory income",
-        "wb home inventory",
-        "owner-unapproved overrun",
-        # "cumulative direct cost", # 用户反馈：27行不允许手工修改
-        "cost of goods sold-audited", # 用户反馈：29行允许手工修改
-        "accrued warranty expenses", # 用户反馈：37行允许手工修改
-    ]
+    sheet = _quote_sheet_name(sheet_109_title)
     start_col = _column_number_to_a1(6)
     end_col = _column_number_to_a1(5 + len(years))
+    audit_start_col = _column_number_to_a1(13)
+    audit_end_col = _column_number_to_a1(12 + len(years))
     ranges: List[str] = []
-    for label in manual_labels:
+
+    def add_row_range(label: str, audit: bool = False) -> None:
         row_list = label_rows.get(label, [])
         if not row_list:
-            # 允许新加入的标签在旧版 sheet 中不存在
-            if label in ["cost of goods sold-audited", "accrued warranty expenses"]:
-                continue
+            return
         row_i = row_list[0]
-        ranges.append(f"{_quote_sheet_name(SHEET_109_NAME)}!{start_col}{row_i}:{end_col}{row_i}")
+        if audit:
+            ranges.append(f"{sheet}!{audit_start_col}{row_i}:{audit_end_col}{row_i}")
+        else:
+            ranges.append(f"{sheet}!{start_col}{row_i}:{end_col}{row_i}")
+
+    ranges.append(f"{sheet}!C2:E2")
+    ranges.append(f"{sheet}!G2:I2")
+    add_row_range("general conditions fee-audited")
+    add_row_range("general conditions fee-audited", audit=True)
+    add_row_range("owner-unapproved overrun")
+    add_row_range("cost of goods sold-audited")
+    add_row_range("cost of goods sold-audited", audit=True)
+    add_row_range("accrued warranty expenses")
+    add_row_range("wb home income")
+    add_row_range("wb home cogs")
+    add_row_range("wb home inventory income")
+    add_row_range("wb home inventory")
     return ranges
+
+
+def _build_109_units_count_formula() -> str:
+    return '=IFERROR(COUNTA(FILTER(\'Unit Master\'!$A$3:$A,REGEXMATCH(\'Unit Master\'!$A$3:$A,"[0-9]"))),0)'
 
 
 def _matrix_cell(row: Sequence[Any], col_1: int) -> Any:
@@ -1669,17 +2130,422 @@ def _build_unit_master_manual_input_ranges(row_count: int) -> List[str]:
     ]
 
 
+def _build_external_sheet_edit_specs() -> Dict[str, Dict[str, List[str]]]:
+    return {
+        "Contract": {"editable_ranges": ["'Contract'!A:ZZ"], "clear_ranges": ["'Contract'!A:ZZ"]},
+        "Unit Budget": {
+            "editable_ranges": ["'Unit Budget'!S:ZZ"],
+            "filter_header_ranges": ["'Unit Budget'!A1:ZZ1"],
+            "clear_ranges": ["'Unit Budget'!S:ZZ"],
+        },
+        "Payable": {
+            "editable_ranges": ["'Payable'!L:AZ"],
+            "filter_header_ranges": ["'Payable'!A1:ZZ1"],
+            "clear_ranges": ["'Payable'!A2:ZZ"],
+        },
+        "Final Detail": {
+            "editable_ranges": ["'Final Detail'!N:AL"],
+            "filter_header_ranges": ["'Final Detail'!A1:ZZ1"],
+            "clear_ranges": ["'Final Detail'!A2:ZZ"],
+        },
+        "Draw request report": {
+            "editable_ranges": ["'Draw request report'!H:AR"],
+            "filter_header_ranges": ["'Draw request report'!A1:ZZ2"],
+            "clear_ranges": ["'Draw request report'!A3:ZZ"],
+        },
+        "Draw Invoice List": {
+            "editable_ranges": ["'Draw Invoice List'!G:AE"],
+            "filter_header_ranges": ["'Draw Invoice List'!A4:ZZ4"],
+            "clear_ranges": ["'Draw Invoice List'!A5:ZZ"],
+        },
+        "Transfer Log": {
+            "editable_ranges": ["'Transfer Log'!G:Z"],
+            "filter_header_ranges": ["'Transfer Log'!A4:ZZ4"],
+            "clear_ranges": ["'Transfer Log'!A5:ZZ"],
+        },
+        "Change Order Log": {
+            "editable_ranges": ["'Change Order Log'!G:AE"],
+            "filter_header_ranges": ["'Change Order Log'!A4:ZZ4"],
+            "clear_ranges": ["'Change Order Log'!A5:ZZ"],
+        },
+    }
+
+
+def _build_external_sheet_clear_ranges() -> List[str]:
+    return [
+        range_ref
+        for spec in _build_external_sheet_edit_specs().values()
+        for range_ref in spec["clear_ranges"]
+    ]
+
+
+def _build_update_hidden_sheet_request(sheet_id: int, hidden: bool) -> Dict[str, Any]:
+    return {
+        "updateSheetProperties": {
+            "properties": {"sheetId": int(sheet_id), "hidden": bool(hidden)},
+            "fields": "hidden",
+        }
+    }
+
+
+def _iso_now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_project_state_values(
+    *,
+    owner_email: str,
+    current_stage: str,
+    locked: bool,
+) -> List[List[str]]:
+    return [
+        ["key", "value"],
+        ["current_stage", current_stage],
+        ["external_data_dirty", "FALSE"],
+        ["manual_input_dirty", "FALSE"],
+        ["locked", "TRUE" if locked else "FALSE"],
+        ["owner_email", owner_email],
+        ["last_external_edit_at", ""],
+        ["last_external_edit_by", ""],
+        ["last_manual_edit_at", ""],
+        ["last_manual_edit_by", ""],
+        ["last_sync_at", ""],
+        ["last_validate_input_at", ""],
+        ["last_reclassify_at", ""],
+        ["last_109_initial_approval_at", ""],
+        ["locked_at", ""],
+        ["locked_by", ""],
+        ["unlocked_at", ""],
+        ["unlocked_by", ""],
+    ]
+
+
+def append_project_audit_log(
+    *,
+    service,
+    spreadsheet_id: str,
+    actor_email: str,
+    action: str,
+    previous_stage: str,
+    next_stage: str,
+    status: str,
+    message: str,
+) -> None:
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range="'AiWB_Audit_Log'!A:I",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[_iso_now_utc(), actor_email, action, previous_stage, spreadsheet_id, "", next_stage, status, message]]},
+    ).execute()
+
+
+def _build_project_bootstrap_manual_clear_ranges(
+    *,
+    rows_109: Sequence[Sequence[Any]],
+    rows_scoping: Sequence[Sequence[Any]],
+    row_count_unit_master: int,
+    sheet_109_title: str = SHEET_109_NAME,
+) -> List[str]:
+    ranges: List[str] = []
+    ranges.extend(_build_109_manual_input_ranges(rows_109, [2021, 2022, 2023, 2024, 2025, 2026], sheet_109_title=sheet_109_title))
+
+    scoping_ranges = _build_scoping_manual_input_ranges(rows_scoping)
+    if not scoping_ranges:
+        group_rows = [
+            idx + 1
+            for idx, row in enumerate(rows_scoping)
+            if _safe_string(row[2] if len(row) > 2 else "")
+        ]
+        if group_rows:
+            first_row, last_row = min(group_rows), max(group_rows)
+            scoping_ranges = [
+                f"'Scoping'!B{first_row}:B{last_row}",
+                f"'Scoping'!E{first_row}:K{last_row}",
+            ]
+    ranges.extend(scoping_ranges)
+    unit_master_sheet = _quote_sheet_name(SHEET_UNIT_MASTER_NAME)
+    end_row = max(int(row_count_unit_master), 3)
+    ranges.append(f"{unit_master_sheet}!B1:M1")
+    ranges.append(f"{unit_master_sheet}!A3:M{end_row}")
+    ranges.extend(_build_unit_master_manual_input_ranges(end_row))
+    ranges.extend(_build_external_sheet_clear_ranges())
+    return ranges
+
+
+def _hide_system_log_sheet(service, spreadsheet_id: str) -> bool:
+    try:
+        metadata = _get_sheet_metadata(service, spreadsheet_id, SHEET_109_LOG_NAME)
+    except KeyError:
+        return False
+    request = _build_update_hidden_sheet_request(int(metadata["sheet_id"]), True)
+    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [request]}).execute()
+    return True
+
+
+def _apply_external_sheet_controls(service, spreadsheet_id: str) -> Dict[str, Any]:
+    requests = _build_external_sheet_protection_requests(service, spreadsheet_id)
+    if requests:
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+    return {
+        "external_protection_request_count": len(requests),
+        "log_hidden": _hide_system_log_sheet(service, spreadsheet_id),
+    }
+
+
+def _a1_to_grid_range_flexible(a1: str, sheet_id: int, column_count: int | None = None) -> Dict[str, int]:
+    normalized = _normalize_formula_range(a1)
+    ref = normalized.split("!", 1)[1] if "!" in normalized else normalized
+    col_only = re.fullmatch(r"([A-Z]+):([A-Z]+)", ref)
+    if col_only:
+        return {
+            "sheetId": int(sheet_id),
+            "startColumnIndex": _column_a1_to_number(col_only.group(1)) - 1,
+            "endColumnIndex": _column_a1_to_number(col_only.group(2)),
+        }
+    grid = _a1_to_grid_range(normalized, sheet_id)
+    if column_count and grid.get("endColumnIndex", 0) > column_count:
+        grid["endColumnIndex"] = int(column_count)
+    return grid
+
+
+def _build_external_sheet_protection_requests(service, spreadsheet_id: str) -> List[Dict[str, Any]]:
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id, includeGridData=False).execute()
+    specs = _build_external_sheet_edit_specs()
+    requests: List[Dict[str, Any]] = []
+    for sheet in metadata.get("sheets", []):
+        props = sheet.get("properties", {})
+        title = _safe_string(props.get("title"))
+        if title not in specs:
+            continue
+        sheet_id = int(props.get("sheetId", 0))
+        column_count = int((props.get("gridProperties") or {}).get("columnCount", 0) or 0)
+        for protected_range in sheet.get("protectedRanges", []) or []:
+            description = _safe_string(protected_range.get("description"))
+            if description.startswith(f"{MANAGED_EXTERNAL_PROTECTION_PREFIX}:"):
+                protected_range_id = protected_range.get("protectedRangeId")
+                if protected_range_id is not None:
+                    requests.append(_build_delete_protected_range_request(int(protected_range_id)))
+        if title == "Contract":
+            continue
+        unprotected_ranges = []
+        max_required_columns = column_count
+        for range_ref in specs[title].get("editable_ranges", []):
+            grid = _a1_to_grid_range_flexible(range_ref, sheet_id)
+            max_required_columns = max(max_required_columns, int(grid.get("endColumnIndex", 0)))
+            unprotected_ranges.append(grid)
+        for range_ref in specs[title].get("filter_header_ranges", []):
+            unprotected_ranges.append(_a1_to_grid_range_flexible(range_ref, sheet_id, column_count=column_count))
+        if max_required_columns > column_count:
+            requests.append(
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": sheet_id, "gridProperties": {"columnCount": max_required_columns}},
+                        "fields": "gridProperties.columnCount",
+                    }
+                }
+            )
+        protected_range = {
+            "range": {"sheetId": sheet_id},
+            "description": f"{MANAGED_EXTERNAL_PROTECTION_PREFIX}: {title}",
+            "warningOnly": True,
+            "unprotectedRanges": unprotected_ranges,
+        }
+        requests.append({"addProtectedRange": {"protectedRange": protected_range}})
+    return requests
+
+
+def _build_project_data_lock_requests(
+    service,
+    spreadsheet_id: str,
+    *,
+    locked: bool,
+    sheet_109_title: str = SHEET_109_NAME,
+) -> List[Dict[str, Any]]:
+    lock_sheets = {"Payable", "Final Detail", "Draw request report", "Unit Budget", "Unit Master", "Scoping", sheet_109_title}
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id, includeGridData=False).execute()
+    requests: List[Dict[str, Any]] = []
+    for sheet in metadata.get("sheets", []):
+        props = sheet.get("properties", {})
+        title = _safe_string(props.get("title"))
+        if title not in lock_sheets:
+            continue
+        description = f"{MANAGED_DATA_LOCK_PREFIX}: {title}"
+        for protected_range in sheet.get("protectedRanges", []) or []:
+            if _safe_string(protected_range.get("description")) == description:
+                protected_range_id = protected_range.get("protectedRangeId")
+                if protected_range_id is not None:
+                    requests.append(_build_delete_protected_range_request(int(protected_range_id)))
+        if locked:
+            requests.append(
+                {
+                    "addProtectedRange": {
+                        "protectedRange": {
+                            "range": {"sheetId": int(props.get("sheetId", 0))},
+                            "description": description,
+                            "warningOnly": True,
+                        }
+                    }
+                }
+            )
+    return requests
+
+
+def _cleanup_109_legacy_duplicate_contract_change_row(service, spreadsheet_id: str, sheet_109_title: str = SHEET_109_NAME) -> Dict[str, Any]:
+    del service, spreadsheet_id, sheet_109_title
+    return {"cleared": False}
+
+
+def _apply_109_layout_controls(
+    service,
+    spreadsheet_id: str,
+    rows: Sequence[Sequence[Any]] | None = None,
+    years: Sequence[int] | None = None,
+    sheet_109_title: str = SHEET_109_NAME,
+) -> Dict[str, Any]:
+    del rows, years
+    try:
+        return _get_109_sheet_metadata(service, spreadsheet_id, sheet_109_title)
+    except KeyError:
+        return {}
+
+
+def _write_project_state_and_log(
+    service,
+    spreadsheet_id: str,
+    *,
+    creator_email: str,
+    project_name: str,
+    project_owner: str,
+) -> Dict[str, bool]:
+    del project_owner
+    state_values = _build_project_state_values(
+        owner_email=creator_email,
+        current_stage=WORKBENCH_STAGE_PROJECT_CREATED,
+        locked=False,
+    )
+    values = service.spreadsheets().values()
+    values.update(
+        spreadsheetId=spreadsheet_id,
+        range="'AiWB_Project_State'!A:B",
+        valueInputOption="USER_ENTERED",
+        body={"values": state_values},
+    ).execute()
+    append_project_audit_log(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        actor_email=creator_email,
+        action="create_project",
+        previous_stage="",
+        next_stage=WORKBENCH_STAGE_PROJECT_CREATED,
+        status="success",
+        message=project_name,
+    )
+    return {"project_state_initialized": True, "audit_log_initialized": True}
+
+
+def initialize_project_workbook(
+    *,
+    service,
+    spreadsheet_id: str,
+    project_name: str = "",
+    project_owner: str = "",
+    creator_email: str = "",
+    sheet_109_title: str = SHEET_109_NAME,
+) -> Dict[str, Any]:
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id, includeGridData=False).execute()
+    sheet_titles = {
+        _safe_string((sheet.get("properties") or {}).get("title")): sheet
+        for sheet in metadata.get("sheets", [])
+    }
+    resolved_sheet_109_title = _safe_string(sheet_109_title) or SHEET_109_NAME
+    sheet_109_renamed = False
+    if resolved_sheet_109_title != SHEET_109_NAME and resolved_sheet_109_title not in sheet_titles and SHEET_109_NAME in sheet_titles:
+        sheet_id = int((sheet_titles[SHEET_109_NAME].get("properties") or {}).get("sheetId", 0))
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {"sheetId": sheet_id, "title": resolved_sheet_109_title},
+                            "fields": "title",
+                        }
+                    }
+                ]
+            },
+        ).execute()
+        sheet_109_renamed = True
+
+    values = service.spreadsheets().values()
+    rows_109 = values.get(spreadsheetId=spreadsheet_id, range=f"{_quote_sheet_name(resolved_sheet_109_title)}!A:ZZ").execute().get("values", [])
+    rows_scoping = values.get(spreadsheetId=spreadsheet_id, range="'Scoping'!A:Z").execute().get("values", [])
+    try:
+        row_count_unit_master = int((_compat_global("_get_sheet_metadata")(service, spreadsheet_id, SHEET_UNIT_MASTER_NAME).get("row_count") or 12))
+    except KeyError:
+        row_count_unit_master = 12
+    clear_ranges = _build_project_bootstrap_manual_clear_ranges(
+        rows_109=rows_109,
+        rows_scoping=rows_scoping,
+        row_count_unit_master=row_count_unit_master,
+        sheet_109_title=resolved_sheet_109_title,
+    )
+    values.batchClear(spreadsheetId=spreadsheet_id, body={"ranges": clear_ranges}).execute()
+    values.batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "USER_ENTERED",
+            "data": [
+                {"range": f"{_quote_sheet_name(resolved_sheet_109_title)}!C2", "values": [[project_name]]},
+                {"range": f"{_quote_sheet_name(resolved_sheet_109_title)}!G2", "values": [[project_owner]]},
+            ],
+        },
+    ).execute()
+    state_result = _write_project_state_and_log(
+        service,
+        spreadsheet_id,
+        creator_email=creator_email,
+        project_name=project_name,
+        project_owner=project_owner,
+    )
+    scoping_layout = _compat_global("_apply_scoping_layout_controls")(service, spreadsheet_id)
+    unit_budget_count = _compat_global("_apply_unit_budget_support_formatting")(service, spreadsheet_id)
+    layout_109 = _compat_global("_apply_109_layout_controls")(
+        service,
+        spreadsheet_id,
+        rows=rows_109,
+        years=[2021, 2022, 2023, 2024, 2025, 2026],
+        sheet_109_title=resolved_sheet_109_title,
+    )
+    external_controls = _compat_global("_apply_external_sheet_controls")(service, spreadsheet_id)
+    return {
+        "headers_written": 2,
+        "manual_clear_range_count": len(clear_ranges),
+        "external_clear_range_count": len(_build_external_sheet_clear_ranges()),
+        "external_data_rows_after_sanitize": {
+            "Payable": 0,
+            "Final Detail": 0,
+            "Draw request report": 0,
+        },
+        "scoping_layout": scoping_layout,
+        "unit_budget_layout_request_count": unit_budget_count,
+        "109_layout": layout_109,
+        **external_controls,
+        **state_result,
+        "sheet_109_renamed": sheet_109_renamed,
+    }
+
+
 def _build_109_date_array_formula(func_name: str) -> str:
     date_floor = "DATE(2021,1,1)"
     arrays = [
         'IFERROR(FILTER(Payable!$T:$T,Payable!$T:$T<>""),"")',
         'IFERROR(FILTER(Payable!$V:$V,Payable!$V:$V<>""),"")',
+        'IFERROR(FILTER(Payable!$AC:$AC,Payable!$AC:$AC<>""),"")',
         'IFERROR(FILTER(\'Final Detail\'!$O:$O,\'Final Detail\'!$O:$O<>""),"")',
-        'IFERROR(FILTER(\'Draw request report\'!$W:$W,\'Draw request report\'!$W:$W<>""),"")',
-        'IFERROR(FILTER(\'Draw request report\'!$F:$F,\'Draw request report\'!$F:$F<>""),"")',
-        'IFERROR(FILTER(\'Draw Invoice List\'!$B:$B,\'Draw Invoice List\'!$B:$B<>""),"")',
-        'IFERROR(FILTER(\'Transfer Log\'!$C:$C,\'Transfer Log\'!$C:$C<>""),"")',
-        'IFERROR(FILTER(\'Change Order Log\'!$B:$B,\'Change Order Log\'!$B:$B<>""),"")',
+        'IFERROR(FILTER(\'Final Detail\'!$S:$S,\'Final Detail\'!$S:$S<>""),"")',
+        'IFERROR(FILTER(\'Draw request report\'!$R:$R,\'Draw request report\'!$R:$R<>""),"")',
+        'IFERROR(FILTER(\'Draw request report\'!$Z:$Z,\'Draw request report\'!$Z:$Z<>""),"")',
     ]
     merged = ";".join(arrays)
     return f"=MAX({date_floor},{func_name}(TOCOL({{{merged}}},1)))"
@@ -1705,6 +2571,106 @@ def _a1_to_grid_range(a1: str, sheet_id: int) -> Dict[str, int]:
         "endRowIndex": end_row,
         "startColumnIndex": start_col,
         "endColumnIndex": end_col,
+    }
+
+
+def _build_delete_protected_range_request(protected_range_id: int) -> Dict[str, Any]:
+    return {"deleteProtectedRange": {"protectedRangeId": int(protected_range_id)}}
+
+
+def _build_add_protected_range_request(
+    sheet_id: int,
+    unprotected_ranges: Sequence[Mapping[str, Any]],
+    editor_email: str | None = None,
+) -> Dict[str, Any]:
+    protected_range: Dict[str, Any] = {
+        "range": {"sheetId": int(sheet_id)},
+        "description": MANAGED_109_PROTECTION_DESCRIPTION,
+        "warningOnly": False,
+        "unprotectedRanges": [dict(item) for item in unprotected_ranges],
+    }
+    if editor_email:
+        protected_range["editors"] = {"users": [str(editor_email)]}
+    return {"addProtectedRange": {"protectedRange": protected_range}}
+
+
+def _format_a1_range(sheet_name: str, start_col_0: int, end_col_0_exclusive: int, row_0: int) -> str:
+    start_col = _column_number_to_a1(start_col_0 + 1)
+    end_col = _column_number_to_a1(end_col_0_exclusive)
+    row = row_0 + 1
+    if start_col == end_col:
+        return f"{_quote_sheet_name(sheet_name)}!{start_col}{row}"
+    return f"{_quote_sheet_name(sheet_name)}!{start_col}{row}:{end_col}{row}"
+
+
+def _merge_grid_ranges_to_a1(sheet_name: str, ranges: Sequence[Mapping[str, int]]) -> List[str]:
+    grouped: Dict[int, List[Tuple[int, int]]] = {}
+    for grid in ranges:
+        if int(grid.get("endRowIndex", 0)) - int(grid.get("startRowIndex", 0)) != 1:
+            continue
+        grouped.setdefault(int(grid["startRowIndex"]), []).append(
+            (int(grid["startColumnIndex"]), int(grid["endColumnIndex"]))
+        )
+    out: List[str] = []
+    for row_0, spans in sorted(grouped.items()):
+        merged: List[Tuple[int, int]] = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        for start, end in merged:
+            out.append(_format_a1_range(sheet_name, start, end, row_0))
+    return out
+
+
+def _apply_109_formula_lock_protection(
+    *,
+    service,
+    spreadsheet_id: str,
+    plan: Sequence[Mapping[str, str]],
+    sheet_109_title: str = SHEET_109_NAME,
+) -> Dict[str, Any]:
+    metadata = _compat_global("_get_109_sheet_metadata")(service, spreadsheet_id, sheet_109_title)
+    sheet_id = int(metadata["sheet_id"])
+    formula_ranges = []
+    for item in plan:
+        range_ref = _safe_string(item.get("range"))
+        if not range_ref or not item.get("formula"):
+            continue
+        range_sheet = range_ref.split("!", 1)[0].strip("'") if "!" in range_ref else _safe_string(item.get("sheet") or sheet_109_title)
+        if range_sheet != sheet_109_title:
+            continue
+        formula_ranges.append(_a1_to_grid_range(range_ref, sheet_id))
+    merged_ranges = _merge_grid_ranges_to_a1(sheet_109_title, formula_ranges)
+    requests: List[Dict[str, Any]] = []
+    for protected_range in metadata.get("protected_ranges", []):
+        description = str(protected_range.get("description") or "")
+        if description.startswith(f"{MANAGED_109_FORMULA_LOCK_PREFIX}:"):
+            protected_range_id = protected_range.get("protectedRangeId")
+            if protected_range_id is not None:
+                requests.append(_build_delete_protected_range_request(int(protected_range_id)))
+    if formula_ranges:
+        editor_email = _safe_string(_compat_global("_get_service_account_info")().get("client_email", ""))
+        protected_range = dict(formula_ranges[0])
+        for grid in formula_ranges[1:]:
+            if (
+                grid.get("startRowIndex") == protected_range.get("startRowIndex")
+                and grid.get("endRowIndex") == protected_range.get("endRowIndex")
+                and grid.get("startColumnIndex") == protected_range.get("endColumnIndex")
+            ):
+                protected_range["endColumnIndex"] = grid["endColumnIndex"]
+            else:
+                break
+        add_request = _build_add_protected_range_request(sheet_id, [], editor_email or None)
+        add_request["addProtectedRange"]["protectedRange"]["description"] = f"{MANAGED_109_FORMULA_LOCK_PREFIX}: 1"
+        add_request["addProtectedRange"]["protectedRange"]["range"] = protected_range
+        requests.append(add_request)
+    if requests:
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+    return {
+        "formula_lock_range_count": len(merged_ranges),
+        "formula_lock_ranges": merged_ranges,
     }
 
 
@@ -1932,6 +2898,30 @@ def _build_unit_master_rows_v2(
     return [total_row, master_header] + data_rows
 
 
+def run_validate_input_data(service, spreadsheet_id: str) -> Dict[str, Any]:
+    values = service.spreadsheets().values()
+    unit_budget_rows = values.get(spreadsheetId=spreadsheet_id, range="'Unit Budget'!A:ZZ").execute().get("values", [])
+    final_detail_rows = values.get(spreadsheetId=spreadsheet_id, range="'Final Detail'!A:V").execute().get("values", [])
+    payable_rows = values.get(spreadsheetId=spreadsheet_id, range="'Payable'!A:AL").execute().get("values", [])
+    values.get(spreadsheetId=spreadsheet_id, range="'Unit Master'!A:M").execute()
+
+    unit_master_rows = _build_unit_master_rows_v2(unit_budget_rows, final_detail_rows, payable_rows)
+    end_row = max(len(unit_master_rows), 1)
+    values.update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'Unit Master'!A1:M{end_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": unit_master_rows},
+    ).execute()
+    unit_budget_layout_count = _compat_global("_apply_unit_budget_support_formatting")(service, spreadsheet_id)
+    scoping_layout = _compat_global("_apply_scoping_layout_controls")(service, spreadsheet_id)
+    return {
+        "unit_master_rows_written": len(unit_master_rows),
+        "unit_budget_layout_request_count": unit_budget_layout_count,
+        "scoping_layout": scoping_layout,
+    }
+
+
 def _build_unit_budget_support_requests(
     unit_budget_sheet_id: int,
     unit_master_sheet_id: int,
@@ -1978,9 +2968,14 @@ def _build_109_error_ranges_from_values(value_map: Mapping[str, float | None]) -
 def _build_109_formula_plan_from_grid(
     rows: Sequence[Sequence[Any]],
     config: Mapping[str, Any] | None = None,
+    sheet_109_title: str = SHEET_109_NAME,
+    formula_mappings: Mapping[str, Any] | None = None,
 ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
     if not rows: raise RuntimeError("109工作表为空。")
     cfg = dict(config or _load_109_formula_dictionary())
+    cfg.update(_build_109_year_axis_config(rows))
+    if formula_mappings:
+        cfg["formula_mappings"] = formula_mappings
     mapper = MapperFactory.create("109", rows)
     generator = FinanceFormulaGenerator(mapper, config=cfg)
     meta: Dict[str, Any] = {}
@@ -2033,7 +3028,7 @@ def _build_109_formula_plan_from_grid(
     row_acc_expenses = _m_row("accrued expenses")
     row_racc_reversed = _m_row("reversed accrued expenses")
     row_income_total = _m_row("total income cost")
-    row_gc_cost = _m_row("total gc cost")
+    row_gc_cost = _m_row("total gc cost", "gc cost")
     row_accrued_warranty = _m_row("accrued warranty expenses")
     row_actual_warranty = _m_row("actual warranty expenses (reversed)")
     row_wbh_total = _m_row("wb. home material margin total")
@@ -2066,19 +3061,24 @@ def _build_109_formula_plan_from_grid(
     plan: List[Dict[str, str]] = []
     def add_formula(col_i: int, row_i: int, formula: str, logic: str) -> None:
         col = _column_number_to_a1(col_i)
-        plan.append({"sheet": SHEET_109_NAME, "cell": f"{col}{row_i}", "range": f"{_quote_sheet_name(SHEET_109_NAME)}!{col}{row_i}", "formula": formula, "logic": logic})
+        plan.append({"sheet": sheet_109_title, "cell": f"{col}{row_i}", "range": f"{_quote_sheet_name(sheet_109_title)}!{col}{row_i}", "formula": formula, "logic": logic})
 
-    start_year_expr = "Year($K$2)"
-    add_formula(11, 2, _build_109_date_array_formula("MIN"), "Start date")
-    add_formula(11, 3, _build_109_date_array_formula("MAX"), "End date")
+    axis = _detect_109_year_axis(rows)
+    primary_year_cols = axis[1] if axis else list(range(6, 12))
+    anchor_col_i = primary_year_cols[-1]
+    anchor_col = _column_number_to_a1(anchor_col_i)
+    start_year_expr = f"Year(${anchor_col}$2)"
+    add_formula(anchor_col_i, 2, _build_109_date_array_formula("MIN"), "Start date")
+    add_formula(anchor_col_i, 3, _build_109_date_array_formula("MAX"), "End date")
     add_formula(3, 5, '=IFERROR(COUNTA(FILTER(\'Unit Budget\'!$B$3:$B,REGEXMATCH(\'Unit Budget\'!$B$3:$B,"[0-9]"))),0)', "Units count")
     add_formula(5, 3, "=SUMIFS('Unit Budget'!$T:$T,'Unit Budget'!$O:$O,1)", "Contract price (Day1)")
     add_formula(5, 5, "=SUMIFS('Unit Budget'!$T:$T,'Unit Budget'!$P:$P,2)", "General Conditions fee")
     add_formula(5, 12, '=IFERROR(round(MAX(F12:K12),8),"")', "POC Total")
     add_formula(5, 13, '=IFERROR(round(SUM(F13:K13),8),"")', "Completion Rate Total")
 
-    for col_i in range(6, 12):
-        col, prev_col = _column_number_to_a1(col_i), _column_number_to_a1(col_i - 1) if col_i > 6 else ""
+    for offset, col_i in enumerate(primary_year_cols):
+        col = _column_number_to_a1(col_i)
+        prev_col = _column_number_to_a1(primary_year_cols[offset - 1]) if offset > 0 else ""
         year_ref = f"{col}${year_row}"
         add_formula(col_i, row_contract_amount, f'=IF({col}$10={start_year_expr},-$E$3,0)', "Contract Amount") # type: ignore
         add_formula(col_i, row_surplus_tp, f"=SUMIFS('Unit Master'!$L:$L,'Unit Master'!$J:$J,{year_ref})", "Budget Surplus") # type: ignore
@@ -2092,6 +3092,9 @@ def _build_109_formula_plan_from_grid(
         add_formula(col_i, row_cr, f"=IFERROR(round({col}{row_poc}-{'0' if not prev_col else prev_col+str(row_poc)},8),\"\")", "CR") # type: ignore
         # 核心逻辑修正：调用重构后的方法，传入 prev_col
         add_formula(col_i, row_revenue, generator.get_revenue_formula(col, prev_col), "Revenue") # type: ignore
+
+        if row_income_total:
+            add_formula(col_i, row_income_total, generator.get_income_total_formula(col, year_ref), "Total Income Cost")
 
         # Gross Profit, 52 行
         if row_gp:
@@ -2115,12 +3118,12 @@ def _build_109_formula_plan_from_grid(
     # 特殊格式化：计提保修费用手工区 (F37:K37)
     if row_accrued_warranty:
         # 37 行 A1 范围: F{row}:K{row}
-        manual_range = f"{_quote_sheet_name(SHEET_109_NAME)}!F{row_accrued_warranty}:K{row_accrued_warranty}"
+        manual_range = f"{_quote_sheet_name(sheet_109_title)}!F{row_accrued_warranty}:K{row_accrued_warranty}"
         # 注入到 meta 中，后续格式化逻辑会读取
         if "manual_input_ranges" not in meta: meta["manual_input_ranges"] = []
         meta["manual_input_ranges"].append(manual_range)
 
-    return plan, {"sheet": SHEET_109_NAME, "year_row": year_row, "formula_count": len(plan), "key_rows": {**required_rows, **optional_rows}, "manual_ranges": meta.get("manual_input_ranges", [])}
+    return plan, {"sheet": sheet_109_title, "year_row": year_row, "formula_count": len(plan), "key_rows": {**required_rows, **optional_rows}, "manual_ranges": meta.get("manual_input_ranges", [])}
 
 
 def _ensure_109_labels(service, spreadsheet_id: str) -> int:
@@ -2162,20 +3165,47 @@ def _ensure_109_labels(service, spreadsheet_id: str) -> int:
     return 0
 
 
-def generate_109_formula_plan(service, spreadsheet_id: str) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+def generate_109_formula_plan(
+    service,
+    spreadsheet_id: str,
+    sheet_109_title: str | None = None,
+    project_id: str | None = None,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
     # These functions need to be defined or imported
-    from .finance_engine import _ensure_unit_budget_actual_settlement_columns, _refresh_unit_budget_actual_settlement_columns, _sync_unit_master_sheet, _apply_unit_budget_support_formatting, _ensure_109_contract_amount_row
-    _ensure_unit_budget_actual_settlement_columns(service, spreadsheet_id)
-    _refresh_unit_budget_actual_settlement_columns(service, spreadsheet_id)
-    _sync_unit_master_sheet(service, spreadsheet_id)
-    _apply_unit_budget_support_formatting(service, spreadsheet_id)
-    _ensure_109_contract_amount_row(service, spreadsheet_id)
-    _ensure_109_labels(service, spreadsheet_id)
-    resp = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range="109!A:ZZ").execute()
+    _compat_global("_ensure_unit_budget_actual_settlement_columns")(service, spreadsheet_id)
+    _compat_global("_refresh_unit_budget_actual_settlement_columns")(service, spreadsheet_id)
+    _compat_global("_sync_unit_master_sheet")(service, spreadsheet_id)
+    _compat_global("_apply_unit_budget_support_formatting")(service, spreadsheet_id)
+    _compat_global("_apply_scoping_layout_controls")(service, spreadsheet_id)
+    _compat_global("_ensure_109_contract_amount_row")(service, spreadsheet_id)
+    _compat_global("_ensure_109_income_section_layout")(service, spreadsheet_id)
+    _compat_global("_ensure_109_labels")(service, spreadsheet_id)
+    resolved_sheet_title = _safe_string(sheet_109_title) or SHEET_109_NAME
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{_quote_sheet_name(resolved_sheet_title)}!A:ZZ",
+    ).execute()
     rows = resp.get("values", [])
-    plan, meta = _build_109_formula_plan_from_grid(rows, _load_109_formula_dictionary())
-    semantic_updates = update_109_semantic_logic(rows)
+    formula_config = _load_109_formula_dictionary()
+    if project_id:
+        project_mappings = _compat_global("MappingService").get_project_mappings(project_id)
+        if project_mappings:
+            formula_config = dict(formula_config)
+            formula_config["formula_mappings"] = project_mappings
+    plan, meta = _build_109_formula_plan_from_grid(rows, formula_config, sheet_109_title=resolved_sheet_title)
+    semantic_updates = update_109_semantic_logic(
+        rows,
+        sheet_109_title=resolved_sheet_title,
+        formula_mappings=formula_config.get("formula_mappings") if isinstance(formula_config, Mapping) else None,
+    )
     merged_plan = _merge_formula_plan_with_semantic_updates(plan, semantic_updates)
+    if resolved_sheet_title != SHEET_109_NAME:
+        for item in merged_plan:
+            item["sheet"] = resolved_sheet_title
+            item["range"] = f"{_quote_sheet_name(resolved_sheet_title)}!{item['cell']}"
+        meta["sheet"] = resolved_sheet_title
+    if project_id:
+        meta["formula_mapping_project_id"] = project_id
     meta["semantic_formula_count"] = len(semantic_updates)
     return merged_plan, meta
 
@@ -2192,14 +3222,33 @@ def _refresh_unit_budget_actual_settlement_columns(service, spreadsheet_id: str)
     return 0
 
 def _sync_unit_master_sheet(service, spreadsheet_id: str) -> int:
-    # Logic to sync master sheet omitted
-    return 0
+    values = service.spreadsheets().values()
+    unit_budget_rows = values.get(spreadsheetId=spreadsheet_id, range="'Unit Budget'!A:ZZ").execute().get("values", [])
+    final_detail_rows = values.get(spreadsheetId=spreadsheet_id, range="'Final Detail'!A:V").execute().get("values", [])
+    payable_rows = values.get(spreadsheetId=spreadsheet_id, range="'Payable'!A:AL").execute().get("values", [])
+    values.get(spreadsheetId=spreadsheet_id, range="'Unit Master'!A:M").execute()
+    unit_master_rows = _compat_global("_build_unit_master_rows_v2")(unit_budget_rows, final_detail_rows, payable_rows)
+    if len(unit_master_rows) <= 2:
+        raise RuntimeError("Unit Master sync aborted: no valid data rows")
+    values.update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'Unit Master'!A1:M{len(unit_master_rows)}",
+        valueInputOption="USER_ENTERED",
+        body={"values": unit_master_rows},
+    ).execute()
+    return len(unit_master_rows)
 
 def _apply_unit_budget_support_formatting(service, spreadsheet_id: str) -> int:
     return 0
 
+def _apply_scoping_layout_controls(service, spreadsheet_id: str) -> Dict[str, Any]:
+    return {}
+
 def _ensure_109_contract_amount_row(service, spreadsheet_id: str) -> bool:
     return False
+
+def _ensure_109_income_section_layout(service, spreadsheet_id: str) -> Dict[str, Any]:
+    return {}
 
 def _verify_formula_plan(service, spreadsheet_id: str, plan: Sequence[Mapping[str, str]]) -> Dict[str, Any]:
     ranges = [str(item["range"]) for item in plan if "range" in item]
@@ -2330,7 +3379,12 @@ def execute_109_formula_plan(
     service,
     spreadsheet_id: str,
     plan: Sequence[Mapping[str, str]],
+    meta: Mapping[str, Any] | None = None,
+    *,
+    sheet_109_title: str | None = None,
 ) -> Dict[str, Any]:
+    resolved_sheet_title = sheet_109_title or _safe_string((meta or {}).get("sheet")) or SHEET_109_NAME
+    _compat_global("_cleanup_109_legacy_duplicate_contract_change_row")(service, spreadsheet_id, resolved_sheet_title)
     updates = [
         {
             "range": str(item["range"]),
@@ -2348,21 +3402,79 @@ def execute_109_formula_plan(
         }
 
     api_calls = 0
-    for chunk in _chunked(updates, 200):
-        service.spreadsheets().values().batchUpdate(
+    retry_count = 0
+    throttled_chunk_count = 0
+    old_values: List[Dict[str, Any]] = []
+    try:
+        batch_get = service.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
-            body={
+            ranges=[item["range"] for item in updates],
+            valueRenderOption="FORMULA",
+        ).execute()
+        for item, value_range in zip(updates, batch_get.get("valueRanges", [])):
+            old_values.append(
+                {
+                    "range": item["range"],
+                    "majorDimension": "ROWS",
+                    "values": value_range.get("values", [[""]]),
+                }
+            )
+    except Exception:
+        old_values = [{"range": item["range"], "majorDimension": "ROWS", "values": [[""]]} for item in updates]
+
+    try:
+        for chunk in _chunked(updates, int(_compat_global("FORMULA_WRITE_CHUNK_SIZE") or 200)):
+            body = {
                 "valueInputOption": "USER_ENTERED",
                 "data": list(chunk),
-            },
-        ).execute()
-        api_calls += 1
+            }
+            try:
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body=body,
+                ).execute()
+            except Exception as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status == 429 or "429" in str(exc):
+                    retry_count += 1
+                    throttled_chunk_count += 1
+                    time.sleep(1)
+                    service.spreadsheets().values().batchUpdate(
+                        spreadsheetId=spreadsheet_id,
+                        body=body,
+                    ).execute()
+                else:
+                    raise
+            api_calls += 1
+    except Exception as exc:
+        try:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"valueInputOption": "USER_ENTERED", "data": old_values},
+            ).execute()
+        finally:
+            raise RuntimeError("FORMULA_WRITEBACK_PARTIAL_ROLLBACK") from exc
 
-    verify = _verify_formula_plan(service, spreadsheet_id, plan)
+    verify = _compat_global("_verify_formula_plan")(service, spreadsheet_id, plan)
+    layout_109 = _compat_global("_apply_109_layout_controls")(service, spreadsheet_id)
+    formula_locks = _compat_global("_apply_109_formula_lock_protection")(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        plan=plan,
+        sheet_109_title=resolved_sheet_title,
+    )
+    external_controls = _compat_global("_apply_external_sheet_controls")(service, spreadsheet_id)
     return {
         "api_calls": api_calls,
         "updated_ranges": len(updates),
         "verify": verify,
+        "109_layout": layout_109,
+        "formula_locks": formula_locks,
+        "external_controls": external_controls,
+        "write_throttle": {
+            "retry_count": retry_count,
+            "throttled_chunk_count": throttled_chunk_count,
+        },
     }
 
 

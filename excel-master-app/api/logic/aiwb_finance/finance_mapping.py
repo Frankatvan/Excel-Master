@@ -1,11 +1,96 @@
 import logging
 import re
 from pathlib import Path
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import yaml
 
 
 DEFAULT_SEMANTIC_CONFIG_PATH = Path("docs/finance_semantic_config.yaml")
+FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "amount": ("Amount",),
+    "cost_code": ("Cost Code", "CostCode"),
+    "cost_name": ("Cost Name", "CostName"),
+    "draw_invoice": ("Draw Invoice",),
+    "invoice_no": ("Invoice No", "Invoice No.", "Invoice Number", "Invoice #", "Invoiced No", "Invoiced No."),
+    "posting_date": ("Posting Date", "Posting Date 1", "Post Date"),
+    "raw_cost_state": ("Cost State", "Raw Cost State"),
+    "unit_code": ("Unit Code", "Unit", "Unit No", "Unit No."),
+    "vendor": ("Vendor",),
+    "year": ("Year", "实际结算年份"),
+}
+FIXED_FIELD_COLUMNS: Dict[Tuple[str, str], int] = {
+    ("draw request report", "raw_cost_state"): 3,
+}
+
+
+def _normalize_header_match_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def resolve_sheet_field_columns(
+    headers: Sequence[Any],
+    sheet_name: str,
+    fields: Sequence[str] = (),
+) -> Dict[str, int]:
+    layout, _ = resolve_sheet_field_columns_with_fallback(
+        headers=headers,
+        sheet_name=sheet_name,
+        fields=fields,
+    )
+    return layout
+
+
+def resolve_sheet_field_columns_with_fallback(
+    *,
+    headers: Sequence[Any],
+    sheet_name: str,
+    fallback_columns: Mapping[str, Any] | None = None,
+    fields: Sequence[str] = (),
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    logger = logging.getLogger("SheetFieldSemanticResolver")
+    normalized_headers = {
+        _normalize_header_match_key(header): index
+        for index, header in enumerate(headers, start=1)
+        if _normalize_header_match_key(header)
+    }
+    fallback_columns = fallback_columns or {}
+    normalized_sheet = str(sheet_name or "").strip().lower()
+    layout: Dict[str, int] = {}
+    warnings: List[Dict[str, Any]] = []
+
+    for field in fields:
+        fixed_column = FIXED_FIELD_COLUMNS.get((normalized_sheet, field))
+        if fixed_column:
+            layout[field] = fixed_column
+            continue
+
+        for alias in FIELD_ALIASES.get(field, (field,)):
+            column_index = normalized_headers.get(_normalize_header_match_key(alias))
+            if column_index:
+                layout[field] = column_index
+                break
+        if field in layout:
+            continue
+
+        fallback_column = fallback_columns.get(field)
+        if fallback_column:
+            event = {
+                "event_code": "FALLBACK_TO_PHYSICAL_INDEX",
+                "sheet_name": sheet_name,
+                "logical_field": field,
+                "physical_index": int(fallback_column),
+            }
+            layout[field] = int(fallback_column)
+            warnings.append(event)
+            logger.warning(
+                "FALLBACK_TO_PHYSICAL_INDEX sheet=%s field=%s column=%s",
+                sheet_name,
+                field,
+                fallback_column,
+            )
+
+    return layout, warnings
 
 
 class ExcelSemanticMapper:

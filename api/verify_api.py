@@ -1,9 +1,19 @@
 import sys
 import os
+import importlib.util
 from pathlib import Path
 
-# Add logic directory to path
-sys.path.append(str(Path(__file__).parent / "logic"))
+api_path = str(Path(__file__).parent)
+if api_path not in sys.path:
+    sys.path.insert(0, api_path)
+
+# Add both local compatibility logic and canonical package logic to the Python path.
+api_dir = Path(__file__).resolve().parent
+workspace_root = api_dir.parent.parent if api_dir.parent.name == "excel-master-app" else api_dir.parent
+for logic_dir in [api_dir / "logic", workspace_root / "excel-master-app" / "api" / "logic"]:
+    logic_path = str(logic_dir)
+    if logic_dir.exists() and logic_path not in sys.path:
+        sys.path.insert(0, logic_path)
 
 def verify_imports():
     print("Verifying imports...")
@@ -11,9 +21,9 @@ def verify_imports():
         import pandas as pd
         import googleapiclient
         import supabase
-        import finance_engine
-        import finance_utils
-        import finance_services
+        import aiwb_finance.finance_engine
+        import aiwb_finance.finance_utils
+        import aiwb_finance.finance_services
         print("✅ Core logic imports successful.")
     except ImportError as e:
         print(f"❌ Import failed: {e}")
@@ -22,7 +32,17 @@ def verify_imports():
 def verify_handlers():
     print("Verifying API handlers...")
     try:
-        from reclassify import handler as reclassify_handler
+        reclassify_job_candidates = [
+            Path(__file__).parent / "internal" / "reclassify_job.py",
+            Path(__file__).parents[1] / "excel-master-app" / "api" / "internal" / "reclassify_job.py",
+        ]
+        reclassify_job_path = next((path for path in reclassify_job_candidates if path.exists()), reclassify_job_candidates[0])
+        spec = importlib.util.spec_from_file_location("reclassify_job", reclassify_job_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load {reclassify_job_path}")
+        reclassify_job = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reclassify_job)
+        reclassify_handler = reclassify_job.handler
         from formula_sync import handler as formula_sync_handler
         print("✅ API handlers loaded successful.")
     except Exception as e:
