@@ -94,6 +94,24 @@ describe("deployment packaging guardrails", () => {
     expect(migrationNames).toContain("20260427060000_create_jobs_table_if_missing.sql");
   });
 
+  it("declares durable external import job and manifest tables", () => {
+    const projectRoot = path.resolve(__dirname, "../..");
+    const migrationPath = path.join(projectRoot, "supabase/migrations/20260427060000_create_jobs_table_if_missing.sql");
+    const migration = fs.readFileSync(migrationPath, "utf8");
+
+    for (const token of [
+      "operation text",
+      "lock_token uuid",
+      "created_by text",
+      "heartbeat_at timestamptz",
+      "public.external_import_manifests",
+      "public.external_import_manifest_items",
+      "schema_drift jsonb",
+    ]) {
+      expect(migration).toContain(token);
+    }
+  });
+
   it("ships python dependencies required by the worker runtime", () => {
     const projectRoot = path.resolve(__dirname, "../..");
     const requirementsPath = path.join(projectRoot, "requirements.txt");

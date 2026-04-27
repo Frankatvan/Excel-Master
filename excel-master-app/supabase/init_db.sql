@@ -23,9 +23,62 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-    type TEXT NOT NULL, -- 'reclassify' or 'formula_sync'
-    status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed'
-    result_meta JSONB DEFAULT '{}'::jsonb,
+    spreadsheet_id TEXT,
+    type TEXT,
+    job_type TEXT,
+    operation TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    lock_token UUID,
+    created_by TEXT,
+    progress INTEGER NOT NULL DEFAULT 0,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result JSONB,
+    result_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    started_at TIMESTAMP WITH TIME ZONE,
+    heartbeat_at TIMESTAMP WITH TIME ZONE,
+    finished_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS external_import_manifests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    spreadsheet_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'parsed',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    imported_at TIMESTAMP WITH TIME ZONE,
+    imported_by TEXT,
+    result_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error JSONB
+);
+
+CREATE TABLE IF NOT EXISTS external_import_manifest_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    manifest_id UUID NOT NULL REFERENCES external_import_manifests(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    spreadsheet_id TEXT NOT NULL,
+    source_table TEXT NOT NULL,
+    source_file_name TEXT,
+    source_sheet_name TEXT,
+    file_hash TEXT,
+    header_signature TEXT,
+    imported_at TIMESTAMP WITH TIME ZONE,
+    imported_by TEXT,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    column_count INTEGER NOT NULL DEFAULT 0,
+    amount_total NUMERIC,
+    target_zone_key TEXT,
+    resolved_zone_fingerprint TEXT,
+    status TEXT NOT NULL DEFAULT 'parsed',
+    validation_message TEXT,
+    schema_drift JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
 );
@@ -34,6 +87,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE external_import_manifests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE external_import_manifest_items ENABLE ROW LEVEL SECURITY;
 
 -- 6. 策略：允许 Service Role 拥有所有权限 (Supabase 默认行为)
 
