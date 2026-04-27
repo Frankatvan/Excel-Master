@@ -47,6 +47,76 @@ class ScopingControlsTests(unittest.TestCase):
         self.assertEqual({"inserted": False, "final_gmp_col_1based": 6}, meta)
         self.assertEqual(rows, migrated)
 
+    def test_apply_scoping_layout_controls_inserts_final_gmp_without_value_overwrite(self):
+        class Execute:
+            def __init__(self, value):
+                self.value = value
+
+            def execute(self):
+                return self.value
+
+        class Values:
+            def __init__(self, rows):
+                self.rows = rows
+                self.updates = []
+
+            def get(self, **_kwargs):
+                return Execute({"values": self.rows})
+
+            def update(self, **kwargs):
+                self.updates.append(kwargs)
+                return Execute({})
+
+        class Spreadsheets:
+            def __init__(self, rows):
+                self.values_api = Values(rows)
+                self.batch_updates = []
+
+            def values(self):
+                return self.values_api
+
+            def get(self, **_kwargs):
+                return Execute(
+                    {
+                        "sheets": [
+                            {
+                                "properties": {
+                                    "title": "Scoping",
+                                    "sheetId": 241616920,
+                                    "gridProperties": {"rowCount": 1000, "columnCount": 26},
+                                }
+                            }
+                        ]
+                    }
+                )
+
+            def batchUpdate(self, **kwargs):
+                self.batch_updates.append(kwargs)
+                return Execute({})
+
+        class Service:
+            def __init__(self, rows):
+                self.spreadsheets_api = Spreadsheets(rows)
+
+            def spreadsheets(self):
+                return self.spreadsheets_api
+
+        rows = [
+            ["", "", "Group Number", "Group Name", "GMP", "Fee"],
+            ["", "", "101", "Group 101", "1", ""],
+        ]
+        service = Service(rows)
+
+        result = fe._apply_scoping_layout_controls(service, "sheet-123")
+
+        self.assertEqual({"inserted": True, "final_gmp_col_1based": 6}, result["final_gmp"])
+        self.assertEqual([], service.spreadsheets_api.values_api.updates)
+        requests = service.spreadsheets_api.batch_updates[0]["body"]["requests"]
+        self.assertEqual("insertDimension", next(iter(requests[0])))
+        self.assertEqual("copyPaste", next(iter(requests[1])))
+        self.assertEqual("copyPaste", next(iter(requests[2])))
+        self.assertEqual("updateCells", next(iter(requests[3])))
+
     def test_build_scoping_manual_input_ranges(self):
         ranges = fe._build_scoping_manual_input_ranges(build_scoping_grid())
         self.assertEqual(

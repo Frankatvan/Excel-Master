@@ -2034,6 +2034,112 @@ def _ensure_scoping_final_gmp_rows(rows: Sequence[Sequence[Any]]) -> Tuple[List[
     return normalized, {"inserted": True, "final_gmp_col_1based": insert_at + 1}
 
 
+def _build_scoping_final_gmp_insert_requests(
+    *,
+    sheet_id: int,
+    row_count: int,
+    header_row_idx: int,
+    gmp_col_idx: int,
+) -> List[Dict[str, Any]]:
+    insert_at = gmp_col_idx + 1
+    target_row_count = max(int(row_count or 0), header_row_idx + 1)
+    requests: List[Dict[str, Any]] = [
+        {
+            "insertDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": insert_at,
+                    "endIndex": insert_at + 1,
+                },
+                "inheritFromBefore": True,
+            }
+        },
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": sheet_id,
+                    "startColumnIndex": gmp_col_idx,
+                    "endColumnIndex": gmp_col_idx + 1,
+                },
+                "destination": {
+                    "sheetId": sheet_id,
+                    "startColumnIndex": insert_at,
+                    "endColumnIndex": insert_at + 1,
+                },
+                "pasteType": "PASTE_FORMAT",
+                "pasteOrientation": "NORMAL",
+            }
+        },
+    ]
+    if target_row_count > header_row_idx + 1:
+        requests.append(
+            {
+                "copyPaste": {
+                    "source": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": header_row_idx + 1,
+                        "endRowIndex": target_row_count,
+                        "startColumnIndex": gmp_col_idx,
+                        "endColumnIndex": gmp_col_idx + 1,
+                    },
+                    "destination": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": header_row_idx + 1,
+                        "endRowIndex": target_row_count,
+                        "startColumnIndex": insert_at,
+                        "endColumnIndex": insert_at + 1,
+                    },
+                    "pasteType": "PASTE_VALUES",
+                    "pasteOrientation": "NORMAL",
+                }
+            }
+        )
+    requests.append(
+        {
+            "updateCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": header_row_idx,
+                    "endRowIndex": header_row_idx + 1,
+                    "startColumnIndex": insert_at,
+                    "endColumnIndex": insert_at + 1,
+                },
+                "rows": [
+                    {
+                        "values": [
+                            {
+                                "userEnteredValue": {
+                                    "stringValue": "Final GMP",
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "fields": "userEnteredValue",
+            }
+        }
+    )
+    return requests
+
+
+def _insert_scoping_final_gmp_column(service, spreadsheet_id: str, rows: Sequence[Sequence[Any]]) -> None:
+    header_row_idx, gmp_col_idx = _find_header_index_in_rows(rows, "GMP")
+    if header_row_idx is None or gmp_col_idx is None:
+        return
+    metadata = _get_sheet_metadata(service, spreadsheet_id, "Scoping")
+    requests = _build_scoping_final_gmp_insert_requests(
+        sheet_id=int(metadata.get("sheet_id", 0)),
+        row_count=int(metadata.get("row_count", 0)),
+        header_row_idx=header_row_idx,
+        gmp_col_idx=gmp_col_idx,
+    )
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests},
+    ).execute()
+
+
 def _format_mdy_no_leading_zero(value: Any) -> str:
     dt = _normalize_date_value(value)
     if dt is None:
@@ -3278,14 +3384,7 @@ def _apply_scoping_layout_controls(service, spreadsheet_id: str) -> Dict[str, An
     ).execute().get("values", [])
     migrated_rows, final_gmp_meta = _ensure_scoping_final_gmp_rows(rows)
     if final_gmp_meta.get("inserted"):
-        max_width = max((len(row) for row in migrated_rows), default=0)
-        end_col = _column_number_to_a1(max_width)
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"'Scoping'!A1:{end_col}{len(migrated_rows)}",
-            valueInputOption="USER_ENTERED",
-            body={"values": migrated_rows},
-        ).execute()
+        _insert_scoping_final_gmp_column(service, spreadsheet_id, rows)
     return {
         "final_gmp": final_gmp_meta,
         "manual_input_ranges": _build_scoping_manual_input_ranges(migrated_rows),

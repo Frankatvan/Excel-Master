@@ -27,7 +27,13 @@ def _load_worker_dependencies():
     if logic_path_text not in sys.path:
         sys.path.insert(0, logic_path_text)
 
-    from aiwb_finance.finance_engine import MappingService, _ensure_scoping_final_gmp_rows, build_dashboard_summary_payload
+    from aiwb_finance.finance_engine import (
+        MappingService,
+        _build_scoping_final_gmp_insert_requests,
+        _ensure_scoping_final_gmp_rows,
+        _get_sheet_metadata,
+        build_dashboard_summary_payload,
+    )
     from aiwb_finance.finance_classification import compute_final_detail_classifications, compute_payable_classifications
     from aiwb_finance.finance_mapping import resolve_sheet_field_columns_with_fallback
     from aiwb_finance.finance_utils import (
@@ -48,7 +54,9 @@ def _load_worker_dependencies():
         "MappingService": MappingService,
         "compute_final_detail_classifications": compute_final_detail_classifications,
         "compute_payable_classifications": compute_payable_classifications,
+        "_build_scoping_final_gmp_insert_requests": _build_scoping_final_gmp_insert_requests,
         "_ensure_scoping_final_gmp_rows": _ensure_scoping_final_gmp_rows,
+        "_get_sheet_metadata": _get_sheet_metadata,
         "_find_col_in_headers": _find_col_in_headers,
         "_find_col_in_row": _find_col_in_row,
         "_column_number_to_a1": _column_number_to_a1,
@@ -301,17 +309,29 @@ def ensure_scoping_final_gmp_before_reclassification(
     if not final_gmp_meta.get("inserted"):
         return final_gmp_meta
 
-    row_count = len(migrated_rows)
-    col_count = max((len(row) for row in migrated_rows), default=0)
-    if row_count < 1 or col_count < 1:
+    header_row_idx = None
+    gmp_col_idx = None
+    for row_idx, row in enumerate(scoping_rows):
+        for col_idx, value in enumerate(row):
+            if str(value).strip().casefold() == "gmp":
+                header_row_idx = row_idx
+                gmp_col_idx = col_idx
+                break
+        if header_row_idx is not None:
+            break
+    if header_row_idx is None or gmp_col_idx is None:
         return final_gmp_meta
 
-    end_col = deps["_column_number_to_a1"](col_count)
-    service.spreadsheets().values().update(
+    metadata = deps["_get_sheet_metadata"](service, spreadsheet_id, "Scoping")
+    requests = deps["_build_scoping_final_gmp_insert_requests"](
+        sheet_id=int(metadata.get("sheet_id", 0)),
+        row_count=int(metadata.get("row_count", 0)),
+        header_row_idx=header_row_idx,
+        gmp_col_idx=gmp_col_idx,
+    )
+    service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
-        range=f"{_quote_sheet_name('Scoping')}!A1:{end_col}{row_count}",
-        valueInputOption="USER_ENTERED",
-        body={"values": migrated_rows},
+        body={"requests": requests},
     ).execute()
     return final_gmp_meta
 

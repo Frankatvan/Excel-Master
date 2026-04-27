@@ -30,6 +30,8 @@ def test_worker_exports_scoping_final_gmp_migration_dependency():
     deps = reclassify_job._load_worker_dependencies()
 
     assert callable(deps["_ensure_scoping_final_gmp_rows"])
+    assert callable(deps["_get_sheet_metadata"])
+    assert callable(deps["_build_scoping_final_gmp_insert_requests"])
 
 
 def test_handler_migrates_scoping_final_gmp_before_computing_reclassification(monkeypatch):
@@ -64,15 +66,18 @@ def test_handler_migrates_scoping_final_gmp_before_computing_reclassification(mo
             sent["body"] = data.decode("utf-8")
 
     service = Mock()
-    value_updates = []
-
-    def update_values(**kwargs):
-        value_updates.append(kwargs)
-        return SimpleNamespace(execute=Mock(return_value={}))
-
-    values_api = service.spreadsheets.return_value.values.return_value
-    values_api.update.side_effect = update_values
-    values_api.batchUpdate.return_value.execute.return_value = {}
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [
+            {
+                "properties": {
+                    "title": "Scoping",
+                    "sheetId": 241616920,
+                    "gridProperties": {"rowCount": 1000, "columnCount": 26},
+                }
+            }
+        ]
+    }
+    service.spreadsheets.return_value.batchUpdate.return_value.execute.return_value = {}
 
     request_body = b'{"spreadsheet_id":"sheet-123"}'
     handler = reclassify_job.handler.__new__(reclassify_job.handler)
@@ -122,7 +127,9 @@ def test_handler_migrates_scoping_final_gmp_before_computing_reclassification(mo
 
     reclassify_job.handler.do_POST(handler)
 
-    assert any("Scoping" in update["range"] for update in value_updates)
+    service.spreadsheets.return_value.values.return_value.update.assert_not_called()
+    batch_body = service.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]
+    assert any("insertDimension" in request for request in batch_body["requests"])
     reclassify_job.compute_reclassification_results.assert_called_once_with(migrated_sheet_map)
     assert handler.send_response.call_args.args[0] == 200
     assert json.loads(sent["body"])["ok"] is True
