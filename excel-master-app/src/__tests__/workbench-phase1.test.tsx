@@ -670,6 +670,79 @@ describe("phase 1 workbench page", () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/external_import/status")).length).toBeGreaterThanOrEqual(2);
   });
 
+  it("keeps preview available but disables external import confirm when the worker is not configured", async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "external_data_ready",
+            is_owner_or_admin: false,
+            can_write: true,
+            drive_role: "writer",
+            is_drive_owner: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      if (url.startsWith("/api/external_import/status")) {
+        return jsonResponse({
+          status: "not_started",
+          worker_configured: false,
+          manifest_items: [],
+        });
+      }
+      if (url.startsWith("/api/external_import/preview")) {
+        expect(init?.method).toBe("POST");
+        return jsonResponse({
+          status: "preview_ready",
+          spreadsheet_id: "sheet-123",
+          preview_hash: "preview-hash-123",
+          confirm_allowed: true,
+          worker_configured: false,
+          source_tables: [
+            {
+              source_role: "payable",
+              source_sheet_name: "Payable",
+              row_count: 1,
+              amount_total: 100,
+              target_zone_key: "external_import.payable_raw",
+              status: "preview_ready",
+              warnings: [],
+              blocking_issues: [],
+            },
+          ],
+          files: [],
+        });
+      }
+      return jsonResponse({});
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByText("外部数据导入")).toBeTruthy());
+    expect(screen.getByText("外部导入 Worker 未配置，确认导入暂不可用。")).toBeTruthy();
+
+    const file = new File(["demo"], "payable-april.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    fireEvent.change(screen.getByLabelText("选择外部导入文件"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "预览导入" }));
+
+    await waitFor(() => expect(screen.getByText("预览完成；外部导入 Worker 未配置，暂不能确认导入")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "确认导入" })).toHaveProperty("disabled", true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/confirm"))).toBe(false);
+  });
+
   it("shows external import status to readonly collaborators without upload controls", async () => {
     global.fetch = jest.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

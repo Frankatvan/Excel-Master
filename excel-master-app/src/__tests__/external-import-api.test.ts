@@ -197,6 +197,8 @@ describe("/api/external_import/preview", () => {
     mockGetServerSession.mockResolvedValue({
       user: { email: "writer@example.com" },
     } as never);
+    process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/external-import";
+    process.env.EXTERNAL_IMPORT_WORKER_SECRET = "worker-secret";
     const buffer = workbookBuffer([
       {
         name: "Payable",
@@ -230,6 +232,7 @@ describe("/api/external_import/preview", () => {
           tables: [
             {
               source_role: "payable",
+              target_zone_key: "external_import.payable_raw",
               target_zone_id: "external_import.payable_raw",
               row_count: 1,
               blocking_issues: [],
@@ -239,6 +242,41 @@ describe("/api/external_import/preview", () => {
       ],
     });
     expect(readJson(res).preview_hash).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/));
+    expect(readJson(res).worker_configured).toBe(true);
+  });
+
+  it("previews uploaded files while reporting that confirm is unavailable when worker config is missing", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    delete process.env.EXTERNAL_IMPORT_WORKER_URL;
+    delete process.env.EXTERNAL_IMPORT_WORKER_SECRET;
+    const buffer = workbookBuffer([
+      {
+        name: "Payable",
+        rows: [
+          ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          ["g-1", "Apex", "INV-1", 100, "CA"],
+        ],
+      },
+    ]);
+
+    const req = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [{ file_name: "payables.xlsx", content_base64: buffer.toString("base64") }],
+      },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await previewHandler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(readJson(res)).toMatchObject({
+      confirm_allowed: true,
+      worker_configured: false,
+    });
   });
 
   it("does not return spreadsheet address literals in the preview payload", async () => {
@@ -1109,6 +1147,8 @@ describe("/api/external_import/status", () => {
     mockGetServerSession.mockResolvedValue({
       user: { email: "reader@example.com" },
     } as never);
+    process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/external-import";
+    process.env.EXTERNAL_IMPORT_WORKER_SECRET = "worker-secret";
     const payload = {
       spreadsheet_id: "sheet-123",
       job_id: "job-123",
@@ -1147,7 +1187,10 @@ describe("/api/external_import/status", () => {
     await statusHandler(req, res);
 
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith(payload);
+    expect(res.json).toHaveBeenCalledWith({
+      ...payload,
+      worker_configured: true,
+    });
   });
 
   it("returns the ProjectAccessError status and code when project access is forbidden", async () => {

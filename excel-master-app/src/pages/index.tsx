@@ -413,6 +413,7 @@ interface ExternalImportStatusView {
   updated_at?: string;
   preview_hash?: string;
   confirm_allowed?: boolean;
+  worker_configured?: boolean;
   tables: ExternalImportTableStatus[];
 }
 
@@ -1015,6 +1016,7 @@ function normalizeExternalImportStatus(payload: unknown): ExternalImportStatusVi
           : undefined,
     preview_hash: typeof payload.preview_hash === "string" ? payload.preview_hash : undefined,
     confirm_allowed: typeof payload.confirm_allowed === "boolean" ? payload.confirm_allowed : undefined,
+    worker_configured: typeof payload.worker_configured === "boolean" ? payload.worker_configured : undefined,
     updated_at:
       typeof payload.updated_at === "string"
         ? payload.updated_at
@@ -2157,7 +2159,13 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       const preview = normalizeExternalImportStatus(data);
       setExternalImportStatus(preview);
       setExternalImportPreviewHash(preview?.preview_hash || null);
-      setExternalImportMessage(preview?.confirm_allowed === false ? "预览存在阻塞问题，不能确认导入" : "预览完成，可以确认导入");
+      setExternalImportMessage(
+        preview?.confirm_allowed === false
+          ? "预览存在阻塞问题，不能确认导入"
+          : preview?.worker_configured === false
+            ? "预览完成；外部导入 Worker 未配置，暂不能确认导入"
+            : "预览完成，可以确认导入",
+      );
     } catch (previewError) {
       const message = previewError instanceof Error ? previewError.message : "外部数据导入预览失败";
       setExternalImportMessage(message);
@@ -2952,6 +2960,9 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
                         <div>只会替换本次识别到的外部表。未上传的表保留当前版本。</div>
                         <div>导入成功后会自动验证录入数据。</div>
                         {!canWriteExternalImport && <div>Reader/Commenter 只能查看导入状态，不能上传。</div>}
+                        {canWriteExternalImport && externalImportStatus?.worker_configured === false && (
+                          <div>外部导入 Worker 未配置，确认导入暂不可用。</div>
+                        )}
                       </div>
 
                       {canWriteExternalImport && (
@@ -2989,7 +3000,12 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
                           <button
                             type="button"
                             onClick={handleExternalImportConfirm}
-                            disabled={!externalImportPreviewHash || externalImportStatus?.confirm_allowed === false || externalImportConfirming}
+                            disabled={
+                              !externalImportPreviewHash ||
+                              externalImportStatus?.confirm_allowed === false ||
+                              externalImportStatus?.worker_configured === false ||
+                              externalImportConfirming
+                            }
                             className={secondaryButtonClassName}
                           >
                             {externalImportConfirming ? "提交中" : "确认导入"}

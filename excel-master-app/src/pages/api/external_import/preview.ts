@@ -118,6 +118,10 @@ function readUploadedWorkbooks(body: Record<string, unknown>): UploadedWorkbookB
   });
 }
 
+function isExternalImportWorkerConfigured() {
+  return Boolean(process.env.EXTERNAL_IMPORT_WORKER_URL?.trim() && process.env.EXTERNAL_IMPORT_WORKER_SECRET?.trim());
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -151,6 +155,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       spreadsheetId,
       parsedWorkbooks,
       fileHashes: uploads.map((upload) => hashFileBuffer(upload.buffer)),
+      workerConfigured: isExternalImportWorkerConfigured(),
     });
     savePreviewPayload(previewPayload);
 

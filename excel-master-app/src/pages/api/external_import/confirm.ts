@@ -113,7 +113,8 @@ async function resolveZonesForPreview(spreadsheetId: string, previewRecord: Exte
   const resolvedZones: Record<string, ResolvedImportZone> = {};
 
   for (const table of previewRecord.sourceTables) {
-    if (resolvedZones[table.target_zone_id]) {
+    const targetZoneKey = table.target_zone_key || table.target_zone_id;
+    if (resolvedZones[targetZoneKey]) {
       continue;
     }
 
@@ -124,7 +125,7 @@ async function resolveZonesForPreview(spreadsheetId: string, previewRecord: Exte
       const issue = resolution.blockingIssues[0];
       throw new Error(issue ? `${issue.code}:${issue.message}` : `IMPORT_ZONE_UNRESOLVED:${table.source_role}`);
     }
-    resolvedZones[table.target_zone_id] = resolution.zone;
+    resolvedZones[targetZoneKey] = resolution.zone;
   }
 
   return resolvedZones;
@@ -389,7 +390,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           row_count: table.row_count,
           column_count: table.column_count,
           amount_total: table.amount_total,
-          target_zone_key: table.target_zone_id,
+          target_zone_key: table.target_zone_key || table.target_zone_id,
           schema_drift: {
             warnings: table.warnings,
             blocking_issues: table.blocking_issues,

@@ -8,8 +8,10 @@ Date: 2026-04-27
   - [ ] `SUPABASE_SERVICE_ROLE_KEY`
   - [ ] `GOOGLE_SERVICE_ACCOUNT_EMAIL`
   - [ ] `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`
+  - [ ] `EXTERNAL_IMPORT_WORKER_URL`
   - [ ] `EXTERNAL_IMPORT_WORKER_SECRET`
   - [ ] External import storage/bucket settings if durable file storage is enabled beyond the MVP JSON/base64 preview path.
+- [ ] Confirm staging `/api/debug-env` reports `hasExternalImportWorkerUrl: true` and `hasExternalImportWorkerSecret: true` without exposing secret values.
 - [ ] Apply Supabase migrations for durable import jobs, manifests, table statuses, warnings, blocking items, and audit log linkage.
 - [ ] Verify Google service account permissions on the target Drive folders and project spreadsheets.
 - [ ] Confirm Drive owner is not required for collaborator write flows; writer/collaborator access is enough.

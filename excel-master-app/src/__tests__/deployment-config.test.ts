@@ -1,7 +1,27 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { NextApiRequest, NextApiResponse } from "next";
+
+import debugEnvHandler from "../pages/api/debug-env";
+
+function createMockRes() {
+  const res = {} as Partial<NextApiResponse>;
+  res.status = jest.fn().mockReturnValue(res as NextApiResponse);
+  res.json = jest.fn().mockReturnValue(res as NextApiResponse);
+  return res as NextApiResponse;
+}
 
 describe("deployment packaging guardrails", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterAll(() => {
+    process.env = originalEnv;
+  });
+
   it("ignores local build artifacts and python caches from Vercel uploads", () => {
     const projectRoot = path.resolve(__dirname, "../..");
     const ignorePath = path.join(projectRoot, ".vercelignore");
@@ -151,5 +171,40 @@ describe("deployment packaging guardrails", () => {
         "db:project-registry:migrate": "node scripts/apply_project_registry_migration.mjs",
       }),
     );
+  });
+
+  it("requires external import worker credentials in deploy scripts", () => {
+    const projectRoot = path.resolve(__dirname, "../..");
+
+    for (const scriptPath of [
+      path.join(projectRoot, "scripts/vercel_env_sync.mjs"),
+      path.join(projectRoot, "scripts/vercel_deploy.mjs"),
+    ]) {
+      const script = fs.readFileSync(scriptPath, "utf8");
+
+      expect(script).toContain('"EXTERNAL_IMPORT_WORKER_URL"');
+      expect(script).toContain('"EXTERNAL_IMPORT_WORKER_SECRET"');
+    }
+  });
+
+  it("reports external import worker readiness without exposing secret values", () => {
+    process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/api/external-import";
+    process.env.EXTERNAL_IMPORT_WORKER_SECRET = "super-secret-external-import-token";
+
+    const req = {} as NextApiRequest;
+    const res = createMockRes();
+
+    debugEnvHandler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    const payload = (res.json as jest.Mock).mock.calls[0][0];
+
+    expect(payload).toEqual(
+      expect.objectContaining({
+        hasExternalImportWorkerUrl: true,
+        hasExternalImportWorkerSecret: true,
+      }),
+    );
+    expect(JSON.stringify(payload)).not.toContain("super-secret-external-import-token");
   });
 });

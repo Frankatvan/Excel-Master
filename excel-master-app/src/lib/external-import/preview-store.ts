@@ -8,6 +8,7 @@ export interface ExternalImportPreviewTable {
   row_count: number;
   column_count: number;
   amount_total: number;
+  target_zone_key: string;
   target_zone_id: string;
   warnings: string[];
   blocking_issues: string[];
@@ -26,6 +27,7 @@ export interface ExternalImportPreviewPayload {
   spreadsheet_id: string;
   preview_hash: string;
   confirm_allowed: boolean;
+  worker_configured?: boolean;
   files: ExternalImportPreviewFile[];
   source_tables: ExternalImportPreviewTable[];
 }
@@ -87,6 +89,7 @@ export function buildPreviewPayload(input: {
   spreadsheetId: string;
   parsedWorkbooks: ParsedExternalImportWorkbook[];
   fileHashes: string[];
+  workerConfigured?: boolean;
 }): ExternalImportPreviewPayload {
   const files = input.parsedWorkbooks.map<ExternalImportPreviewFile>((workbook, index) => ({
     file_name: workbook.fileName,
@@ -97,6 +100,7 @@ export function buildPreviewPayload(input: {
       row_count: table.rowCount,
       column_count: table.columnCount,
       amount_total: table.amountTotal,
+      target_zone_key: table.targetZoneKey,
       target_zone_id: table.targetZoneKey,
       warnings: [...table.warnings],
       blocking_issues: [...table.blockingIssues],
@@ -117,6 +121,7 @@ export function buildPreviewPayload(input: {
     spreadsheet_id: input.spreadsheetId,
     preview_hash: previewHash,
     confirm_allowed: confirmAllowed,
+    worker_configured: input.workerConfigured,
     files,
     source_tables: sourceTables,
   };

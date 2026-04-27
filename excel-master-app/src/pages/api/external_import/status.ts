@@ -16,6 +16,10 @@ function readQueryString(req: NextApiRequest, key: string) {
   return readString(raw);
 }
 
+function isExternalImportWorkerConfigured() {
+  return Boolean(process.env.EXTERNAL_IMPORT_WORKER_URL?.trim() && process.env.EXTERNAL_IMPORT_WORKER_SECRET?.trim());
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -40,7 +44,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       jobId: readQueryString(req, "job_id"),
     });
 
-    return res.status(200).json(status);
+    return res.status(200).json({
+      ...status,
+      worker_configured: isExternalImportWorkerConfigured(),
+    });
   } catch (error) {
     if (error instanceof ProjectAccessError) {
       return res.status(error.statusCode).json({ error: error.message, code: error.code });

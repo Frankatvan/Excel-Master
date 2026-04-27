@@ -149,22 +149,22 @@ describe("external import workbook parser", () => {
         {
           name: "Draw Invoice List",
           rows: [
-            ["Invoice No", "Vendor", "Amount"],
-            ["INV-1", "Apex", 100],
+            ["Draw Date", "Vendor Name", "Invoice #", "Total"],
+            ["2026-04-02", "Apex", "INV-1", 100],
           ],
         },
         {
           name: "Transfer Log",
           rows: [
-            ["Transfer Date", "From Unit", "To Unit", "Amount"],
-            ["2026-04-02", "101", "102", "$200"],
+            ["Draw Date", "Description", "Deduct", "Credit", "Total"],
+            ["2026-04-02", "Move budget", "", "", "$200"],
           ],
         },
         {
           name: "Change Order Log",
           rows: [
-            ["Change Order No", "Vendor", "Amount"],
-            ["CO-1", "Apex", "$300"],
+            ["Change Order Date Submitted (Draw Date)", "Description", "Approved Change Orders"],
+            ["2026-04-02", "CO work", "$300"],
           ],
         },
       ]),
@@ -282,14 +282,38 @@ describe("external import workbook parser", () => {
     );
   });
 
+  it("treats blank required amounts as warning-only while still allowing preview", () => {
+    const preview = parseWorkbookBuffer(
+      workbookBuffer([
+        {
+          name: "Draw Invoice List",
+          rows: [
+            ["Draw Date", "Vendor Name", "Invoice #", "Total"],
+            ["2026-04-02", "Apex", "INV-1", ""],
+          ],
+        },
+      ]),
+      "draw-invoice-blank-amount.xlsx",
+    );
+
+    expect(preview.tables[0]).toMatchObject({
+      sourceRole: "draw_invoice_list",
+      amountTotal: 0,
+      blockingIssues: [],
+    });
+    expect(preview.tables[0].warnings).toContain(
+      "Blank amount values present in nullable required amount columns: Total.",
+    );
+  });
+
   it("marks unparsable required dates as blocking", () => {
     const preview = parseWorkbookBuffer(
       workbookBuffer([
         {
           name: "Transfer Log",
           rows: [
-            ["Transfer Date", "From Unit", "To Unit", "Amount"],
-            ["not a date", "101", "102", 200],
+            ["Draw Date", "Description", "Deduct", "Credit", "Total"],
+            ["not a date", "Move budget", "", "", 200],
           ],
         },
       ]),
@@ -298,8 +322,29 @@ describe("external import workbook parser", () => {
 
     expect(preview.tables[0].sourceRole).toBe("transfer_log");
     expect(preview.tables[0].blockingIssues).toContain(
-      'Unparsable date values in required columns: Transfer Date has invalid value "not a date".',
+      'Unparsable date values in required columns: Draw Date has invalid value "not a date".',
     );
+  });
+
+  it("treats blank required dates as warning-only while still allowing preview", () => {
+    const preview = parseWorkbookBuffer(
+      workbookBuffer([
+        {
+          name: "Transfer Log",
+          rows: [
+            ["Draw Date", "Description", "Deduct", "Credit", "Total"],
+            ["", "Move budget", "", "", 200],
+          ],
+        },
+      ]),
+      "transfer-log-blank-date.xlsx",
+    );
+
+    expect(preview.tables[0]).toMatchObject({
+      sourceRole: "transfer_log",
+      blockingIssues: [],
+    });
+    expect(preview.tables[0].warnings).toContain("Blank date values present in nullable required date columns: Draw Date.");
   });
 
   it("marks duplicate required semantic headers as blocking", () => {

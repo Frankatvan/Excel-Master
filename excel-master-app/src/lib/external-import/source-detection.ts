@@ -50,23 +50,25 @@ const SOURCE_RULES: SourceDetectionRule[] = [
     sourceRole: "draw_invoice_list",
     targetZoneKey: "external_import.draw_invoice_list_raw",
     exactSheetNames: ["Draw Invoice List"],
-    requiredHeaders: ["Invoice No", "Vendor", "Amount"],
-    amountHeaders: ["Amount"],
+    requiredHeaders: ["Draw Date", "Vendor Name", "Invoice #", "Total"],
+    amountHeaders: ["Total"],
+    dateHeaders: ["Draw Date", "Invoice Date"],
   },
   {
     sourceRole: "transfer_log",
     targetZoneKey: "external_import.transfer_log_raw",
     exactSheetNames: ["Transfer Log"],
-    requiredHeaders: ["Transfer Date", "From Unit", "To Unit", "Amount"],
-    amountHeaders: ["Amount"],
-    dateHeaders: ["Transfer Date"],
+    requiredHeaders: ["Draw Date", "Description", "Deduct", "Credit", "Total"],
+    amountHeaders: ["Total"],
+    dateHeaders: ["Draw Date"],
   },
   {
     sourceRole: "change_order_log",
     targetZoneKey: "external_import.change_order_log_raw",
     exactSheetNames: ["Change Order Log"],
-    requiredHeaders: ["Change Order No", "Vendor", "Amount"],
-    amountHeaders: ["Amount"],
+    requiredHeaders: ["Change Order Date Submitted (Draw Date)", "Description", "Approved Change Orders"],
+    amountHeaders: ["Approved Change Orders"],
+    dateHeaders: ["Change Order Date Submitted (Draw Date)"],
   },
   {
     sourceRole: "payable",
@@ -87,8 +89,8 @@ const SOURCE_RULES: SourceDetectionRule[] = [
   {
     sourceRole: "unit_budget",
     targetZoneKey: "external_import.unit_budget_raw",
-    sheetNames: ["Unit Budget"],
-    requiredHeaders: ["Unit Code", "Cost Code"],
+    sheetNames: ["Unit Budget", "LS Fronterra"],
+    requiredHeaders: [],
     matrixAmountColumns: true,
   },
 ];
@@ -118,7 +120,15 @@ function matchesSheetName(rule: SourceDetectionRule, sheetName: string): boolean
   return (rule.sheetNames ?? []).some((candidate) => normalizeSheetName(candidate) === normalizedName);
 }
 
-function matchesByHeaders(rule: SourceDetectionRule, headersByName: Map<string, string>): boolean {
+function hasMatrixBudgetHeader(headers: string[]) {
+  return headers.some((header) => /^total\s*(?:\(|$)/i.test(String(header ?? "").trim()));
+}
+
+function matchesByHeaders(rule: SourceDetectionRule, headersByName: Map<string, string>, headers: string[]): boolean {
+  if (rule.matrixAmountColumns) {
+    return hasMatrixBudgetHeader(headers);
+  }
+
   if (rule.requiredHeaders.every((header) => findHeader(headersByName, header))) {
     return true;
   }
@@ -138,7 +148,7 @@ export function detectSourceForSheet(sheetName: string, headers: string[]): Dete
       return headers.filter((header) => normalizeHeader(header) === normalizedRequiredHeader).length > 1;
     });
     const matchesName = matchesSheetName(rule, sheetName);
-    const matchesHeaders = !rule.exactSheetNames && !rule.matrixAmountColumns && matchesByHeaders(rule, headersByName);
+    const matchesHeaders = !rule.exactSheetNames && !rule.matrixAmountColumns && matchesByHeaders(rule, headersByName, headers);
 
     duplicateRequiredHeadersByRule.set(rule.sourceRole, duplicateRequiredHeaders);
 

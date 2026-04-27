@@ -149,7 +149,9 @@ function amountColumnIndexes(headers: string[], detection: NonNullable<ReturnTyp
   if (detection.rule.matrixAmountColumns) {
     const keyHeaders = new Set(detection.rule.requiredHeaders.map(normalizeHeader));
     return headers.reduce<number[]>((indexes, header, index) => {
-      if (header && !keyHeaders.has(normalizeHeader(header))) {
+      const normalizedHeader = normalizeHeader(header);
+      const looksLikeMatrixLabelColumn = index === 0 || normalizedHeader === "unit code" || normalizedHeader === "cost code";
+      if (header && !keyHeaders.has(normalizedHeader) && !looksLikeMatrixLabelColumn) {
         indexes.push(index);
       }
 
@@ -170,6 +172,9 @@ function requiredValueIssues(
 
   indexesForHeaders(headers, detection.rule.amountHeaders ?? []).forEach((index) => {
     dataRows.forEach((row) => {
+      if (String(row[index] ?? "").trim() === "") {
+        return;
+      }
       if (!parseAmount(row[index]).valid) {
         amountIssues.push({ header: headers[index], value: row[index] });
       }
@@ -178,6 +183,9 @@ function requiredValueIssues(
 
   indexesForHeaders(headers, detection.rule.dateHeaders ?? []).forEach((index) => {
     dataRows.forEach((row) => {
+      if (String(row[index] ?? "").trim() === "") {
+        return;
+      }
       if (!isParseableDate(row[index])) {
         dateIssues.push({ header: headers[index], value: row[index] });
       }
@@ -205,6 +213,30 @@ function buildWarnings(detection: NonNullable<ReturnType<typeof detectSourceForS
   }
 
   return warnings;
+}
+
+function blankRequiredDateWarnings(
+  headers: string[],
+  dataRows: CellValue[][],
+  detection: NonNullable<ReturnType<typeof detectSourceForSheet>>,
+): string[] {
+  const blankHeaders = indexesForHeaders(headers, detection.rule.dateHeaders ?? []).flatMap((index) =>
+    dataRows.some((row) => String(row[index] ?? "").trim() === "") ? [headers[index]] : [],
+  );
+
+  return blankHeaders.length ? [`Blank date values present in nullable required date columns: ${blankHeaders.join(", ")}.`] : [];
+}
+
+function blankRequiredAmountWarnings(
+  headers: string[],
+  dataRows: CellValue[][],
+  detection: NonNullable<ReturnType<typeof detectSourceForSheet>>,
+): string[] {
+  const blankHeaders = indexesForHeaders(headers, detection.rule.amountHeaders ?? []).flatMap((index) =>
+    dataRows.some((row) => String(row[index] ?? "").trim() === "") ? [headers[index]] : [],
+  );
+
+  return blankHeaders.length ? [`Blank amount values present in nullable required amount columns: ${blankHeaders.join(", ")}.`] : [];
 }
 
 function buildBlockingIssues(
@@ -282,7 +314,11 @@ export function parseWorkbookBuffer(buffer: Buffer | ArrayBuffer | Uint8Array, f
         columnCount: headerRow.headers.length,
         amountTotal,
         targetZoneKey: detection.rule.targetZoneKey,
-        warnings: buildWarnings(detection),
+        warnings: [
+          ...buildWarnings(detection),
+          ...blankRequiredAmountWarnings(headerRow.headers, dataRows, detection),
+          ...blankRequiredDateWarnings(headerRow.headers, dataRows, detection),
+        ],
         blockingIssues: buildBlockingIssues(detection, dataRows.length, valueIssues),
         headers: headerRow.headers,
         rows: dataRows.map((row) => headerRow.headers.map((_header, index) => serializableCellValue(row[index]))),
