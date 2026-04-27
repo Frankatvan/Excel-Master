@@ -1524,6 +1524,151 @@ def _build_109_manual_input_ranges(
     return ranges
 
 
+def _matrix_cell(row: Sequence[Any], col_1: int) -> Any:
+    return row[col_1 - 1] if 0 < col_1 <= len(row) else ""
+
+
+def _find_col_in_matrix_row(row: Sequence[Any], *candidates: str) -> int | None:
+    wanted = {_normalize_header_token(item) for item in candidates}
+    for idx, value in enumerate(row, start=1):
+        if _normalize_header_token(value) in wanted:
+            return idx
+    return None
+
+
+def _find_header_row_with_columns(rows: Sequence[Sequence[Any]], *candidates: str) -> int | None:
+    for row_idx, row in enumerate(rows):
+        if all(_find_col_in_matrix_row(row, candidate) is not None for candidate in candidates):
+            return row_idx
+    return None
+
+
+def _format_mdy_no_leading_zero(value: Any) -> str:
+    dt = _normalize_date_value(value)
+    if dt is None:
+        return ""
+    return f"{dt.month}/{dt.day}/{dt.year}"
+
+
+def _build_scoping_manual_input_ranges(rows: Sequence[Sequence[Any]]) -> List[str]:
+    header_idx = _find_header_row_with_columns(rows, "Group Number")
+    if header_idx is None:
+        return []
+
+    header = rows[header_idx]
+    group_col = _find_col_in_matrix_row(header, "Group Number") or 3
+    entity_col = _find_col_in_matrix_row(header, "Welltower", "Entity") or 2
+    status_start_col = _find_col_in_matrix_row(header, "GMP") or 5
+    status_end_col = (
+        _find_col_in_matrix_row(header, "Warranty Months", "保修月数")
+        or _find_col_in_matrix_row(header, "Warranty Month")
+        or 11
+    )
+    if status_end_col < status_start_col:
+        status_start_col, status_end_col = status_end_col, status_start_col
+
+    sheet = _quote_sheet_name("Scoping")
+    entity_col_a1 = _column_number_to_a1(entity_col)
+    status_start_a1 = _column_number_to_a1(status_start_col)
+    status_end_a1 = _column_number_to_a1(status_end_col)
+    ranges: List[str] = []
+    for row_idx in range(header_idx + 1, len(rows)):
+        if not _safe_string(_matrix_cell(rows[row_idx], group_col)):
+            continue
+        row_1 = row_idx + 1
+        ranges.append(f"{sheet}!{entity_col_a1}{row_1}")
+        ranges.append(f"{sheet}!{status_start_a1}{row_1}:{status_end_a1}{row_1}")
+    return ranges
+
+
+def _build_scoping_hidden_row_numbers(rows: Sequence[Sequence[Any]]) -> List[int]:
+    header_idx = _find_header_row_with_columns(rows, "Group Number")
+    if header_idx is None:
+        return []
+
+    header = rows[header_idx]
+    group_col = _find_col_in_matrix_row(header, "Group Number") or 3
+    budget_col = _find_col_in_matrix_row(header, "Budget")
+    incurred_col = _find_col_in_matrix_row(header, "Incurred amount", "Incurred Amount")
+
+    hidden: List[int] = []
+    for row_idx in range(header_idx + 1, len(rows)):
+        row = rows[row_idx]
+        if _safe_string(_matrix_cell(row, group_col)):
+            continue
+        budget = _to_float(_matrix_cell(row, budget_col)) if budget_col is not None else None
+        incurred = _to_float(_matrix_cell(row, incurred_col)) if incurred_col is not None else None
+        if budget is None and incurred is None:
+            hidden.append(row_idx + 1)
+    return hidden
+
+
+def _group_co_date_map(rows: Sequence[Sequence[Any]]) -> Dict[str, pd.Timestamp]:
+    header_idx = _find_header_row_with_columns(rows, "Group", "C/O date")
+    if header_idx is None:
+        return {}
+
+    header = rows[header_idx]
+    group_col = _find_col_in_matrix_row(header, "Group")
+    co_date_col = _find_col_in_matrix_row(header, "C/O date")
+    if group_col is None or co_date_col is None:
+        return {}
+
+    out: Dict[str, pd.Timestamp] = {}
+    for row in rows[header_idx + 1:]:
+        group = _safe_string(_matrix_cell(row, group_col))
+        dt = _normalize_date_value(_matrix_cell(row, co_date_col))
+        if not group or dt is None:
+            continue
+        out[group] = dt if group not in out else max(out[group], dt)
+    return out
+
+
+def _build_scoping_warranty_expiry_values(
+    scoping_rows: Sequence[Sequence[Any]],
+    unit_master_rows: Sequence[Sequence[Any]],
+    unit_budget_rows: Sequence[Sequence[Any]] | None = None,
+) -> List[List[Any]]:
+    values: List[List[Any]] = [[""] for _ in scoping_rows]
+    header_idx = _find_header_row_with_columns(scoping_rows, "Group Number")
+    if header_idx is None:
+        return values
+
+    header = scoping_rows[header_idx]
+    group_col = _find_col_in_matrix_row(header, "Group Number") or 3
+    warranty_months_col = (
+        _find_col_in_matrix_row(header, "Warranty Months", "保修月数")
+        or _find_col_in_matrix_row(header, "Warranty Month")
+    )
+    values[header_idx][0] = "保修到期日"
+    if warranty_months_col is None:
+        return values
+
+    unit_master_dates = _group_co_date_map(unit_master_rows)
+    unit_budget_dates = _group_co_date_map(unit_budget_rows or [])
+    for row_idx in range(header_idx + 1, len(scoping_rows)):
+        row = scoping_rows[row_idx]
+        group = _safe_string(_matrix_cell(row, group_col))
+        months = _to_float(_matrix_cell(row, warranty_months_col))
+        if not group or months is None:
+            continue
+        co_date = unit_master_dates.get(group) or unit_budget_dates.get(group)
+        if co_date is None:
+            continue
+        expiry = co_date + pd.Timedelta(days=months * 30.25)
+        values[row_idx][0] = _format_mdy_no_leading_zero(expiry)
+    return values
+
+
+def _build_unit_master_manual_input_ranges(row_count: int) -> List[str]:
+    end_row = max(int(row_count), 3)
+    sheet = _quote_sheet_name(SHEET_UNIT_MASTER_NAME)
+    return [
+        f"{sheet}!H3:H{end_row}",
+        f"{sheet}!K3:K{end_row}",
+    ]
+
+
 def _build_109_date_array_formula(func_name: str) -> str:
     date_floor = "DATE(2021,1,1)"
     arrays = [
@@ -1800,17 +1945,16 @@ def _build_unit_budget_support_requests(
         _build_repeat_cell_request({"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8}, COLOR_FILL_LIGHT_GRAY),
         _build_repeat_cell_request({"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 10, "endColumnIndex": 11}, COLOR_FILL_LIGHT_GRAY),
         _build_number_format_request({"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 9, "endColumnIndex": 10}, NUMBER_FORMAT_YEAR_0),
-        _build_repeat_cell_request({"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 6, "endColumnIndex": 7}, COLOR_FILL_LIGHT_GRAY),
-        _build_repeat_cell_request({"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 9, "endColumnIndex": 10}, COLOR_FILL_LIGHT_GRAY),
+        _build_repeat_cell_request({"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8}, COLOR_FILL_LIGHT_GRAY),
+        _build_repeat_cell_request({"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 10, "endColumnIndex": 11}, COLOR_FILL_LIGHT_GRAY),
         _build_number_format_request({"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 8, "endColumnIndex": 9}, NUMBER_FORMAT_YEAR_0),
     ]
     for grid_range in [
         {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8},
         {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 8, "endColumnIndex": 9},
         {"sheetId": int(unit_budget_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 10, "endColumnIndex": 11},
-        {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 6, "endColumnIndex": 7},
         {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 7, "endColumnIndex": 8},
-        {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 9, "endColumnIndex": 10},
+        {"sheetId": int(unit_master_sheet_id), "startRowIndex": 2, "endRowIndex": end_row, "startColumnIndex": 10, "endColumnIndex": 11},
     ]:
         requests.append(_build_number_format_request(grid_range, NUMBER_FORMAT_DATE_ISO))
     return requests
@@ -2224,3 +2368,6 @@ def execute_109_formula_plan(
 
 def clear_local_cloud_snapshot() -> None:
     CLOUD_SNAPSHOT_FILE.unlink(missing_ok=True)
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]

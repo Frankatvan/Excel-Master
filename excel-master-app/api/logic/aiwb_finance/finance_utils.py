@@ -615,3 +615,6 @@ def _find_rows_by_item_label(
             continue
         out.setdefault(label, []).append(row_i)
     return out
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]
