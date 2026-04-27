@@ -51,6 +51,7 @@ from .finance_utils import (
     _to_float,
     _extract_tail_int,
     _extract_tail_str,
+    _extract_leading_int,
     _extract_year,
     _co_date_to_actual_settlement_date,
     _format_iso_date_or_blank,
@@ -97,6 +98,36 @@ CLOUD_SNAPSHOT_FILE = LOCAL_ROOT / "cloud_snapshot.pkl"
 RULE_ID_HIT_RATE_BASELINE_FILE = LOCAL_ROOT / "rule_id_hit_rate_baseline.json"
 FORMULA_DICTIONARY_109_FILE = Path("docs/AiWB_公式字典_109_v1.yaml")
 SANDY_COVE_DATES_FILE = Path("docs/Sandy cove.xlsx")
+DEFAULT_FORMULA_SEMANTIC_COLUMNS = {
+    "Unit Master": {
+        "unit_code": 1,
+        "budget_surplus": 12,
+        "final_date": 10,
+    },
+    "Unit Budget": {
+        "unit_code": 2,
+        "contract_price_day1": 20,
+        "general_conditions_fee": 20,
+        "contract_price_type": 15,
+        "general_conditions_type": 16,
+    },
+    "Payable": {
+        "cost_state": 1,
+        "year": 10,
+        "amount": 21,
+        "incurred_date": 20,
+        "post_date": 22,
+        "settlement_date": 29,
+    },
+    "Final Detail": {
+        "posting_date": 15,
+        "incurred_date": 19,
+    },
+    "Draw request report": {
+        "date": 18,
+        "payment_date": 26,
+    },
+}
 
 DAILY_API_QUOTA_ESTIMATE = 5000
 DEFAULT_UID_COLUMN = "AiWB_UID"
@@ -881,7 +912,6 @@ def _detect_rule_id_hit_rate_alerts(
 
 
 def _process_payable_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
-    from .finance_classification import compute_payable_classifications
     out = {k: v.copy() for k, v in sheet_map.items()}
     wsp_key = _sheet_key(out, "Payable")
     wss_key = _sheet_key(out, "Scoping")
@@ -895,7 +925,12 @@ def _process_payable_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str
         "WB Home LLC": "WBH",
         "WB Lago Mar Pod 8 Land LLC": "WLM",
     }
-    categories, classification_extra = compute_payable_classifications(out)
+    compat_classifier = sys.modules.get("finance_classification")
+    if compat_classifier is not None and hasattr(compat_classifier, "compute_payable_classifications"):
+        classifier = getattr(compat_classifier, "compute_payable_classifications")
+    else:
+        from .finance_classification import compute_payable_classifications as classifier
+    categories, classification_extra = classifier(out)
     if len(categories) == len(wsp):
         first_col = wsp.columns[0]
         wsp[first_col] = categories
@@ -918,13 +953,17 @@ def _process_payable_py(sheet_map: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str
         scope_agg[key] = (e, f, g)
 
     write_rows: List[List[Any]] = []
+    cost_name_col = _find_col_in_headers(wsp, "Cost Name", "CostName")
     for i in range(len(wsp)):
         o_text = _safe_string(_get_cell(wsp, i, 15))
         v_text = _safe_string(_get_cell(wsp, i, 22))
         am_text = _safe_string(_get_cell(wsp, i, 39))
+        cost_name_text = _safe_string(_get_cell(wsp, i, cost_name_col)) if cost_name_col else ""
 
         j_val = _extract_tail_str(v_text, 4)
         d_val = _extract_tail_int(am_text, 3)
+        if d_val is None:
+            d_val = _extract_leading_int(cost_name_text, 3)
         c_val = mapping.get(o_text, "")
 
         s_e: Any = ""
@@ -1940,6 +1979,63 @@ def _year_columns_from_109_dictionary(config: Mapping[str, Any]) -> List[int]:
     return list(range(6, 6 + len(years)))
 
 
+class FormulaSemanticResolver:
+    def __init__(self, sheet_rows: Mapping[str, Sequence[Sequence[Any]]]):
+        self._sheet_rows = sheet_rows
+
+    def column_range(self, sheet_name: str, header_label: str, start_row: int = 2) -> str:
+        rows = self._sheet_rows.get(sheet_name) or []
+        if not rows:
+            raise ValueError(f"Missing sheet rows for {sheet_name}")
+        headers = [_safe_string(value).strip() for value in rows[0]]
+        normalized_label = _normalize_header_token(header_label)
+        column_index = next(
+            (index + 1 for index, value in enumerate(headers) if _normalize_header_token(value) == normalized_label),
+            None,
+        )
+        if column_index is None:
+            raise ValueError(f"Missing header {header_label} in {sheet_name}")
+        column = _column_number_to_a1(column_index)
+        return f"{_quote_sheet_name(sheet_name)}!${column}${start_row}:${column}"
+
+
+def _formula_sheet_name(sheet_name: str) -> str:
+    return sheet_name if re.fullmatch(r"[A-Za-z0-9_]+", sheet_name) else _quote_sheet_name(sheet_name)
+
+
+def _semantic_column_range(sheet_name: str, logical_field: str, start_row: int | None = None) -> str:
+    sheet_columns = DEFAULT_FORMULA_SEMANTIC_COLUMNS.get(sheet_name, {})
+    column_index = sheet_columns.get(logical_field)
+    if not column_index:
+        raise ValueError(f"Missing semantic column mapping: {sheet_name}.{logical_field}")
+    column = _column_number_to_a1(int(column_index))
+    if start_row is None:
+        return f"{_formula_sheet_name(sheet_name)}!${column}:${column}"
+    return f"{_formula_sheet_name(sheet_name)}!${column}${start_row}:${column}"
+
+
+def _a1_cell_for_grid_write(row: int, col: int, *, absolute: bool = False) -> str:
+    column = _column_number_to_a1(col)
+    if absolute:
+        return f"${column}${row}"
+    return f"{column}{row}"
+
+
+def _a1_range_for_grid_write(
+    sheet_name: str,
+    start_row: int,
+    start_col: int,
+    end_row: int,
+    end_col: int,
+    *,
+    absolute: bool = False,
+) -> str:
+    start = _a1_cell_for_grid_write(start_row, start_col, absolute=absolute)
+    end = _a1_cell_for_grid_write(end_row, end_col, absolute=absolute)
+    prefix = f"{_quote_sheet_name(sheet_name)}!" if sheet_name else ""
+    return f"{prefix}{start}:{end}"
+
+
 def _build_109_manual_input_ranges(
     rows: Sequence[Sequence[Any]],
     years: Sequence[int],
@@ -1966,8 +2062,8 @@ def _build_109_manual_input_ranges(
         else:
             ranges.append(f"{sheet}!{start_col}{row_i}:{end_col}{row_i}")
 
-    ranges.append(f"{sheet}!C2:E2")
-    ranges.append(f"{sheet}!G2:I2")
+    ranges.append(_a1_range_for_grid_write(sheet_109_title, 2, 3, 2, 5))
+    ranges.append(_a1_range_for_grid_write(sheet_109_title, 2, 7, 2, 9))
     add_row_range("general conditions fee-audited")
     add_row_range("general conditions fee-audited", audit=True)
     add_row_range("owner-unapproved overrun")
@@ -1982,7 +2078,8 @@ def _build_109_manual_input_ranges(
 
 
 def _build_109_units_count_formula() -> str:
-    return '=IFERROR(COUNTA(FILTER(\'Unit Master\'!$A$3:$A,REGEXMATCH(\'Unit Master\'!$A$3:$A,"[0-9]"))),0)'
+    unit_code = _semantic_column_range(SHEET_UNIT_MASTER_NAME, "unit_code", start_row=3)
+    return f'=IFERROR(COUNTA(FILTER({unit_code},REGEXMATCH({unit_code},"[0-9]"))),0)'
 
 
 def _matrix_cell(row: Sequence[Any], col_1: int) -> Any:
@@ -2528,8 +2625,27 @@ def _build_project_data_lock_requests(
 
 
 def _cleanup_109_legacy_duplicate_contract_change_row(service, spreadsheet_id: str, sheet_109_title: str = SHEET_109_NAME) -> Dict[str, Any]:
-    del service, spreadsheet_id, sheet_109_title
-    return {"cleared": False}
+    cleanup_range = f"{_quote_sheet_name(sheet_109_title)}!A64:Q64"
+    values_api = service.spreadsheets().values()
+    response = values_api.get(
+        spreadsheetId=spreadsheet_id,
+        range=cleanup_range,
+        valueRenderOption="FORMULA",
+    ).execute()
+    rows = response.get("values", []) if isinstance(response, Mapping) else []
+    row = list(rows[0]) if rows else []
+
+    def cell(index: int) -> str:
+        return _safe_string(row[index] if index < len(row) else "")
+
+    is_contract_change_row = "合同变动金额" in cell(0) and "Contract Change Amount" in cell(2)
+    has_legacy_formula = "IFERROR(61+F15" in cell(5)
+    has_period_formula = "IF(AND($C$4<M$9,$C$4>L$9),$E$3" in cell(12)
+    if not (is_contract_change_row and has_legacy_formula and has_period_formula):
+        return {"cleared": False, "range": cleanup_range}
+
+    values_api.batchClear(spreadsheetId=spreadsheet_id, body={"ranges": [cleanup_range]}).execute()
+    return {"cleared": True, "range": cleanup_range}
 
 
 def _apply_109_layout_controls(
@@ -2674,14 +2790,18 @@ def initialize_project_workbook(
 
 def _build_109_date_array_formula(func_name: str) -> str:
     date_floor = "DATE(2021,1,1)"
+    def date_filter(sheet_name: str, logical_field: str) -> str:
+        column_range = _semantic_column_range(sheet_name, logical_field)
+        return f'IFERROR(FILTER({column_range},{column_range}<>""),"")'
+
     arrays = [
-        'IFERROR(FILTER(Payable!$T:$T,Payable!$T:$T<>""),"")',
-        'IFERROR(FILTER(Payable!$V:$V,Payable!$V:$V<>""),"")',
-        'IFERROR(FILTER(Payable!$AC:$AC,Payable!$AC:$AC<>""),"")',
-        'IFERROR(FILTER(\'Final Detail\'!$O:$O,\'Final Detail\'!$O:$O<>""),"")',
-        'IFERROR(FILTER(\'Final Detail\'!$S:$S,\'Final Detail\'!$S:$S<>""),"")',
-        'IFERROR(FILTER(\'Draw request report\'!$R:$R,\'Draw request report\'!$R:$R<>""),"")',
-        'IFERROR(FILTER(\'Draw request report\'!$Z:$Z,\'Draw request report\'!$Z:$Z<>""),"")',
+        date_filter("Payable", "incurred_date"),
+        date_filter("Payable", "post_date"),
+        date_filter("Payable", "settlement_date"),
+        date_filter("Final Detail", "posting_date"),
+        date_filter("Final Detail", "incurred_date"),
+        date_filter("Draw request report", "date"),
+        date_filter("Draw request report", "payment_date"),
     ]
     merged = ";".join(arrays)
     return f"=MAX({date_floor},{func_name}(TOCOL({{{merged}}},1)))"
@@ -3206,21 +3326,30 @@ def _build_109_formula_plan_from_grid(
     start_year_expr = f"Year(${anchor_col}$2)"
     add_formula(anchor_col_i, 2, _build_109_date_array_formula("MIN"), "Start date")
     add_formula(anchor_col_i, 3, _build_109_date_array_formula("MAX"), "End date")
-    add_formula(3, 5, '=IFERROR(COUNTA(FILTER(\'Unit Budget\'!$B$3:$B,REGEXMATCH(\'Unit Budget\'!$B$3:$B,"[0-9]"))),0)', "Units count")
-    add_formula(5, 3, "=SUMIFS('Unit Budget'!$T:$T,'Unit Budget'!$O:$O,1)", "Contract price (Day1)")
-    add_formula(5, 5, "=SUMIFS('Unit Budget'!$T:$T,'Unit Budget'!$P:$P,2)", "General Conditions fee")
-    add_formula(5, 12, '=IFERROR(round(MAX(F12:K12),8),"")', "POC Total")
-    add_formula(5, 13, '=IFERROR(round(SUM(F13:K13),8),"")', "Completion Rate Total")
+    unit_budget_contract_price = _semantic_column_range("Unit Budget", "contract_price_day1")
+    unit_budget_contract_type = _semantic_column_range("Unit Budget", "contract_price_type")
+    unit_budget_gc_type = _semantic_column_range("Unit Budget", "general_conditions_type")
+    poc_period_range = _a1_range_for_grid_write("", row_poc, primary_year_cols[0], row_poc, primary_year_cols[-1])  # type: ignore[arg-type]
+    cr_period_range = _a1_range_for_grid_write("", row_cr, primary_year_cols[0], row_cr, primary_year_cols[-1])  # type: ignore[arg-type]
+    add_formula(3, 5, _build_109_units_count_formula(), "Units count")
+    add_formula(5, 3, f"=SUMIFS({unit_budget_contract_price},{unit_budget_contract_type},1)", "Contract price (Day1)")
+    add_formula(5, 5, f"=SUMIFS({unit_budget_contract_price},{unit_budget_gc_type},2)", "General Conditions fee")
+    add_formula(5, 12, f'=IFERROR(round(MAX({poc_period_range}),8),"")', "POC Total")
+    add_formula(5, 13, f'=IFERROR(round(SUM({cr_period_range}),8),"")', "Completion Rate Total")
 
     for offset, col_i in enumerate(primary_year_cols):
         col = _column_number_to_a1(col_i)
         prev_col = _column_number_to_a1(primary_year_cols[offset - 1]) if offset > 0 else ""
         year_ref = f"{col}${year_row}"
-        add_formula(col_i, row_contract_amount, f'=IF({col}$10={start_year_expr},-$E$3,0)', "Contract Amount") # type: ignore
-        add_formula(col_i, row_surplus_tp, f"=SUMIFS('Unit Master'!$L:$L,'Unit Master'!$J:$J,{year_ref})", "Budget Surplus") # type: ignore
+        contract_price_anchor = _a1_cell_for_grid_write(3, 5, absolute=True)
+        initial_budget_anchor = _a1_cell_for_grid_write(3, 3, absolute=True)
+        unit_master_budget_surplus = _semantic_column_range(SHEET_UNIT_MASTER_NAME, "budget_surplus")
+        unit_master_final_date = _semantic_column_range(SHEET_UNIT_MASTER_NAME, "final_date")
+        add_formula(col_i, row_contract_amount, f'=IF({col}$10={start_year_expr},-{contract_price_anchor},0)', "Contract Amount") # type: ignore
+        add_formula(col_i, row_surplus_tp, f"=SUMIFS({unit_master_budget_surplus},{unit_master_final_date},{year_ref})", "Budget Surplus") # type: ignore
         contract_price_formula = f'=IF({col}$10<{start_year_expr},"",IF({col}$10={start_year_expr},{col}{row_contract_amount}+{col}{row_surplus_tp},IFERROR({prev_col}{row_contract_price}+{col}{row_surplus_tp},"")))'
         add_formula(col_i, row_contract_price, contract_price_formula, "Contract Change Amount") # type: ignore
-        add_formula(col_i, row_initial_budget, f"=IF({col}$10={start_year_expr},$C$3,0)", "Initial Budget") # type: ignore
+        add_formula(col_i, row_initial_budget, f"=IF({col}$10={start_year_expr},{initial_budget_anchor},0)", "Initial Budget") # type: ignore
         add_formula(col_i, row_budget, generator.get_eac_formula(col), "EAC") # type: ignore
         add_formula(col_i, row_poc, generator.get_poc_formula(col), "POC") # type: ignore
         # 核心逻辑修正：调用重构后的方法，传入 prev_col 以支持差额推算
@@ -3253,8 +3382,13 @@ def _build_109_formula_plan_from_grid(
 
     # 特殊格式化：计提保修费用手工区 (F37:K37)
     if row_accrued_warranty:
-        # 37 行 A1 范围: F{row}:K{row}
-        manual_range = f"{_quote_sheet_name(sheet_109_title)}!F{row_accrued_warranty}:K{row_accrued_warranty}"
+        manual_range = _a1_range_for_grid_write(
+            sheet_109_title,
+            row_accrued_warranty,
+            primary_year_cols[0],
+            row_accrued_warranty,
+            primary_year_cols[-1],
+        )
         # 注入到 meta 中，后续格式化逻辑会读取
         if "manual_input_ranges" not in meta: meta["manual_input_ranges"] = []
         meta["manual_input_ranges"].append(manual_range)
@@ -3264,7 +3398,8 @@ def _build_109_formula_plan_from_grid(
 
 def _ensure_109_labels(service, spreadsheet_id: str) -> int:
     """确保109表的关键行（如GC成本、保修费用等）具备正确的英文标签，以便后续公式匹配。"""
-    resp = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range="109!A1:D100").execute()
+    label_scan_range = _a1_range_for_grid_write(SHEET_109_NAME, 1, 1, 100, 4)
+    resp = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=label_scan_range).execute()
     rows = resp.get("values", [])
     if not rows:
         return 0
@@ -3280,17 +3415,17 @@ def _ensure_109_labels(service, spreadsheet_id: str) -> int:
         # 1. GC Cost -> Total GC Cost
         if "GC" in label_cn and ("GC Cost" in label_en or not label_en):
             if label_en != "Total GC Cost":
-                updates.append({"range": f"109!D{row_num}", "values": [["Total GC Cost"]]})
+                updates.append({"range": f"{_quote_sheet_name(SHEET_109_NAME)}!{_a1_cell_for_grid_write(row_num, 4)}", "values": [["Total GC Cost"]]})
 
         # 2. 计提保修费用
         if label_cn == "计提保修费用":
             if label_en != "Accrued Warranty Expenses":
-                updates.append({"range": f"109!D{row_num}", "values": [["Accrued Warranty Expenses"]]})
+                updates.append({"range": f"{_quote_sheet_name(SHEET_109_NAME)}!{_a1_cell_for_grid_write(row_num, 4)}", "values": [["Accrued Warranty Expenses"]]})
 
         # 3. 实际发生保修费用
         if label_cn == "实际发生保修费用":
             if label_en != "Actual Warranty Expenses (Reversed)":
-                updates.append({"range": f"109!D{row_num}", "values": [["Actual Warranty Expenses (Reversed)"]]})
+                updates.append({"range": f"{_quote_sheet_name(SHEET_109_NAME)}!{_a1_cell_for_grid_write(row_num, 4)}", "values": [["Actual Warranty Expenses (Reversed)"]]})
 
     if updates:
         service.spreadsheets().values().batchUpdate(

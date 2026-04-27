@@ -2,17 +2,10 @@ import type { NextApiRequest, NextApiResponse } from "next";
 
 import { getServerSession } from "next-auth/next";
 
-import {
-  appendAuditLog,
-  getProjectState,
-  writeProjectState,
-  type PersistedProjectState,
-  type ProjectState,
-} from "@/lib/project-state-sheet";
+import { getLiveSheetStatus } from "@/lib/live-sheet-status";
 import { ProjectAccessError, requireProjectCollaborator } from "@/lib/project-access";
-import { readReclassifyCooldown, writeReclassifyCooldown } from "@/lib/reclassify-rate-limit";
+import { getProject109Title } from "@/lib/project-109-sheet";
 import { resolveTrustedWorkerUrl } from "@/lib/trusted-worker-url";
-import { WORKBENCH_STAGES } from "@/lib/workbench-stage";
 import { authOptions } from "./auth/[...nextauth]";
 
 function readSpreadsheetId(body: NextApiRequest["body"]) {
@@ -27,13 +20,21 @@ function readSpreadsheetId(body: NextApiRequest["body"]) {
   return typeof spreadsheetId === "string" && spreadsheetId.trim() ? spreadsheetId.trim() : undefined;
 }
 
-function resolveWorkerSecret() {
-  return process.env.RECLASSIFY_WORKER_SECRET?.trim() || process.env.AIWB_WORKER_SECRET?.trim() || undefined;
+function resolveFormulaSyncWorkerSecret() {
+  return process.env.FORMULA_SYNC_WORKER_SECRET?.trim() || process.env.AIWB_WORKER_SECRET?.trim() || undefined;
 }
 
-function toPersistedState(state: ProjectState): PersistedProjectState {
-  const { is_owner_or_admin: _ignored, ...persisted } = state;
-  return persisted;
+async function parseWorkerBody(response: Response) {
+  const raw = await response.text();
+  if (!raw.trim()) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return { message: raw };
+  }
 }
 
 function normalizeWorkerError(status: number, body: Record<string, unknown> | null) {
@@ -53,6 +54,16 @@ function normalizeWorkerError(status: number, body: Record<string, unknown> | nu
         details: {
           active_operation: activeOperation,
         },
+      },
+    };
+  }
+
+  if (status === 409 && rawMessage.startsWith("SNAPSHOT_STALE_ERROR")) {
+    return {
+      status: 409,
+      body: {
+        error: "SNAPSHOT_STALE_ERROR",
+        message: rawMessage,
       },
     };
   }
@@ -104,23 +115,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     await requireProjectCollaborator(spreadsheetId, session.user.email);
-    const workerSecret = resolveWorkerSecret();
+    const workerSecret = resolveFormulaSyncWorkerSecret();
     if (!workerSecret) {
       return res.status(500).json({ error: "Worker secret is not configured." });
     }
 
-    const retryAt = await readReclassifyCooldown(spreadsheetId);
-    if (retryAt) {
-      const retryAtMs = new Date(retryAt).getTime();
-      if (Number.isFinite(retryAtMs) && retryAtMs > Date.now()) {
-        return res.status(429).json({
-          error: "成本重分类 1 小时内仅允许执行一次",
-          retry_at: retryAt,
-        });
-      }
-    }
-
-    const workerUrl = resolveTrustedWorkerUrl(process.env.RECLASSIFY_WORKER_URL, "/api/internal/reclassify_job");
+    const sheet109Title = await getProject109Title(spreadsheetId);
+    const workerUrl = resolveTrustedWorkerUrl(process.env.FORMULA_SYNC_WORKER_URL, "/api/formula_sync");
     if (!workerUrl) {
       return res.status(500).json({ error: "Worker URL is not configured." });
     }
@@ -130,69 +131,37 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         "Content-Type": "application/json",
         "X-AiWB-Worker-Secret": workerSecret,
       },
-      body: JSON.stringify({ spreadsheet_id: spreadsheetId }),
+      body: JSON.stringify({
+        spreadsheet_id: spreadsheetId,
+        project_id: spreadsheetId,
+        sheet_109_title: sheet109Title,
+      }),
     });
+    const workerBody = await parseWorkerBody(workerResponse);
 
     if (!workerResponse.ok) {
-      const errorBody = (await workerResponse.json().catch(() => null)) as Record<string, unknown> | null;
-      console.error("reclassify worker failed", {
-        status: workerResponse.status,
-        body: errorBody,
-        message:
-          errorBody && typeof errorBody === "object" && typeof errorBody.message === "string"
-            ? errorBody.message
-            : undefined,
-      });
-      const normalizedError = normalizeWorkerError(workerResponse.status, errorBody);
+      const normalizedError = normalizeWorkerError(workerResponse.status, workerBody);
       return res.status(normalizedError.status).json(normalizedError.body);
     }
 
-    const workerBody = (await workerResponse.json().catch(() => ({}))) as {
-      message?: unknown;
-      triggered_at?: unknown;
-      summary?: unknown;
-    };
-    const triggeredAt =
-      typeof workerBody.triggered_at === "string" && workerBody.triggered_at.trim()
-        ? workerBody.triggered_at
-        : new Date().toISOString();
-    const state = await getProjectState(spreadsheetId, session.user.email);
-    const nextState: PersistedProjectState = {
-      ...toPersistedState(state),
-      current_stage: WORKBENCH_STAGES.MANUAL_INPUT_READY,
-      manual_input_dirty: false,
-      locked: false,
-      last_reclassify_at: new Date().toISOString(),
-    };
-
-    await writeProjectState(spreadsheetId, nextState);
-    await appendAuditLog(spreadsheetId, {
-      actor_email: session.user.email,
-      action: "reclassify",
-      previous_stage: state.current_stage,
-      next_stage: WORKBENCH_STAGES.MANUAL_INPUT_READY,
-      status: "success",
-      message: "Reclassification completed.",
-    });
-    const nextRetryAt = await writeReclassifyCooldown(spreadsheetId, triggeredAt);
+    const liveStatus = await getLiveSheetStatus(spreadsheetId);
+    const message =
+      typeof workerBody.message === "string" && workerBody.message.trim()
+        ? workerBody.message
+        : "主表与保护规则已同步";
 
     return res.status(200).json({
-      ok: true,
-      mode: "worker",
-      message:
-        typeof workerBody.message === "string" && workerBody.message.trim()
-          ? workerBody.message
-          : "成本重分类已触发",
+      status: "success",
+      message,
       spreadsheet_id: spreadsheetId,
-      triggered_at: triggeredAt,
-      retry_at: nextRetryAt,
-      summary: workerBody.summary,
-      state: nextState,
+      verify: workerBody.verify ?? null,
+      live_status: liveStatus,
     });
   } catch (error) {
     if (error instanceof ProjectAccessError) {
       return res.status(error.statusCode).json({ error: error.message, code: error.code });
     }
-    return res.status(502).json({ error: "成本重分类失败" });
+    const message = error instanceof Error && error.message.trim() ? error.message : "主表同步失败";
+    return res.status(502).json({ error: message });
   }
 }

@@ -10,6 +10,7 @@ import pandas as pd
 
 
 WORKER_PATH = Path(__file__).resolve().parents[1] / "excel-master-app" / "api" / "internal" / "reclassify_job.py"
+TEST_WORKER_SECRET = "test-worker-secret"
 
 
 def load_worker_module():
@@ -18,6 +19,13 @@ def load_worker_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def authenticated_headers(content_length: int | str) -> dict[str, str]:
+    return {
+        "Content-Length": str(content_length),
+        "X-AiWB-Worker-Secret": TEST_WORKER_SECRET,
+    }
 
 
 def test_build_reclassify_updates_returns_batch_updates_for_payable_and_final_detail():
@@ -53,7 +61,8 @@ def test_build_reclassify_updates_returns_batch_updates_for_payable_and_final_de
     }
 
 
-def test_handler_returns_explicit_success_payload():
+def test_handler_returns_explicit_success_payload(monkeypatch):
+    monkeypatch.setenv("RECLASSIFY_WORKER_SECRET", TEST_WORKER_SECRET)
     worker = load_worker_module()
 
     sent = {}
@@ -63,7 +72,7 @@ def test_handler_returns_explicit_success_payload():
             sent["body"] = data.decode("utf-8")
 
     request = SimpleNamespace(
-        headers={"Content-Length": "31"},
+        headers=authenticated_headers("31"),
         rfile=SimpleNamespace(read=Mock(return_value=b'{"spreadsheet_id":"sheet-123"}')),
         wfile=DummyWriter(),
         send_response=Mock(),
@@ -85,7 +94,7 @@ def test_handler_returns_explicit_success_payload():
     )
 
     handler = worker.handler.__new__(worker.handler)
-    handler.headers = {"Content-Length": "31"}
+    handler.headers = authenticated_headers("31")
     handler.rfile = request.rfile
     handler.wfile = request.wfile
     handler.send_response = request.send_response
@@ -125,7 +134,8 @@ def test_handler_returns_explicit_success_payload():
     }
 
 
-def test_handler_fails_when_required_snapshot_manifest_is_missing():
+def test_handler_fails_when_required_snapshot_manifest_is_missing(monkeypatch):
+    monkeypatch.setenv("RECLASSIFY_WORKER_SECRET", TEST_WORKER_SECRET)
     worker = load_worker_module()
 
     sent = {}
@@ -148,7 +158,7 @@ def test_handler_fails_when_required_snapshot_manifest_is_missing():
     )
 
     handler = worker.handler.__new__(worker.handler)
-    handler.headers = {"Content-Length": "31"}
+    handler.headers = authenticated_headers("31")
     handler.rfile = SimpleNamespace(read=Mock(return_value=b'{"spreadsheet_id":"sheet-123"}'))
     handler.wfile = DummyWriter()
     handler.send_response = Mock()
@@ -170,7 +180,8 @@ def test_handler_fails_when_required_snapshot_manifest_is_missing():
     assert payload["spreadsheet_id"] == "sheet-123"
 
 
-def test_handler_returns_explicit_failure_payload_for_missing_spreadsheet_id():
+def test_handler_returns_explicit_failure_payload_for_missing_spreadsheet_id(monkeypatch):
+    monkeypatch.setenv("RECLASSIFY_WORKER_SECRET", TEST_WORKER_SECRET)
     worker = load_worker_module()
 
     sent = {}
@@ -180,7 +191,7 @@ def test_handler_returns_explicit_failure_payload_for_missing_spreadsheet_id():
             sent["body"] = data.decode("utf-8")
 
     handler = worker.handler.__new__(worker.handler)
-    handler.headers = {"Content-Length": "2"}
+    handler.headers = authenticated_headers("2")
     handler.rfile = SimpleNamespace(read=Mock(return_value=b"{}"))
     handler.wfile = DummyWriter()
     handler.send_response = Mock()
@@ -202,7 +213,8 @@ def test_handler_returns_explicit_failure_payload_for_missing_spreadsheet_id():
     }
 
 
-def test_handler_supports_validate_only_without_writing_updates():
+def test_handler_supports_validate_only_without_writing_updates(monkeypatch):
+    monkeypatch.setenv("RECLASSIFY_WORKER_SECRET", TEST_WORKER_SECRET)
     worker = load_worker_module()
 
     sent = {}
@@ -224,6 +236,7 @@ def test_handler_supports_validate_only_without_writing_updates():
 
     worker._load_worker_dependencies = Mock(return_value={"get_sheets_service": Mock(return_value=service)})
     worker.load_reclassify_sheet_map = Mock(return_value={"Payable": object(), "Final Detail": object()})
+    worker.ensure_scoping_final_gmp_before_reclassification = Mock(return_value={"inserted": True})
     worker.persist_reclassification_snapshot = Mock(return_value={"status": "skipped", "reason": "TEST"})
     worker.compute_reclassification_results = Mock(
         return_value={
@@ -233,7 +246,7 @@ def test_handler_supports_validate_only_without_writing_updates():
     )
 
     handler = worker.handler.__new__(worker.handler)
-    handler.headers = {"Content-Length": str(len(request_body))}
+    handler.headers = authenticated_headers(len(request_body))
     handler.rfile = SimpleNamespace(read=Mock(return_value=request_body))
     handler.wfile = DummyWriter()
     handler.send_response = Mock()
@@ -248,6 +261,8 @@ def test_handler_supports_validate_only_without_writing_updates():
 
     worker.handler.do_POST(handler)
 
+    worker.ensure_scoping_final_gmp_before_reclassification.assert_not_called()
+    service.spreadsheets.return_value.batchUpdate.assert_not_called()
     service.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
     assert handler.send_response.call_args.args[0] == 200
     payload = json.loads(sent["body"])
@@ -285,6 +300,60 @@ def test_handler_supports_validate_only_without_writing_updates():
             "sample_mismatches": [],
             "message": "重分类校验通过",
         },
+    }
+
+
+def test_handler_supports_explicit_final_gmp_schema_operation(monkeypatch):
+    monkeypatch.setenv("RECLASSIFY_WORKER_SECRET", TEST_WORKER_SECRET)
+    worker = load_worker_module()
+
+    sent = {}
+
+    class DummyWriter:
+        def write(self, data):
+            sent["body"] = data.decode("utf-8")
+
+    request_body = json.dumps(
+        {"spreadsheet_id": "sheet-123", "operation": "ensure_final_gmp_schema"}
+    ).encode("utf-8")
+
+    service = Mock()
+    worker._load_worker_dependencies = Mock(return_value={"get_sheets_service": Mock(return_value=service)})
+    worker.load_reclassify_sheet_map = Mock(return_value={"Payable": object(), "Final Detail": object()})
+    worker.ensure_scoping_final_gmp_before_reclassification = Mock(
+        return_value={"inserted": True, "final_gmp_col_1based": 6}
+    )
+    worker.compute_reclassification_results = Mock()
+    worker.push_reclassify_updates = Mock()
+    worker.persist_reclassification_snapshot = Mock()
+
+    handler = worker.handler.__new__(worker.handler)
+    handler.headers = authenticated_headers(len(request_body))
+    handler.rfile = SimpleNamespace(read=Mock(return_value=request_body))
+    handler.wfile = DummyWriter()
+    handler.send_response = Mock()
+    handler.send_header = Mock()
+    handler.end_headers = Mock()
+    handler.requestline = "POST /api/internal/reclassify_job HTTP/1.1"
+    handler.command = "POST"
+    handler.path = "/api/internal/reclassify_job"
+    handler.request_version = "HTTP/1.1"
+    handler.client_address = ("127.0.0.1", 0)
+    handler.server = Mock()
+
+    worker.handler.do_POST(handler)
+
+    worker.ensure_scoping_final_gmp_before_reclassification.assert_called_once()
+    worker.compute_reclassification_results.assert_not_called()
+    worker.push_reclassify_updates.assert_not_called()
+    worker.persist_reclassification_snapshot.assert_not_called()
+    assert handler.send_response.call_args.args[0] == 200
+    assert json.loads(sent["body"]) == {
+        "ok": True,
+        "message": "Final GMP schema migration completed.",
+        "operation": "ensure_final_gmp_schema",
+        "spreadsheet_id": "sheet-123",
+        "final_gmp": {"inserted": True, "final_gmp_col_1based": 6},
     }
 
 

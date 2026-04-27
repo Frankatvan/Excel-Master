@@ -17,6 +17,40 @@ constants:
     source: "Contract price (Day1)"
     dynamic: false
 
+semantic_sources:
+  unit_master:
+    unit_code: "Unit Code"
+    budget_surplus: "Budget Surplus"
+    final_date: "Final Date"
+  unit_budget:
+    unit_code: "Unit Code"
+    contract_price_day1: "Contract Price"
+    general_conditions_fee: "General Conditions Fee"
+    year: "Year"
+  payable:
+    cost_state: "Cost State"
+    incurred_date: "Incurred Date"
+    amount: "Amount"
+    post_date: "Posting Date"
+    settlement_date: "Settlement Date"
+  final_detail:
+    posting_date: "Posting Date"
+    incurred_date: "Incurred Date"
+  draw_request:
+    date: "Date"
+    payment_date: "Payment Date"
+
+formula_templates:
+  units_count:
+    target_label: "Units count"
+    formula: '=IFERROR(COUNTA(FILTER({unit_master.unit_code},REGEXMATCH({unit_master.unit_code},"[0-9]"))),0)'
+  contract_price_day1:
+    target_label: "Contract price (Day1)"
+    formula: '=SUMIFS({unit_budget.contract_price_day1},{unit_budget.year},1)'
+  payable_date_array:
+    target_label: "Payable date array"
+    formula: '=IFERROR(FILTER({payable.incurred_date},{payable.incurred_date}<>""),"")'
+
 anchors:
   initial_direct_cost:
     source: "Unit Budget!C1"

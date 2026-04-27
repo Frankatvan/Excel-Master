@@ -1259,30 +1259,72 @@ def _read_validate_only(data: Mapping[str, Any]) -> bool:
     return operation == "validate"
 
 
+def _read_operation(data: Mapping[str, Any]) -> str:
+    raw = data.get("operation")
+    if raw in (None, ""):
+        return "reclassify"
+    if not isinstance(raw, str):
+        raise ValueError("operation must be a string")
+    operation = raw.strip().lower()
+    allowed = {"reclassify", "validate", "ensure_final_gmp_schema"}
+    if operation not in allowed:
+        raise ValueError(f"unsupported operation: {operation}")
+    return operation
+
+
+def _resolve_worker_secret() -> str:
+    return (os.environ.get("RECLASSIFY_WORKER_SECRET") or os.environ.get("AIWB_WORKER_SECRET") or "").strip()
+
+
+def _authorize_worker_request(request_handler: BaseHTTPRequestHandler) -> Tuple[bool, int, str]:
+    expected_secret = _resolve_worker_secret()
+    if not expected_secret:
+        return False, 500, "Worker secret is not configured."
+    actual_secret = str(request_handler.headers.get("X-AiWB-Worker-Secret", "") or "").strip()
+    if actual_secret != expected_secret:
+        return False, 401, "Unauthorized"
+    return True, 200, ""
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         spreadsheet_id = ""
         try:
+            authorized, status_code, auth_message = _authorize_worker_request(self)
+            if not authorized:
+                return self._send_error(status_code, auth_message)
+
             data = _read_json_body(self)
             spreadsheet_id = _safe_text(data.get("spreadsheet_id"))
             if not spreadsheet_id:
                 return self._send_error(400, "spreadsheet_id is required")
-            validate_only = _read_validate_only(data)
+            operation = _read_operation(data)
+            validate_only = _read_validate_only(data) or operation == "validate"
 
             deps = _load_worker_dependencies()
             service = deps["get_sheets_service"]()
             sheet_map = load_reclassify_sheet_map(service, spreadsheet_id)
-            final_gmp_meta = ensure_scoping_final_gmp_before_reclassification(
-                service,
-                spreadsheet_id,
-                sheet_map,
-                deps=deps,
-            )
-            if final_gmp_meta.get("inserted"):
-                sheet_map = load_reclassify_sheet_map(service, spreadsheet_id)
-            results = compute_reclassification_results(sheet_map)
+
+            if operation == "ensure_final_gmp_schema":
+                final_gmp_meta = ensure_scoping_final_gmp_before_reclassification(
+                    service,
+                    spreadsheet_id,
+                    sheet_map,
+                    deps=deps,
+                )
+                return self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "message": "Final GMP schema migration completed.",
+                        "operation": "ensure_final_gmp_schema",
+                        "spreadsheet_id": spreadsheet_id,
+                        "final_gmp": final_gmp_meta,
+                    },
+                )
 
             if validate_only:
+                results = compute_reclassification_results(sheet_map)
                 validation = build_validation_payload(service, spreadsheet_id, results)
                 return self._send_json(
                     200,
@@ -1293,6 +1335,16 @@ class handler(BaseHTTPRequestHandler):
                         "validation": validation,
                     },
                 )
+
+            final_gmp_meta = ensure_scoping_final_gmp_before_reclassification(
+                service,
+                spreadsheet_id,
+                sheet_map,
+                deps=deps,
+            )
+            if final_gmp_meta.get("inserted"):
+                sheet_map = load_reclassify_sheet_map(service, spreadsheet_id)
+            results = compute_reclassification_results(sheet_map)
 
             updates, summary = build_reclassify_updates(results)
             commit_result = push_reclassify_updates(service, spreadsheet_id, updates)

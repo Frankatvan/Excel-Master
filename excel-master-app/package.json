@@ -6,8 +6,19 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
-    "test": "jest"
+    "lint": "eslint .",
+    "test": "jest",
+    "deploy:prod": "node scripts/vercel_deploy.mjs --prod",
+    "deploy:prod:fast": "node scripts/vercel_deploy.mjs --prod --skip-env-sync",
+    "deploy:prod:fast:dry": "node scripts/vercel_deploy.mjs --prod --skip-env-sync --dry-run",
+    "deploy:prod:dry": "node scripts/vercel_deploy.mjs --prod --dry-run",
+    "deploy:prod:check": "node scripts/vercel_deploy.mjs --prod --check-env-only",
+    "deploy:env:prod": "node scripts/vercel_env_sync.mjs --prod",
+    "deploy:env:prod:dry": "node scripts/vercel_env_sync.mjs --prod --dry-run",
+    "db:project-registry:check": "node scripts/apply_project_registry_migration.mjs --check-only",
+    "db:project-registry:migrate:dry": "node scripts/apply_project_registry_migration.mjs --dry-run",
+    "db:project-registry:migrate": "node scripts/apply_project_registry_migration.mjs",
+    "backfill:legacy-project-registry": "node scripts/backfill_legacy_project_registry.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.104.0",

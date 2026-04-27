@@ -446,6 +446,112 @@ describe("phase 1 workbench page", () => {
     expect(replaceMock).toHaveBeenCalledWith("/?spreadsheetId=sheet-1");
   });
 
+  it("uses Drive sharing guidance when no accessible projects exist", async () => {
+    routerState.query = {};
+    routerState.asPath = "/";
+    global.fetch = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "empty",
+          projects: [],
+        });
+      }
+
+      return jsonResponse({});
+    }) as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("当前账号暂无可访问项目。请确认该邮箱已加入项目 Google Sheet 分享名单，或创建一个新项目。"),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("lets a writable Drive collaborator submit audit confirmation", async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "manual_input_ready",
+            is_owner_or_admin: false,
+            can_write: true,
+            drive_role: "writer",
+            is_drive_owner: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      if (url.startsWith("/api/projects/action")) {
+        return jsonResponse({ ok: true });
+      }
+      return jsonResponse({});
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "提交审计确认" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "提交审计确认" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            String(input).startsWith("/api/projects/action") &&
+            init?.method === "POST" &&
+            init.body === JSON.stringify({ spreadsheet_id: "sheet-123", action: "approve_109" }),
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("hides workflow write actions for readonly Drive collaborators", async () => {
+    global.fetch = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "manual_input_ready",
+            is_owner_or_admin: true,
+            can_write: false,
+            drive_role: "reader",
+            is_drive_owner: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      return jsonResponse({});
+    }) as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "同步数据" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "验证录入数据" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "成本重分类" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "提交审计确认" })).toBeNull();
+  });
+
   it("requires a three-digit project serial before allowing project creation", async () => {
     routerState.query = {};
     routerState.asPath = "/";
@@ -469,8 +575,9 @@ describe("phase 1 workbench page", () => {
 
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "添加新项目" })).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "添加新项目" }));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "添加新项目" }).length).toBeGreaterThan(0));
+    const addButtons = screen.getAllByRole("button", { name: "添加新项目" });
+    fireEvent.click(addButtons[addButtons.length - 1]);
 
     fireEvent.change(screen.getByLabelText("Project Short Name"), { target: { value: "Project Atlas" } });
     fireEvent.change(screen.getByLabelText("Project Owner"), { target: { value: "Taylor Chen" } });
@@ -606,7 +713,7 @@ describe("phase 1 workbench page", () => {
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
     await waitFor(() => expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy());
-    expect(screen.getByRole("button", { name: "同步数据" })).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole("button", { name: "同步数据" })).toBeTruthy());
     await waitFor(() => expect(screen.getByRole("button", { name: "验证录入数据" })).toBeTruthy());
     expect(screen.getByRole("button", { name: "成本重分类" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "提交审计确认" })).toBeTruthy();
@@ -1214,7 +1321,7 @@ describe("phase 1 workbench page", () => {
     expect(logButton.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("shows unlock action only for owner/admin in locked state", async () => {
+  it("does not show unlock action for non-owner locked state", async () => {
     global.fetch = jest.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith("/api/projects/list")) {
@@ -1229,6 +1336,9 @@ describe("phase 1 workbench page", () => {
             current_stage: "locked_109_approved",
             locked: true,
             is_owner_or_admin: false,
+            can_write: true,
+            drive_role: "writer",
+            is_drive_owner: false,
           }),
         );
       }
@@ -1240,12 +1350,45 @@ describe("phase 1 workbench page", () => {
 
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "同步数据" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy());
     expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "同步数据" })).toBeNull();
     expect(screen.queryByRole("button", { name: "验证录入数据" })).toBeNull();
     expect(screen.queryByRole("button", { name: "成本重分类" })).toBeNull();
     expect(screen.queryByRole("button", { name: "提交审计确认" })).toBeNull();
     expect(screen.queryByRole("button", { name: "解除锁定数据" })).toBeNull();
+  });
+
+  it("shows unlock action for Drive owner locked state", async () => {
+    global.fetch = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "locked_109_approved",
+            locked: true,
+            is_owner_or_admin: false,
+            can_write: true,
+            drive_role: "owner",
+            is_drive_owner: true,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      return jsonResponse({});
+    }) as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "解除锁定数据" })).toBeTruthy());
   });
 
   it("fails closed when project state is still loading", async () => {
@@ -1270,8 +1413,9 @@ describe("phase 1 workbench page", () => {
 
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "同步数据" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy());
     expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "同步数据" })).toBeNull();
     expect(screen.queryByRole("button", { name: "验证录入数据" })).toBeNull();
     expect(screen.queryByRole("button", { name: "成本重分类" })).toBeNull();
     expect(screen.queryByRole("button", { name: "提交审计确认" })).toBeNull();
@@ -1298,17 +1442,19 @@ describe("phase 1 workbench page", () => {
 
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "同步数据" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("link", { name: "当前项目 Google Sheet" })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "同步数据" })).toBeNull();
     expect(screen.queryByRole("button", { name: "验证录入数据" })).toBeNull();
     expect(screen.queryByRole("button", { name: "成本重分类" })).toBeNull();
     expect(screen.queryByRole("button", { name: "提交审计确认" })).toBeNull();
     expect(screen.queryByRole("button", { name: "解除锁定数据" })).toBeNull();
   });
 
-  it("runs audit sync inline before refreshing state and dashboard when clicking 同步数据", async () => {
+  it("starts audit sync and surfaces stale polling status when clicking 同步数据", async () => {
     let stateCalls = 0;
     let dashboardCalls = 0;
     let auditSyncCalls = 0;
+    let auditSyncStatusCalls = 0;
     let auditSyncBody: unknown = null;
 
     global.fetch = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1327,13 +1473,32 @@ describe("phase 1 workbench page", () => {
         dashboardCalls += 1;
         return jsonResponse(baseDashboardPayload());
       }
+      if (url.startsWith("/api/audit_sync_status")) {
+        auditSyncStatusCalls += 1;
+        return jsonResponse({
+          status: "stale",
+          run: {
+            id: "run-123",
+            sync_run_id: "run-123",
+            status: "stale",
+            started_at: "2026-04-27T12:00:00.000Z",
+          },
+          latest_run: {
+            sync_run_id: "run-123",
+            status: "stale",
+            started_at: "2026-04-27T12:00:00.000Z",
+          },
+        });
+      }
       if (url.startsWith("/api/audit_sync")) {
         auditSyncCalls += 1;
         auditSyncBody = init?.body ? JSON.parse(String(init.body)) : null;
         return jsonResponse({
-          status: "success",
+          status: "accepted",
+          mode: "async",
           spreadsheet_id: "sheet-123",
-          last_synced_at: "2026-04-27T12:00:00.000Z",
+          sync_run_id: "run-123",
+          message: "同步已开始，后台完成后会刷新快照",
         });
       }
       return jsonResponse({});
@@ -1342,13 +1507,15 @@ describe("phase 1 workbench page", () => {
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "同步数据" })).toBeTruthy());
+    expect(screen.getByText("同步会先检查工作表结构，再校验并刷新审计快照。")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "同步数据" }));
 
     await waitFor(() => expect(stateCalls).toBeGreaterThanOrEqual(2));
     await waitFor(() => expect(dashboardCalls).toBeGreaterThanOrEqual(2));
     expect(auditSyncCalls).toBe(1);
+    expect(auditSyncStatusCalls).toBeGreaterThanOrEqual(1);
     expect(auditSyncBody).toEqual({ spreadsheet_id: "sheet-123" });
-    expect(screen.getByText(/同步完成/)).toBeTruthy();
+    expect(await screen.findByText("同步任务可能已超时，请稍后重试或联系管理员清理运行锁。")).toBeTruthy();
   });
 
   it("drops stale responses from previous spreadsheetId", async () => {

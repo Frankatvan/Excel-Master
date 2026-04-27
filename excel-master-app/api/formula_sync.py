@@ -49,6 +49,38 @@ def _merge_writeback_metrics(
         return
 
 
+def _is_missing_jobs_table_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "PGRST205" in message
+        or "Could not find the table" in message
+        or "relation \"jobs\" does not exist" in message
+        or "relation 'jobs' does not exist" in message
+    )
+
+
+def _safe_job_insert(supabase: Client, payload: dict):
+    try:
+        return supabase.table("jobs").insert(payload).execute()
+    except Exception as exc:
+        if _is_missing_jobs_table_error(exc):
+            print("[formula_sync] jobs table missing; continuing without job persistence")
+            return None
+        raise
+
+
+def _safe_job_update(supabase: Client, job_id: str | None, payload: dict) -> None:
+    if not supabase or not job_id:
+        return
+    try:
+        supabase.table("jobs").update(dict(payload)).eq("id", job_id).execute()
+    except Exception as exc:
+        if _is_missing_jobs_table_error(exc):
+            print("[formula_sync] jobs table missing; continuing without job persistence")
+            return
+        raise
+
+
 def _read_rpc_row(response):
     data = getattr(response, "data", None)
     if isinstance(data, list) and data and isinstance(data[0], dict):
@@ -97,8 +129,27 @@ def _release_project_run_lock(supabase: Client, project_id: str, lock_token: str
         return
 
 
+def _resolve_worker_secret() -> str:
+    return (os.environ.get("FORMULA_SYNC_WORKER_SECRET") or os.environ.get("AIWB_WORKER_SECRET") or "").strip()
+
+
+def _authorize_worker_request(request_handler: BaseHTTPRequestHandler):
+    expected_secret = _resolve_worker_secret()
+    if not expected_secret:
+        return False, 500, "Worker secret is not configured."
+    actual_secret = str(request_handler.headers.get("X-AiWB-Worker-Secret", "") or "").strip()
+    if actual_secret != expected_secret:
+        return False, 401, "Unauthorized"
+    return True, 200, ""
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        authorized, status_code, auth_message = _authorize_worker_request(self)
+        if not authorized:
+            self._send_error(status_code, auth_message)
+            return
+
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
         
@@ -145,8 +196,9 @@ class handler(BaseHTTPRequestHandler):
                 "status": "running",
                 "result_meta": {"spreadsheet_id": spreadsheet_id, "sheet_109_title": sheet_109_title or ""}
             }
-            job_res = supabase.table("jobs").insert(job_data).execute()
-            job_id = job_res.data[0]["id"]
+            job_res = _safe_job_insert(supabase, job_data)
+            if job_res and getattr(job_res, "data", None):
+                job_id = job_res.data[0]["id"]
 
             # 1. Get Sheets Service
             service = get_sheets_service()
@@ -213,7 +265,7 @@ class handler(BaseHTTPRequestHandler):
                 "writeback_audit": writeback_audit,
                 "sync_details": sync_res,
             }
-            supabase.table("jobs").update({"status": "completed", "result_meta": final_meta}).eq("id", job_id).execute()
+            _safe_job_update(supabase, job_id, {"status": "completed", "result_meta": final_meta})
 
             self._send_json(
                 200,
@@ -229,16 +281,15 @@ class handler(BaseHTTPRequestHandler):
             )
 
         except SnapshotStaleError as e:
-            if job_id:
-                supabase.table("jobs").update({
-                    "status": "failed",
-                    "result_meta": {
-                        "error_code": "SNAPSHOT_STALE_ERROR",
-                        "error": str(e),
-                        "spreadsheet_id": spreadsheet_id,
-                        "snapshot_id": data.get("snapshot_id"),
-                    }
-                }).eq("id", job_id).execute()
+            _safe_job_update(supabase, job_id, {
+                "status": "failed",
+                "result_meta": {
+                    "error_code": "SNAPSHOT_STALE_ERROR",
+                    "error": str(e),
+                    "spreadsheet_id": spreadsheet_id,
+                    "snapshot_id": data.get("snapshot_id"),
+                }
+            })
             self._send_error(409, f"SNAPSHOT_STALE_ERROR: {e}")
         except Exception as e:
             import traceback
@@ -246,14 +297,13 @@ class handler(BaseHTTPRequestHandler):
             if str(e).startswith("PROJECT_RUN_LOCKED:"):
                 self._send_error(409, str(e))
             else:
-                if job_id:
-                    supabase.table("jobs").update({
-                        "status": "failed",
-                        "result_meta": {
-                            "error": str(e),
-                            "traceback": error_trace
-                        }
-                    }).eq("id", job_id).execute()
+                _safe_job_update(supabase, job_id, {
+                    "status": "failed",
+                    "result_meta": {
+                        "error": str(e),
+                        "traceback": error_trace
+                    }
+                })
                 self._send_error(500, f"Processing failed: {e}")
         finally:
             if lock_token:

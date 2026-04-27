@@ -319,6 +319,9 @@ interface ProjectStateSnapshot {
   external_data_dirty: boolean;
   manual_input_dirty: boolean;
   locked: boolean;
+  can_write?: boolean;
+  drive_role?: string | null;
+  is_drive_owner?: boolean;
   is_owner_or_admin?: boolean;
   last_sync_at?: string;
   owner_email?: string;
@@ -355,10 +358,12 @@ interface AuditSnapshotHistoryItem {
 }
 
 interface AuditSyncRunStatusPayload {
+  status?: "queued" | "running" | "succeeded" | "failed" | "partial" | "unknown" | "stale";
   latest_run?: {
     sync_run_id?: string;
-    status?: "queued" | "running" | "succeeded" | "failed" | "partial" | "unknown";
+    status?: "queued" | "running" | "succeeded" | "failed" | "partial" | "unknown" | "stale";
     created_at?: string;
+    started_at?: string;
     finished_at?: string;
     error_message?: string;
   } | null;
@@ -840,6 +845,15 @@ function parseProjectStatePayload(payload: unknown) {
           external_data_dirty: stateCandidate.external_data_dirty,
           manual_input_dirty: stateCandidate.manual_input_dirty,
           locked: stateCandidate.locked,
+          can_write: typeof stateCandidate.can_write === "boolean" ? stateCandidate.can_write : undefined,
+          drive_role:
+            typeof stateCandidate.drive_role === "string" || stateCandidate.drive_role === null
+              ? stateCandidate.drive_role
+              : undefined,
+          is_drive_owner:
+            typeof stateCandidate.is_drive_owner === "boolean"
+              ? stateCandidate.is_drive_owner
+              : undefined,
           is_owner_or_admin:
             typeof stateCandidate.is_owner_or_admin === "boolean"
               ? stateCandidate.is_owner_or_admin
@@ -1041,18 +1055,29 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       ? (activeProjectState.current_stage as (typeof WORKBENCH_STAGES)[keyof typeof WORKBENCH_STAGES])
       : WORKBENCH_STAGES.PROJECT_CREATED;
   const hasWritableProjectState = Boolean(activeProjectState) && projectStateLoadStatus === "ready";
+  const canWriteProject = activeProjectState?.can_write ?? true;
+  const isDriveOwner = activeProjectState?.is_drive_owner ?? activeProjectState?.is_owner_or_admin ?? false;
   const availableActions = getAvailableProjectActions({
     current_stage: normalizedStage,
     locked: Boolean(activeProjectState?.locked),
-    isOwnerOrAdmin: Boolean(activeProjectState?.is_owner_or_admin),
+    isOwnerOrAdmin: Boolean(isDriveOwner),
   });
-  const visibleActions: ProjectAction[] = hasWritableProjectState ? availableActions : ["open_sheet", "sync_data"];
+  const visibleActions: ProjectAction[] = hasWritableProjectState
+    ? availableActions.filter((action) =>
+        action === "sync_data" ||
+        action === "validate_input" ||
+        action === "reclassify" ||
+        action === "approve_109"
+          ? canWriteProject
+          : true,
+      )
+    : ["open_sheet"];
   const showUnlockAction =
     hasWritableProjectState &&
     canShowUnlockData({
       current_stage: normalizedStage,
       locked: Boolean(activeProjectState?.locked),
-      isOwnerOrAdmin: Boolean(activeProjectState?.is_owner_or_admin),
+      isOwnerOrAdmin: Boolean(isDriveOwner),
     });
   const sheetUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(currentId)}/edit`;
   const externalRecon = projectData?.audit_tabs?.external_recon;
@@ -1783,6 +1808,11 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       return false;
     }
 
+    if (statusPayload?.status === "stale" || latestRun.status === "stale") {
+      setProjectActionStatus("同步任务可能已超时，请稍后重试或联系管理员清理运行锁。");
+      return true;
+    }
+
     if (latestRun.status === "succeeded") {
       setProjectActionStatus(
         latestRun.finished_at ? `后台同步完成：${formatTimestamp(latestRun.finished_at)}` : "后台同步完成",
@@ -2422,7 +2452,9 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
           {isProjectEmptyView && !projectListLoading && (
             <section className={panelClassName("mt-4 p-8 text-center")}>
               <h1 className="text-2xl font-bold tracking-tight">项目汇总</h1>
-              <p className="mt-3 text-sm text-[#5B7A88]">当前账号暂无项目，先创建一个项目开始。</p>
+              <p className="mt-3 text-sm text-[#5B7A88]">
+                当前账号暂无可访问项目。请确认该邮箱已加入项目 Google Sheet 分享名单，或创建一个新项目。
+              </p>
               <button
                 type="button"
                 onClick={() => setProjectFormOpen(true)}
@@ -2731,7 +2763,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
                     <div className="rounded-2xl bg-slate-50 p-4">
                       <div className="text-sm text-slate-500">数据刷新</div>
                       <div className="mt-2 text-sm font-medium text-slate-700">
-                        {syncing ? "刷新中" : "同步数据仅刷新前端展示"}
+                        {syncing ? "刷新中" : "同步会先检查工作表结构，再校验并刷新审计快照。"}
                       </div>
                     </div>
                     <div className="rounded-2xl bg-slate-50 p-4">
