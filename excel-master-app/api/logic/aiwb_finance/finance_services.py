@@ -125,15 +125,15 @@ RULE_REGISTRY: Dict[str, Dict[str, Any]] = {
     # 第四类：跨表修正 (Restore / R300s)
     "R301": {
         "category": "RACC",
-        "reason_zh": "Restore: 结算前后配对修正（Payable 端）",
-        "reason_en": "Restore: Match correction for Payable side",
+        "reason_zh": "Restore: 结算前后窗口修正（Payable 端，独立判定）",
+        "reason_en": "Restore: Settlement-window correction for Payable side (standalone)",
         "semantics": "restore_payable_racc",
         "sheet_scope": ("Payable",),
     },
     "R302": {
         "category": "ACC",
-        "reason_zh": "Restore: 结算前后配对修正（Final Detail 端）",
-        "reason_en": "Restore: Match correction for Final Detail side",
+        "reason_zh": "Restore: 结算前后窗口修正（Final Detail 端，独立判定）",
+        "reason_en": "Restore: Settlement-window correction for Final Detail side (standalone)",
         "semantics": "restore_final_detail_acc",
         "sheet_scope": ("Final Detail",),
     },
@@ -146,26 +146,77 @@ class ClassificationService:
             setattr(self, f"_{key}" if not key.startswith("_") else key, func)
 
         self.wsp = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Payable")], 43)
-        self.wss = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Scoping")], 10)
+        self.wss = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Scoping")], 11)
         self.wsf = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Final Detail")], 30)
         self.wsb = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Unit Budget")], 16)
         self.wsm = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Unit Master")], 13)
 
         self.scoping_status_map = self._build_scoping_status_map(self.wss)
-        self.warranty_expiry_date = self._calculate_warranty_expiry_date(self.wsm)
+        self.scoping_warranty_months_map = self._build_scoping_warranty_months_map(self.wss)
+        self.group_warranty_expiry_map = self._build_group_warranty_expiry_map(
+            self.wsb,
+            self.wsm,
+            self.scoping_warranty_months_map,
+        )
+        self.warranty_expiry_date = max(self.group_warranty_expiry_map.values()) if self.group_warranty_expiry_map else None
         self.unit_schedule_map = self._build_unit_budget_schedule_map(self.wsb, self._load_default_unit_budget_schedule_overrides())
         self.final_detail_index = self._build_final_detail_classification_index(self.wsf, self.scoping_status_map, self.unit_schedule_map)
 
-    def _calculate_warranty_expiry_date(self, wsm: pd.DataFrame) -> pd.Timestamp | None:
-        """从 Unit Master H 列（C/O Date）提取最大日期作为保修期基准。"""
-        # H 列索引为 7 (1-based 为 8)
-        co_dates = self._column_values_1based(wsm, 8)
-        valid_dates = []
-        for d in co_dates:
-            dt = self._normalize_date_value(d)
-            if dt is not None:
-                valid_dates.append(dt)
-        return max(valid_dates) if valid_dates else None
+    def _build_scoping_warranty_months_map(self, wss: pd.DataFrame) -> Dict[int, float]:
+        group_col = self._find_col_in_row(wss, 0, "Group Number") or 2
+        warranty_col = (
+            self._find_col_in_row(wss, 0, "Warranty Months")
+            or self._find_col_in_row(wss, 0, "保修月数")
+            or 10
+        )
+        out: Dict[int, float] = {}
+        for r in range(len(wss)):
+            code = self._to_float(self._get_cell(wss, r, group_col))
+            months = self._to_float(self._get_cell(wss, r, warranty_col))
+            if code is None or months is None:
+                continue
+            out[int(code)] = float(months)
+        return out
+
+    def _build_group_warranty_expiry_map(
+        self,
+        wsb: pd.DataFrame,
+        wsm: pd.DataFrame,
+        warranty_months_map: Mapping[int, float],
+    ) -> Dict[int, pd.Timestamp]:
+        latest_co_date_by_group: Dict[int, pd.Timestamp] = {}
+
+        def collect_latest(df: pd.DataFrame, group_default: int, co_default: int) -> None:
+            group_col = (
+                self._find_col_in_headers(df, "Group")
+                or self._find_col_in_row(df, 0, "Group")
+                or group_default
+            )
+            co_col = (
+                self._find_col_in_headers(df, "C/O date")
+                or self._find_col_in_row(df, 0, "C/O date")
+                or co_default
+            )
+            for row_idx in range(len(df)):
+                group_number = self._to_float(self._get_cell(df, row_idx, group_col))
+                co_date = self._normalize_date_value(self._get_cell(df, row_idx, co_col))
+                if group_number is None or co_date is None:
+                    continue
+                group_key = int(group_number)
+                existing = latest_co_date_by_group.get(group_key)
+                if existing is None or co_date > existing:
+                    latest_co_date_by_group[group_key] = co_date
+
+        collect_latest(wsm, 13, 8)
+        collect_latest(wsb, 13, 8)
+
+        out: Dict[int, pd.Timestamp] = {}
+        for group_key, latest_co_date in latest_co_date_by_group.items():
+            warranty_months = warranty_months_map.get(group_key)
+            if warranty_months is None:
+                continue
+            out[group_key] = latest_co_date + pd.to_timedelta(float(warranty_months) * 30.25, unit="D")
+        return out
 
     def compute(self) -> Dict[str, Any]:
         payable_decisions_initial, payable_extra_initial = self._compute_payable_classifications_initial(
@@ -174,7 +225,7 @@ class ClassificationService:
         final_detail_decisions_initial, final_detail_extra_initial = self._compute_final_detail_classifications_initial(
             self.wsf, self.scoping_status_map, self.unit_schedule_map, self.final_detail_index
         )
-        payable_decisions, final_detail_decisions, restore_hit_count, restore_samples = self._apply_exp_restore_overrides(
+        payable_decisions, final_detail_decisions, restore_extra = self._apply_exp_restore_overrides(
             self.wsp,
             self.wsf,
             payable_decisions_initial,
@@ -184,10 +235,6 @@ class ClassificationService:
         )
         payable_categories = self._build_decision_categories(payable_decisions)
         final_detail_categories = self._build_decision_categories(final_detail_decisions)
-        restore_extra = {
-            "restore_hit_count": restore_hit_count,
-            "restore_samples": restore_samples,
-        }
         payable_extra = self._merge_restore_extra(payable_extra_initial, restore_extra)
         payable_extra["classification_counts"] = self._build_classification_counts(payable_categories)
         payable_extra["decisions"] = list(payable_decisions)
@@ -311,12 +358,19 @@ class ClassificationService:
         return "Direct", "R108"
 
     def _classify_payable_record(self, unit_code, vendor, amount, cost_code, incurred_date, statuses, actual_settlement_date, tbd_acceptance_date, payable_racc_keys):
+        group_number = self._extract_tail_int(cost_code, 3)
+        group_warranty_expiry = (
+            self.group_warranty_expiry_map.get(int(group_number))
+            if group_number is not None
+            else None
+        )
         evidence = {
             "unit_code": self._safe_string(unit_code),
             "vendor": self._safe_string(vendor),
             "cost_code": self._safe_string(cost_code),
             "incurred_date": self._iso_date_text(incurred_date),
             "actual_settlement_date": self._iso_date_text(actual_settlement_date),
+            "group_number": str(group_number) if group_number is not None else "",
         }
 
         # P0: 全时段文本最高优先级 - General Condition 判定
@@ -327,16 +381,11 @@ class ClassificationService:
         incurred_dt = self._normalize_date_value(incurred_date)
         tbd_dt = self._normalize_date_value(tbd_acceptance_date)
 
-        # 核心修正：
-        # 1. 满足实际结算日期
-        # 2. 或者年份硬边界：2026年及以后的记录强制视为“结算后”
+        # 仅当记录日期实际跨过结算线时，才进入结算后逻辑。
         is_after_settlement = False
         if incurred_dt is not None:
             if actual_dt is not None and incurred_dt >= actual_dt:
                 is_after_settlement = True
-            elif incurred_dt.year >= 2026:
-                is_after_settlement = True
-                evidence["is_after_settlement_by_year_boundary"] = True
 
         if not is_after_settlement:
             category, rule_id = self._classify_before_actual_settlement(unit_code, vendor, statuses)
@@ -354,14 +403,20 @@ class ClassificationService:
             return self._decision("R203", evidence=evidence)
 
         # 3. R204: RACC2 (发生日 <= 保修到期日 且 符合 ROE 特征)
-        if incurred_dt and self.warranty_expiry_date and incurred_dt <= self.warranty_expiry_date:
+        if incurred_dt and group_warranty_expiry is not None and incurred_dt <= group_warranty_expiry:
             if 1 in statuses or 2 in statuses:
-                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(self.warranty_expiry_date)})
+                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(group_warranty_expiry)})
 
         # 4. R205: EXP 兜底
         return self._decision("R205", evidence=evidence)
 
     def _classify_final_detail_record(self, unit_code, vendor, amount, cost_code, activity_no, incurred_date, final_date, statuses, actual_settlement_date, tbd_acceptance_date, paired_racc_keys, record_type=None):
+        group_number = self._extract_tail_int(cost_code, 3)
+        group_warranty_expiry = (
+            self.group_warranty_expiry_map.get(int(group_number))
+            if group_number is not None
+            else None
+        )
         evidence = {
             "unit_code": self._safe_string(unit_code),
             "vendor": self._safe_string(vendor),
@@ -370,6 +425,7 @@ class ClassificationService:
             "incurred_date": self._iso_date_text(incurred_date),
             "final_date": self._iso_date_text(final_date),
             "actual_settlement_date": self._iso_date_text(actual_settlement_date),
+            "group_number": str(group_number) if group_number is not None else "",
         }
 
         # R000: 前置排除
@@ -384,17 +440,13 @@ class ClassificationService:
         incurred_dt = self._normalize_date_value(incurred_date)
         final_dt = self._normalize_date_value(final_date)
         tbd_dt = self._normalize_date_value(tbd_acceptance_date)
-        event_dt = incurred_dt or final_dt
+        event_dates = [dt for dt in (incurred_dt, final_dt) if dt is not None]
+        event_dt = max(event_dates) if event_dates else None
 
-        # 核心修正：
-        # 只要 Final Date 或 Incurred Date 任何一个跨过了结算线（或进入2026年硬边界），就进入结算后逻辑
+        # 只要 Final Date 或 Incurred Date 任何一个实际跨过结算线，才进入结算后逻辑。
         is_after_settlement = False
-        if event_dt is not None:
-            if actual_dt is not None and event_dt >= actual_dt:
-                is_after_settlement = True
-            elif event_dt.year >= 2026:
-                is_after_settlement = True
-                evidence["is_after_settlement_by_year_boundary"] = True
+        if actual_dt is not None:
+            is_after_settlement = any(dt >= actual_dt for dt in event_dates)
 
         if not is_after_settlement:
             category, rule_id = self._classify_before_actual_settlement(unit_code, vendor, statuses)
@@ -415,9 +467,9 @@ class ClassificationService:
             return self._decision("R203", evidence=evidence)
 
         # 4. R204: RACC2 (发生日 <= 保修到期日 且 符合 ROE 特征)
-        if event_dt and self.warranty_expiry_date and event_dt <= self.warranty_expiry_date:
+        if event_dt and group_warranty_expiry is not None and event_dt <= group_warranty_expiry:
             if 1 in statuses or 2 in statuses:
-                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(self.warranty_expiry_date)})
+                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(group_warranty_expiry)})
 
         # 5. R205: EXP 兜底
         return self._decision("R205", evidence=evidence)
@@ -665,7 +717,7 @@ class ClassificationService:
             "paired_racc_key_count": int(final_detail_index.get("paired_racc_key_count", 0)),
         }
 
-    def _apply_exp_restore_overrides(self, wsp: pd.DataFrame, wsf: pd.DataFrame, payable_decisions: Sequence[ClassificationDecision], final_detail_decisions: Sequence[ClassificationDecision], scoping_status_map: Mapping[int, set[int]], unit_schedule_map: Mapping[str, Mapping[str, pd.Timestamp | None]]) -> Tuple[List[ClassificationDecision], List[ClassificationDecision], int, List[Dict[str, Any]]]:
+    def _apply_exp_restore_overrides(self, wsp: pd.DataFrame, wsf: pd.DataFrame, payable_decisions: Sequence[ClassificationDecision], final_detail_decisions: Sequence[ClassificationDecision], scoping_status_map: Mapping[int, set[int]], unit_schedule_map: Mapping[str, Mapping[str, pd.Timestamp | None]]) -> Tuple[List[ClassificationDecision], List[ClassificationDecision], Dict[str, Any]]:
         adjusted_payable = list(payable_decisions)
         adjusted_final_detail = list(final_detail_decisions)
         payable_layout = self._payable_layout(wsp)
@@ -763,34 +815,138 @@ class ClassificationService:
 
         restore_hit_count = 0
         restore_samples: List[Dict[str, Any]] = []
+        payable_restore_hit_count = 0
+        final_detail_restore_hit_count = 0
+        payable_restore_samples: List[Dict[str, Any]] = []
+        final_detail_restore_samples: List[Dict[str, Any]] = []
+        payable_missing_final_detail_count = 0
+        payable_missing_final_detail_samples: List[Dict[str, Any]] = []
+        final_detail_missing_payable_count = 0
+        final_detail_missing_payable_samples: List[Dict[str, Any]] = []
+        matched_keys: set[Tuple[str, float, str, str]] = set()
 
         for key, payable_matches in payable_candidates.items():
-            final_matches = final_candidates.get(key, [])
-            if len(payable_matches) != 1 or len(final_matches) != 1:
+            if len(payable_matches) != 1:
                 continue
             payable_item = payable_matches[0]
-            final_item = final_matches[0]
-            if payable_item["unit_code"] != final_item["unit_code"]:
-                continue
-            actual_dt = self._normalize_date_value(final_item.get("actual_settlement_date"))
+            final_matches = final_candidates.get(key, [])
+            matched_final_item = None
+            if len(final_matches) == 1 and final_matches[0]["unit_code"] == payable_item["unit_code"]:
+                matched_final_item = final_matches[0]
+                matched_keys.add(key)
+
             payable_incurred_dt = self._normalize_date_value(payable_item.get("payable_incurred_date"))
-            final_dt = self._normalize_date_value(final_item.get("final_date"))
-            if actual_dt is None or payable_incurred_dt is None or final_dt is None:
-                continue
-            if not (actual_dt < final_dt and payable_incurred_dt <= final_dt):
-                continue
             restore_evidence = {
-                "unit_code": final_item["unit_code"] or payable_item["unit_code"],
+                "unit_code": payable_item["unit_code"],
                 "vendor": payable_item["vendor"],
                 "amount": payable_item["amount"],
                 "cost_code": payable_item["cost_code"],
                 "payable_key": list(key),
-                "payable_incurred_date": payable_incurred_dt.strftime("%Y-%m-%d"),
-                "final_detail_final_date": final_dt.strftime("%Y-%m-%d"),
-                "actual_settlement_date": actual_dt.strftime("%Y-%m-%d"),
+                "payable_incurred_date": payable_incurred_dt.strftime("%Y-%m-%d") if payable_incurred_dt is not None else "",
+                "restore_match_status": "matched_to_final_detail" if matched_final_item else "payable_only",
             }
+            if matched_final_item is not None:
+                actual_dt = self._normalize_date_value(matched_final_item.get("actual_settlement_date"))
+                final_dt = self._normalize_date_value(matched_final_item.get("final_date"))
+                restore_evidence["final_detail_row"] = matched_final_item["index"] + 2
+                restore_evidence["final_detail_final_date"] = final_dt.strftime("%Y-%m-%d") if final_dt is not None else ""
+                restore_evidence["actual_settlement_date"] = actual_dt.strftime("%Y-%m-%d") if actual_dt is not None else ""
+
             adjusted_payable[payable_item["index"]] = self._decision("R301", evidence=restore_evidence)
+            payable_restore_hit_count += 1
+            if len(payable_restore_samples) < 20:
+                payable_restore_samples.append(
+                    {
+                        "match_key": "|".join(str(part) for part in key),
+                        "payable_row": payable_item["index"] + 2,
+                        "vendor": payable_item["vendor"],
+                        "amount": payable_item["amount"],
+                        "cost_code": payable_item["cost_code"],
+                        "unit_code": payable_item["unit_code"],
+                        "payable_incurred_date": restore_evidence["payable_incurred_date"],
+                        "restore_match_status": restore_evidence["restore_match_status"],
+                    }
+                )
+            if matched_final_item is None:
+                payable_missing_final_detail_count += 1
+                if len(payable_missing_final_detail_samples) < 20:
+                    payable_missing_final_detail_samples.append(
+                        {
+                            "match_key": "|".join(str(part) for part in key),
+                            "payable_row": payable_item["index"] + 2,
+                            "vendor": payable_item["vendor"],
+                            "amount": payable_item["amount"],
+                            "cost_code": payable_item["cost_code"],
+                            "unit_code": payable_item["unit_code"],
+                            "payable_incurred_date": restore_evidence["payable_incurred_date"],
+                        }
+                    )
+
+        for key, final_matches in final_candidates.items():
+            if len(final_matches) != 1:
+                continue
+            final_item = final_matches[0]
+            payable_matches = payable_candidates.get(key, [])
+            matched_payable_item = None
+            if len(payable_matches) == 1 and payable_matches[0]["unit_code"] == final_item["unit_code"]:
+                matched_payable_item = payable_matches[0]
+
+            actual_dt = self._normalize_date_value(final_item.get("actual_settlement_date"))
+            final_dt = self._normalize_date_value(final_item.get("final_date"))
+            incurred_dt = self._normalize_date_value(final_item.get("incurred_date"))
+            restore_evidence = {
+                "unit_code": final_item["unit_code"],
+                "vendor": final_item["vendor"],
+                "amount": final_item["amount"],
+                "cost_code": final_item["cost_code"],
+                "payable_key": list(key),
+                "payable_incurred_date": incurred_dt.strftime("%Y-%m-%d") if incurred_dt is not None else "",
+                "final_detail_final_date": final_dt.strftime("%Y-%m-%d") if final_dt is not None else "",
+                "actual_settlement_date": actual_dt.strftime("%Y-%m-%d") if actual_dt is not None else "",
+                "restore_match_status": "matched_to_payable" if matched_payable_item else "final_detail_only",
+            }
+            if matched_payable_item is not None:
+                restore_evidence["payable_row"] = matched_payable_item["index"] + 2
+
             adjusted_final_detail[final_item["index"]] = self._decision("R302", evidence=restore_evidence)
+            final_detail_restore_hit_count += 1
+            if len(final_detail_restore_samples) < 20:
+                final_detail_restore_samples.append(
+                    {
+                        "match_key": "|".join(str(part) for part in key),
+                        "final_detail_row": final_item["index"] + 2,
+                        "vendor": final_item["vendor"],
+                        "amount": final_item["amount"],
+                        "cost_code": final_item["cost_code"],
+                        "unit_code": final_item["unit_code"],
+                        "payable_incurred_date": restore_evidence["payable_incurred_date"],
+                        "final_detail_final_date": restore_evidence["final_detail_final_date"],
+                        "actual_settlement_date": restore_evidence["actual_settlement_date"],
+                        "restore_match_status": restore_evidence["restore_match_status"],
+                    }
+                )
+            if matched_payable_item is None:
+                final_detail_missing_payable_count += 1
+                if len(final_detail_missing_payable_samples) < 20:
+                    final_detail_missing_payable_samples.append(
+                        {
+                            "match_key": "|".join(str(part) for part in key),
+                            "final_detail_row": final_item["index"] + 2,
+                            "vendor": final_item["vendor"],
+                            "amount": final_item["amount"],
+                            "cost_code": final_item["cost_code"],
+                            "unit_code": final_item["unit_code"],
+                            "payable_incurred_date": restore_evidence["payable_incurred_date"],
+                            "final_detail_final_date": restore_evidence["final_detail_final_date"],
+                        }
+                    )
+
+        for key in matched_keys:
+            payable_item = payable_candidates[key][0]
+            final_item = final_candidates[key][0]
+            actual_dt = self._normalize_date_value(final_item.get("actual_settlement_date"))
+            final_dt = self._normalize_date_value(final_item.get("final_date"))
+            payable_incurred_dt = self._normalize_date_value(payable_item.get("payable_incurred_date"))
             restore_hit_count += 1
             if len(restore_samples) < 20:
                 restore_samples.append(
@@ -802,13 +958,25 @@ class ClassificationService:
                         "amount": payable_item["amount"],
                         "cost_code": payable_item["cost_code"],
                         "unit_code": final_item["unit_code"] or payable_item["unit_code"],
-                        "payable_incurred_date": payable_incurred_dt.strftime("%Y-%m-%d"),
-                        "final_detail_final_date": final_dt.strftime("%Y-%m-%d"),
-                        "actual_settlement_date": actual_dt.strftime("%Y-%m-%d"),
+                        "payable_incurred_date": payable_incurred_dt.strftime("%Y-%m-%d") if payable_incurred_dt is not None else "",
+                        "final_detail_final_date": final_dt.strftime("%Y-%m-%d") if final_dt is not None else "",
+                        "actual_settlement_date": actual_dt.strftime("%Y-%m-%d") if actual_dt is not None else "",
                     }
                 )
 
-        return adjusted_payable, adjusted_final_detail, restore_hit_count, restore_samples
+        restore_extra = {
+            "restore_hit_count": restore_hit_count,
+            "restore_samples": restore_samples,
+            "payable_restore_hit_count": payable_restore_hit_count,
+            "payable_restore_samples": payable_restore_samples,
+            "final_detail_restore_hit_count": final_detail_restore_hit_count,
+            "final_detail_restore_samples": final_detail_restore_samples,
+            "payable_missing_final_detail_count": payable_missing_final_detail_count,
+            "payable_missing_final_detail_samples": payable_missing_final_detail_samples,
+            "final_detail_missing_payable_count": final_detail_missing_payable_count,
+            "final_detail_missing_payable_samples": final_detail_missing_payable_samples,
+        }
+        return adjusted_payable, adjusted_final_detail, restore_extra
 
     def _merge_restore_extra(self, extra: Mapping[str, Any], restore_extra: Mapping[str, Any]) -> Dict[str, Any]:
         merged = dict(extra)

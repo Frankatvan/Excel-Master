@@ -51,6 +51,10 @@ def _get_service_account_info() -> Dict[str, Any]:
             info[k] = val
 
     if all(k in info for k in ["project_id", "private_key", "client_email"]):
+        info.setdefault("type", "service_account")
+        info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+        info.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+        info.setdefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
         return info
 
     raise RuntimeError(
@@ -68,18 +72,10 @@ def _to_plain_dict(obj: Any) -> Any:
     return obj
 
 def _safe_secrets() -> Mapping[str, Any]:
-    try:
-        return _to_plain_dict(dict(st.secrets))
-    except StreamlitSecretNotFoundError:
-        return {}
+    return {}
 
 def _get_secret(name: str, default: Any = None) -> Any:
-    secrets = _safe_secrets()
-    if name in secrets:
-        return secrets[name]
-    if "app" in secrets and name in secrets["app"]:
-        return secrets["app"][name]
-    return default
+    return os.getenv(name, default)
 
 def _parse_options(value: Any, fallback: Sequence[str]) -> List[str]:
     if value is None:
@@ -105,6 +101,9 @@ def _column_number_to_a1(index_1_based: int) -> str:
         value, rem = divmod(value - 1, 26)
         chars.append(chr(ord("A") + rem))
     return "".join(reversed(chars))
+
+def column_index_to_letter(index_1_based: int) -> str:
+    return _column_number_to_a1(index_1_based)
 
 def _quote_sheet_name(name: str) -> str:
     escaped = name.replace("'", "''")
@@ -330,6 +329,21 @@ def _extract_tail_int(value: Any, digits: int) -> int | None:
         return int(tail)
     return None
 
+def _extract_leading_int(value: Any, digits: int) -> int | None:
+    text = _safe_string(value)
+    if not text:
+        return None
+
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return None
+
+    head = match.group(1)[:digits]
+    if not head:
+        return None
+
+    return int(head)
+
 def _extract_tail_str(value: Any, digits: int) -> str:
     text = _safe_string(value)
     if not text:
@@ -389,12 +403,8 @@ def _extract_year(value: Any) -> int | str:
     return _extract_year_text_cached(text)
 
 def _co_date_to_actual_settlement_date(co_date: Any) -> str:
-    text = _safe_string(co_date)
-    if not text:
-        return ""
-
-    dt = pd.to_datetime(text, errors="coerce")
-    if pd.isna(dt):
+    dt = _normalize_date_value(co_date)
+    if dt is None:
         return ""
 
     actual = dt + pd.offsets.MonthBegin(1) + pd.offsets.MonthEnd(1)
@@ -422,7 +432,20 @@ def _normalize_date_value(value: Any) -> pd.Timestamp | None:
         return pd.Timestamp(value).normalize()
     if isinstance(value, date):
         return pd.Timestamp(value).normalize()
-    return _normalize_date_text_cached(_safe_string(value))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if 10000 <= numeric <= 80000:
+            dt = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
+            if pd.notna(dt):
+                return pd.Timestamp(dt).normalize()
+    text = _safe_string(value)
+    if re.fullmatch(r"\d+(?:\.0+)?", text):
+        numeric = float(text)
+        if 10000 <= numeric <= 80000:
+            dt = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
+            if pd.notna(dt):
+                return pd.Timestamp(dt).normalize()
+    return _normalize_date_text_cached(text)
 
 def _normalize_amount_key(value: Any) -> float:
     return round(_safe_number(value), 2)
