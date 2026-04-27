@@ -1,6 +1,9 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +24,108 @@ def _load_reclassify_job_module():
 
 
 reclassify_job = _load_reclassify_job_module()
+
+
+def test_worker_exports_scoping_final_gmp_migration_dependency():
+    deps = reclassify_job._load_worker_dependencies()
+
+    assert callable(deps["_ensure_scoping_final_gmp_rows"])
+
+
+def test_handler_migrates_scoping_final_gmp_before_computing_reclassification(monkeypatch):
+    sent = {}
+    old_sheet_map = {
+        "Scoping": _values_to_dataframe(
+            [
+                ["Group Number", "Group Name", "GMP", "Fee"],
+                ["101", "Group 101", "1", ""],
+            ]
+        ),
+        "Payable": object(),
+        "Final Detail": object(),
+        "Unit Budget": object(),
+        "Unit Master": object(),
+    }
+    migrated_sheet_map = {
+        "Scoping": _values_to_dataframe(
+            [
+                ["Group Number", "Group Name", "GMP", "Final GMP", "Fee"],
+                ["101", "Group 101", "1", "1", ""],
+            ]
+        ),
+        "Payable": object(),
+        "Final Detail": object(),
+        "Unit Budget": object(),
+        "Unit Master": object(),
+    }
+
+    class DummyWriter:
+        def write(self, data):
+            sent["body"] = data.decode("utf-8")
+
+    service = Mock()
+    value_updates = []
+
+    def update_values(**kwargs):
+        value_updates.append(kwargs)
+        return SimpleNamespace(execute=Mock(return_value={}))
+
+    values_api = service.spreadsheets.return_value.values.return_value
+    values_api.update.side_effect = update_values
+    values_api.batchUpdate.return_value.execute.return_value = {}
+
+    request_body = b'{"spreadsheet_id":"sheet-123"}'
+    handler = reclassify_job.handler.__new__(reclassify_job.handler)
+    handler.headers = {"Content-Length": str(len(request_body))}
+    handler.rfile = SimpleNamespace(read=Mock(return_value=request_body))
+    handler.wfile = DummyWriter()
+    handler.send_response = Mock()
+    handler.send_header = Mock()
+    handler.end_headers = Mock()
+    handler.requestline = "POST /api/internal/reclassify_job HTTP/1.1"
+    handler.command = "POST"
+    handler.path = "/api/internal/reclassify_job"
+    handler.request_version = "HTTP/1.1"
+    handler.client_address = ("127.0.0.1", 0)
+    handler.server = Mock()
+
+    monkeypatch.setattr(
+        reclassify_job,
+        "_load_worker_dependencies",
+        Mock(
+            return_value={
+                **reclassify_job._load_worker_dependencies(),
+                "get_sheets_service": Mock(return_value=service),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        reclassify_job,
+        "load_reclassify_sheet_map",
+        Mock(side_effect=[old_sheet_map, migrated_sheet_map]),
+    )
+    monkeypatch.setattr(
+        reclassify_job,
+        "compute_reclassification_results",
+        Mock(
+            return_value={
+                "payable_decisions": [],
+                "final_detail_decisions": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        reclassify_job,
+        "persist_reclassification_snapshot",
+        Mock(return_value={"status": "skipped", "reason": "TEST"}),
+    )
+
+    reclassify_job.handler.do_POST(handler)
+
+    assert any("Scoping" in update["range"] for update in value_updates)
+    reclassify_job.compute_reclassification_results.assert_called_once_with(migrated_sheet_map)
+    assert handler.send_response.call_args.args[0] == 200
+    assert json.loads(sent["body"])["ok"] is True
 
 
 def _make_row(length: int):

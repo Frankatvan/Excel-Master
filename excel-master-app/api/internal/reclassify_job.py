@@ -27,12 +27,13 @@ def _load_worker_dependencies():
     if logic_path_text not in sys.path:
         sys.path.insert(0, logic_path_text)
 
-    from aiwb_finance.finance_engine import MappingService, build_dashboard_summary_payload
+    from aiwb_finance.finance_engine import MappingService, _ensure_scoping_final_gmp_rows, build_dashboard_summary_payload
     from aiwb_finance.finance_classification import compute_final_detail_classifications, compute_payable_classifications
     from aiwb_finance.finance_mapping import resolve_sheet_field_columns_with_fallback
     from aiwb_finance.finance_utils import (
         _find_col_in_headers,
         _find_col_in_row,
+        _column_number_to_a1,
         _get_cell,
         _normalize_amount_key,
         _normalize_text_key,
@@ -47,8 +48,10 @@ def _load_worker_dependencies():
         "MappingService": MappingService,
         "compute_final_detail_classifications": compute_final_detail_classifications,
         "compute_payable_classifications": compute_payable_classifications,
+        "_ensure_scoping_final_gmp_rows": _ensure_scoping_final_gmp_rows,
         "_find_col_in_headers": _find_col_in_headers,
         "_find_col_in_row": _find_col_in_row,
+        "_column_number_to_a1": _column_number_to_a1,
         "_get_cell": _get_cell,
         "_normalize_amount_key": _normalize_amount_key,
         "_normalize_text_key": _normalize_text_key,
@@ -254,6 +257,63 @@ def load_reclassify_sheet_map(service, spreadsheet_id: str) -> Dict[str, Any]:
         raise RuntimeError(f"Missing required sheets: {', '.join(missing)}")
 
     return sheet_map
+
+
+def _sheet_data_to_values(sheet_data: Any, deps: Mapping[str, Any]) -> List[List[Any]]:
+    if hasattr(sheet_data, "columns") and hasattr(sheet_data, "to_numpy"):
+        headers = [str(col) for col in sheet_data.columns.tolist()]
+        body = [
+            [_serialize_sheet_cell(value) for value in row]
+            for row in sheet_data.to_numpy(dtype=object).tolist()
+        ]
+        return [headers] + body
+    if isinstance(sheet_data, Sequence) and not isinstance(sheet_data, (str, bytes)):
+        return [list(row) for row in sheet_data]
+    return []
+
+
+def _serialize_sheet_cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    try:
+        if value != value:
+            return ""
+    except Exception:
+        if str(value) in {"<NA>", "NaT"}:
+            return ""
+    return value
+
+
+def ensure_scoping_final_gmp_before_reclassification(
+    service,
+    spreadsheet_id: str,
+    sheet_map: Mapping[str, Any],
+    deps: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    deps = deps or _load_worker_dependencies()
+    try:
+        scoping_key = deps["_sheet_key"](sheet_map, "Scoping")
+    except KeyError:
+        return {"inserted": False, "final_gmp_col_1based": 0}
+
+    scoping_rows = _sheet_data_to_values(sheet_map[scoping_key], deps)
+    migrated_rows, final_gmp_meta = deps["_ensure_scoping_final_gmp_rows"](scoping_rows)
+    if not final_gmp_meta.get("inserted"):
+        return final_gmp_meta
+
+    row_count = len(migrated_rows)
+    col_count = max((len(row) for row in migrated_rows), default=0)
+    if row_count < 1 or col_count < 1:
+        return final_gmp_meta
+
+    end_col = deps["_column_number_to_a1"](col_count)
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{_quote_sheet_name('Scoping')}!A1:{end_col}{row_count}",
+        valueInputOption="USER_ENTERED",
+        body={"values": migrated_rows},
+    ).execute()
+    return final_gmp_meta
 
 
 def _collect_mapping_metrics(mapping_warnings: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -1192,6 +1252,14 @@ class handler(BaseHTTPRequestHandler):
             deps = _load_worker_dependencies()
             service = deps["get_sheets_service"]()
             sheet_map = load_reclassify_sheet_map(service, spreadsheet_id)
+            final_gmp_meta = ensure_scoping_final_gmp_before_reclassification(
+                service,
+                spreadsheet_id,
+                sheet_map,
+                deps=deps,
+            )
+            if final_gmp_meta.get("inserted"):
+                sheet_map = load_reclassify_sheet_map(service, spreadsheet_id)
             results = compute_reclassification_results(sheet_map)
 
             if validate_only:

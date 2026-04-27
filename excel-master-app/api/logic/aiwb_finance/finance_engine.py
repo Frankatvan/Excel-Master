@@ -2004,6 +2004,36 @@ def _find_header_row_with_columns(rows: Sequence[Sequence[Any]], *candidates: st
     return None
 
 
+def _find_header_index_in_rows(rows: Sequence[Sequence[Any]], header: str) -> Tuple[int | None, int | None]:
+    target = _normalize_label(header)
+    for row_idx, row in enumerate(rows):
+        for col_idx, value in enumerate(row):
+            if _normalize_label(value) == target:
+                return row_idx, col_idx
+    return None, None
+
+
+def _ensure_scoping_final_gmp_rows(rows: Sequence[Sequence[Any]]) -> Tuple[List[List[Any]], Dict[str, Any]]:
+    normalized = [list(row) for row in rows]
+    if not normalized:
+        return normalized, {"inserted": False, "final_gmp_col_1based": 0}
+
+    header_row_idx, gmp_col_idx = _find_header_index_in_rows(normalized, "GMP")
+    _, final_gmp_col_idx = _find_header_index_in_rows(normalized, "Final GMP")
+    if final_gmp_col_idx is not None:
+        return normalized, {"inserted": False, "final_gmp_col_1based": final_gmp_col_idx + 1}
+    if header_row_idx is None or gmp_col_idx is None:
+        return normalized, {"inserted": False, "final_gmp_col_1based": 0}
+
+    insert_at = gmp_col_idx + 1
+    for row_idx, row in enumerate(normalized):
+        if len(row) < insert_at:
+            row.extend([""] * (insert_at - len(row)))
+        source_value = row[gmp_col_idx] if len(row) > gmp_col_idx else ""
+        row.insert(insert_at, "Final GMP" if row_idx == header_row_idx else source_value)
+    return normalized, {"inserted": True, "final_gmp_col_1based": insert_at + 1}
+
+
 def _format_mdy_no_leading_zero(value: Any) -> str:
     dt = _normalize_date_value(value)
     if dt is None:
@@ -3242,7 +3272,25 @@ def _apply_unit_budget_support_formatting(service, spreadsheet_id: str) -> int:
     return 0
 
 def _apply_scoping_layout_controls(service, spreadsheet_id: str) -> Dict[str, Any]:
-    return {}
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range="'Scoping'!A:Z",
+    ).execute().get("values", [])
+    migrated_rows, final_gmp_meta = _ensure_scoping_final_gmp_rows(rows)
+    if final_gmp_meta.get("inserted"):
+        max_width = max((len(row) for row in migrated_rows), default=0)
+        end_col = _column_number_to_a1(max_width)
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"'Scoping'!A1:{end_col}{len(migrated_rows)}",
+            valueInputOption="USER_ENTERED",
+            body={"values": migrated_rows},
+        ).execute()
+    return {
+        "final_gmp": final_gmp_meta,
+        "manual_input_ranges": _build_scoping_manual_input_ranges(migrated_rows),
+        "hidden_row_numbers": _build_scoping_hidden_row_numbers(migrated_rows),
+    }
 
 def _ensure_109_contract_amount_row(service, spreadsheet_id: str) -> bool:
     return False
