@@ -162,6 +162,28 @@ class PayableFinalDetailClassificationTests(unittest.TestCase):
         self.assertEqual("R301", working_map["Payable"].iloc[0, 1])
         self.assertEqual("R302", working_map["Final Detail"].iloc[0, 1])
 
+    def test_restore_marks_payable_r301_even_without_final_detail_match(self):
+        sheet_map = self._build_restore_ready_sheet_map()
+        sheet_map["Final Detail"] = sheet_map["Final Detail"].iloc[0:0].copy()
+
+        service = self._get_classification_service(sheet_map)
+        results = service.compute()
+
+        self.assertEqual("R301", results["payable_extra"]["rule_ids"][0])
+        self.assertEqual(1, results["restore_extra"]["payable_restore_hit_count"])
+        self.assertEqual(1, results["restore_extra"]["payable_missing_final_detail_count"])
+
+    def test_restore_marks_final_detail_r302_even_without_payable_match(self):
+        sheet_map = self._build_restore_ready_sheet_map()
+        sheet_map["Payable"] = sheet_map["Payable"].iloc[0:0].copy()
+
+        service = self._get_classification_service(sheet_map)
+        results = service.compute()
+
+        self.assertEqual("R302", results["final_detail_extra"]["rule_ids"][0])
+        self.assertEqual(1, results["restore_extra"]["final_detail_restore_hit_count"])
+        self.assertEqual(1, results["restore_extra"]["final_detail_missing_payable_count"])
+
     def _build_restore_ready_sheet_map(self) -> dict[str, pd.DataFrame]:
         payable = pd.DataFrame(
             [
@@ -179,12 +201,13 @@ class PayableFinalDetailClassificationTests(unittest.TestCase):
 
         scoping = pd.DataFrame(
             [
-                ["", "", "Group Number", "", "GMP", "Fee", "WIP", "WTC", "GC", "TBD"],
-                ["", "", 1, "", 1, 5, "", "", "", ""],
-                ["", "", 4, "", 1, "", "", "", "", ""],
-                ["", "", 300, "", 1, "", "", "", "", ""],
-                ["", "", 670, "", 6, "", "", "", "", ""],
-                ["", "", 895, "", 1, 6, "", "", "", ""],
+                ["", "", "Group Number", "", "GMP", "Fee", "WIP", "WTC", "GC", "TBD", "Warranty Months"],
+                ["", "", 1, "", 1, 5, "", "", "", "", ""],
+                ["", "", 4, "", 1, "", "", "", "", "", 12],
+                ["", "", 300, "", 1, "", "", "", "", "", ""],
+                ["", "", 305, "", 1, "", "", "", "", "", 12],
+                ["", "", 670, "", 6, "", "", "", "", "", ""],
+                ["", "", 895, "", 1, 6, "", "", "", "", ""],
             ]
         )
 
@@ -198,7 +221,10 @@ class PayableFinalDetailClassificationTests(unittest.TestCase):
         unit_master = pd.DataFrame(
             [
                 ["Unit Code", "Total Budget", "GC Budget", "WIP Budget", "Incurred Amount", "Settlement Amount", "Final Date", "C/O date", "实际结算日期", "实际结算年份", "TBD Acceptance Date", "Budget Variance", "Group"],
-                ["24407DD", 0, 0, 0, 0, 0, "2025-04-15", "2025-04-15", "2025-05-31", 2025, "", 0, ""],
+                ["24407DD", 0, 0, 0, 0, 0, "2025-04-15", "2025-04-15", "2025-05-31", 2025, "", 0, 300],
+                ["24408DD", 0, 0, 0, 0, 0, "2025-04-15", "2025-04-15", "2025-05-31", 2025, "", 0, 305],
+                ["24409DD", 0, 0, 0, 0, 0, "2025-06-15", "2025-06-15", "2025-07-31", 2025, "", 0, 305],
+                ["14403DD", 0, 0, 0, 0, 0, "2025-04-15", "2025-04-15", "2025-05-31", 2025, "", 0, 4],
             ]
         )
 
@@ -306,6 +332,49 @@ class PayableFinalDetailClassificationTests(unittest.TestCase):
         )
         self.assertEqual("RACC2", decision.category)
         self.assertEqual("R204", decision.rule_id)
+
+        # R202 remains ahead of R204 when a valid paired RACC key exists.
+        racc_key = service._make_payable_racc_key("Other Vendor", 100, "1SF004", "2025-04-15")
+        decision = service._classify_payable_record(
+            unit_code="14403DD",
+            vendor="Other Vendor",
+            amount=100,
+            cost_code="1SF004",
+            incurred_date="2025-04-15",
+            statuses={1},
+            actual_settlement_date="2025-02-01",
+            tbd_acceptance_date="2025-03-01",
+            payable_racc_keys={racc_key},
+        )
+        self.assertEqual("RACC", decision.category)
+        self.assertEqual("R202", decision.rule_id)
+
+    def test_group_warranty_expiry_uses_latest_co_date_plus_scoping_months(self):
+        service = self._get_classification_service()
+
+        self.assertEqual(pd.Timestamp("2026-06-13"), service.group_warranty_expiry_map[305])
+        self.assertEqual(pd.Timestamp("2026-04-13"), service.group_warranty_expiry_map[4])
+
+    def test_group_warranty_expiry_reads_unit_budget_when_summary_row_precedes_headers(self):
+        sheet_map = self._build_restore_ready_sheet_map()
+        sheet_map["Unit Master"] = pd.DataFrame(
+            [
+                ["Unit Code", "Total Budget", "GC Budget", "WIP Budget", "Incurred Amount", "Settlement Amount", "Final Date", "C/O date", "实际结算日期", "实际结算年份", "TBD Acceptance Date", "Budget Variance"],
+                ["24407DD", 0, 0, 0, 0, 0, "2025-04-15", "2025-04-15", "2025-05-31", 2025, "", 0],
+            ]
+        )
+        sheet_map["Unit Budget"] = pd.DataFrame(
+            [
+                ["", 84, "预算金额", "WIP逻辑预算", "incurred Amount", "结算金额", "结算年份", "C/O date", "实际结算日期", "实际结算年份", "TBD Acceptance Date", "预算差异", "", "Group", "GMP", "Fee", "WIP"],
+                ["", "Unit Code", "", "", "", "", "结算年份", "C/O date", "实际结算日期", "实际结算年份", "TBD Acceptance Date", "预算差异", "", "Group", "GMP", "Fee", "WIP"],
+                ["", "24408DD", "", "", "", "", 2025, "2025-04-15", "2025-05-31", 2025, "", "", "", 305, "", "", ""],
+                ["", "24409DD", "", "", "", "", 2025, "2025-06-15", "2025-07-31", 2025, "", "", "", 305, "", "", ""],
+            ]
+        )
+
+        service = self._get_classification_service(sheet_map)
+
+        self.assertEqual(pd.Timestamp("2026-06-13"), service.group_warranty_expiry_map[305])
 
     def test_classify_final_detail_pre_exclusion(self):
         service = self._get_classification_service()
