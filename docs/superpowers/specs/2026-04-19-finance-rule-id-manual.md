@@ -36,32 +36,32 @@
 
 - Category: `GC Income`
 - Sheet Scope: `Payable / Final Detail`
-- 中文判定依据：结算前：GMP (1) + GC (5) + 供应商为 Wan Pacific
-- English Reason: Before Settlement: GMP (1) + GC (5) + Vendor is Wan Pacific
+- 中文判定依据：结算前：Final GMP (1) + GC (5) + 供应商为 Wan Pacific
+- English Reason: Before Settlement: Final GMP (1) + GC (5) + Vendor is Wan Pacific
 - 典型字段 / Key Fields: `statuses`, `vendor`
 
 ## R105
 
 - Category: `GC`
 - Sheet Scope: `Payable / Final Detail`
-- 中文判定依据：结算前：GMP (1) + GC (5) + 供应商非 Wan Pacific
-- English Reason: Before Settlement: GMP (1) + GC (5) + Vendor is not Wan Pacific
+- 中文判定依据：结算前：Final GMP (1) + GC (5) + 供应商非 Wan Pacific
+- English Reason: Before Settlement: Final GMP (1) + GC (5) + Vendor is not Wan Pacific
 - 典型字段 / Key Fields: `statuses`, `vendor`
 
 ## R106
 
 - Category: `Income`
 - Sheet Scope: `Payable / Final Detail`
-- 中文判定依据：结算前：GMP (1) + Fee (2) + 供应商为 Wan Pacific
-- English Reason: Before Settlement: GMP (1) + Fee (2) + Vendor is Wan Pacific
+- 中文判定依据：结算前：Final GMP (1) + Fee (2) + 供应商为 Wan Pacific
+- English Reason: Before Settlement: Final GMP (1) + Fee (2) + Vendor is Wan Pacific
 - 典型字段 / Key Fields: `statuses`, `vendor`
 
 ## R107
 
 - Category: `ROE`
 - Sheet Scope: `Payable / Final Detail`
-- 中文判定依据：结算前：标准 ROE 特征 (GMP/Fee)
-- English Reason: Before Settlement: Standard ROE features (GMP/Fee)
+- 中文判定依据：结算前：标准 ROE 特征 (Final GMP/Fee)
+- English Reason: Before Settlement: Standard ROE features (Final GMP/Fee)
 - 典型字段 / Key Fields: `statuses`
 
 ## R108
@@ -100,8 +100,8 @@
 
 - Category: `RACC2`
 - Sheet Scope: `Payable / Final Detail`
-- 中文判定依据：结算后：发生日 <= 保修到期日，且符合 ROE 特征
-- English Reason: After Settlement: Date <= Warranty Expiry AND matches ROE features
+- 中文判定依据：结算后：发生日 <= 保修到期日，且符合 Final GMP/Fee ROE 特征
+- English Reason: After Settlement: Date <= Warranty Expiry AND matches Final GMP/Fee ROE features
 - 典型字段 / Key Fields: `event_dt`, `warranty_expiry_date`, `statuses`
 
 ## R205
@@ -116,14 +116,14 @@
 
 - Category: `RACC`
 - Sheet Scope: `Payable`
-- 中文判定依据：Restore: 结算前后配对修正（Payable 端）
-- English Reason: Restore: Match correction for Payable side
-- 典型字段 / Key Fields: `payable_key`, `restore_hit`
+- 中文判定依据：Restore: 结算前后窗口修正（Payable 端，独立判定）
+- English Reason: Restore: Settlement-window correction for Payable side (standalone)
+- 典型字段 / Key Fields: `payable_key`, `payable_incurred_date`, `restore_match_status`
 
 ## R302
 
 - Category: `ACC`
 - Sheet Scope: `Final Detail`
-- 中文判定依据：Restore: 结算前后配对修正（Final Detail 端）
-- English Reason: Restore: Match correction for Final Detail side
-- 典型字段 / Key Fields: `payable_key`, `restore_hit`
+- 中文判定依据：Restore: 结算前后窗口修正（Final Detail 端，独立判定）
+- English Reason: Restore: Settlement-window correction for Final Detail side (standalone)
+- 典型字段 / Key Fields: `payable_key`, `final_date`, `restore_match_status`

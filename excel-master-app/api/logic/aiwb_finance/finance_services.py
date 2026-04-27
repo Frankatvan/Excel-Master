@@ -53,29 +53,29 @@ RULE_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "R104": {
         "category": "GC Income",
-        "reason_zh": "结算前：GMP (1) + GC (5) + 供应商为 Wan Pacific",
-        "reason_en": "Before Settlement: GMP (1) + GC (5) + Vendor is Wan Pacific",
+        "reason_zh": "结算前：Final GMP (1) + GC (5) + 供应商为 Wan Pacific",
+        "reason_en": "Before Settlement: Final GMP (1) + GC (5) + Vendor is Wan Pacific",
         "semantics": "gmp_gc_income",
         "sheet_scope": ("Payable", "Final Detail"),
     },
     "R105": {
         "category": "GC",
-        "reason_zh": "结算前：GMP (1) + GC (5) + 供应商非 Wan Pacific",
-        "reason_en": "Before Settlement: GMP (1) + GC (5) + Vendor is not Wan Pacific",
+        "reason_zh": "结算前：Final GMP (1) + GC (5) + 供应商非 Wan Pacific",
+        "reason_en": "Before Settlement: Final GMP (1) + GC (5) + Vendor is not Wan Pacific",
         "semantics": "gmp_gc_standard",
         "sheet_scope": ("Payable", "Final Detail"),
     },
     "R106": {
         "category": "Income",
-        "reason_zh": "结算前：GMP (1) + Fee (2) + 供应商为 Wan Pacific",
-        "reason_en": "Before Settlement: GMP (1) + Fee (2) + Vendor is Wan Pacific",
+        "reason_zh": "结算前：Final GMP (1) + Fee (2) + 供应商为 Wan Pacific",
+        "reason_en": "Before Settlement: Final GMP (1) + Fee (2) + Vendor is Wan Pacific",
         "semantics": "gmp_fee_income",
         "sheet_scope": ("Payable", "Final Detail"),
     },
     "R107": {
         "category": "ROE",
-        "reason_zh": "结算前：标准 ROE 特征 (GMP/Fee)",
-        "reason_en": "Before Settlement: Standard ROE features (GMP/Fee)",
+        "reason_zh": "结算前：标准 ROE 特征 (Final GMP/Fee)",
+        "reason_en": "Before Settlement: Standard ROE features (Final GMP/Fee)",
         "semantics": "gmp_roe_standard",
         "sheet_scope": ("Payable", "Final Detail"),
     },
@@ -110,8 +110,8 @@ RULE_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "R204": {
         "category": "RACC2",
-        "reason_zh": "结算后：发生日 <= 保修到期日，且符合 ROE 特征",
-        "reason_en": "After Settlement: Date <= Warranty Expiry AND matches ROE features",
+        "reason_zh": "结算后：发生日 <= 保修到期日，且符合 Final GMP/Fee ROE 特征",
+        "reason_en": "After Settlement: Date <= Warranty Expiry AND matches Final GMP/Fee ROE features",
         "semantics": "post_settlement_racc2",
         "sheet_scope": ("Payable", "Final Detail"),
     },
@@ -351,7 +351,7 @@ class ClassificationService:
         if 1 in statuses and 2 in statuses and "WAN PACIFIC" in vendor_str:
             return "Income", "R106"
 
-        # P4: ROE (GMP/Fee 兜底) -> R107
+        # P4: ROE (Final GMP/Fee 兜底) -> R107
         if 1 in statuses or 2 in statuses:
             return "ROE", "R107"
 
@@ -403,7 +403,7 @@ class ClassificationService:
         if incurred_dt and tbd_dt and incurred_dt > tbd_dt and 6 in statuses:
             return self._decision("R203", evidence=evidence)
 
-        # 3. R204: RACC2 (发生日 <= 保修到期日 且 符合 ROE 特征)
+        # 3. R204: RACC2 (发生日 <= 保修到期日 且符合 Final GMP/Fee ROE 特征)
         if incurred_dt and group_warranty_expiry is not None and incurred_dt <= group_warranty_expiry:
             if 1 in statuses or 2 in statuses:
                 return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(group_warranty_expiry)})
@@ -467,7 +467,7 @@ class ClassificationService:
         if event_dt and tbd_dt and event_dt > tbd_dt and 6 in statuses:
             return self._decision("R203", evidence=evidence)
 
-        # 4. R204: RACC2 (发生日 <= 保修到期日 且 符合 ROE 特征)
+        # 4. R204: RACC2 (发生日 <= 保修到期日 且符合 Final GMP/Fee ROE 特征)
         if event_dt and group_warranty_expiry is not None and event_dt <= group_warranty_expiry:
             if 1 in statuses or 2 in statuses:
                 return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(group_warranty_expiry)})
