@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-04-27T11:33:19.335Z",
+  "env_present": {
+    "supabase_url": true,
+    "supabase_service_role_key": true,
+    "external_import_worker_url": false,
+    "external_import_worker_secret": false,
+    "google_sheet_id": true,
+    "google_client_email": true
+  },
+  "tables": {
+    "jobs": {
+      "ok": true,
+      "count": null
+    },
+    "external_import_manifests": {
+      "ok": true,
+      "count": null
+    },
+    "external_import_manifest_items": {
+      "ok": true,
+      "count": null
+    },
+    "projects": {
+      "ok": true,
+      "count": 4
+    }
+  }
+}
