@@ -49,7 +49,7 @@ def _get_service_account_info() -> Dict[str, Any]:
             if k == "private_key":
                 val = val.replace("\\n", "\n")
             info[k] = val
-    
+
     if all(k in info for k in ["project_id", "private_key", "client_email"]):
         return info
 
@@ -105,9 +105,6 @@ def _column_number_to_a1(index_1_based: int) -> str:
         value, rem = divmod(value - 1, 26)
         chars.append(chr(ord("A") + rem))
     return "".join(reversed(chars))
-
-def column_index_to_letter(index_1_based: int) -> str:
-    return _column_number_to_a1(index_1_based)
 
 def _quote_sheet_name(name: str) -> str:
     escaped = name.replace("'", "''")
@@ -333,21 +330,6 @@ def _extract_tail_int(value: Any, digits: int) -> int | None:
         return int(tail)
     return None
 
-def _extract_leading_int(value: Any, digits: int) -> int | None:
-    text = _safe_string(value)
-    if not text:
-        return None
-
-    match = re.search(r"(\d+)", text)
-    if not match:
-        return None
-
-    head = match.group(1)[:digits]
-    if not head:
-        return None
-
-    return int(head)
-
 def _extract_tail_str(value: Any, digits: int) -> str:
     text = _safe_string(value)
     if not text:
@@ -407,8 +389,12 @@ def _extract_year(value: Any) -> int | str:
     return _extract_year_text_cached(text)
 
 def _co_date_to_actual_settlement_date(co_date: Any) -> str:
-    dt = _normalize_date_value(co_date)
-    if dt is None:
+    text = _safe_string(co_date)
+    if not text:
+        return ""
+
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.isna(dt):
         return ""
 
     actual = dt + pd.offsets.MonthBegin(1) + pd.offsets.MonthEnd(1)
@@ -436,20 +422,7 @@ def _normalize_date_value(value: Any) -> pd.Timestamp | None:
         return pd.Timestamp(value).normalize()
     if isinstance(value, date):
         return pd.Timestamp(value).normalize()
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        numeric = float(value)
-        if 10000 <= numeric <= 80000:
-            dt = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
-            if pd.notna(dt):
-                return pd.Timestamp(dt).normalize()
-    text = _safe_string(value)
-    if re.fullmatch(r"\d+(?:\.0+)?", text):
-        numeric = float(text)
-        if 10000 <= numeric <= 80000:
-            dt = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
-            if pd.notna(dt):
-                return pd.Timestamp(dt).normalize()
-    return _normalize_date_text_cached(text)
+    return _normalize_date_text_cached(_safe_string(value))
 
 def _normalize_amount_key(value: Any) -> float:
     return round(_safe_number(value), 2)

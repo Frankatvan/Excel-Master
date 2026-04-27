@@ -1,52 +1,11 @@
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import yaml
 
 
 DEFAULT_SEMANTIC_CONFIG_PATH = Path("docs/finance_semantic_config.yaml")
-SHEET_FIELD_RESOLVER_LOGGER = logging.getLogger("SheetFieldSemanticResolver")
-
-
-SEMANTIC_SHEET_FIELD_ALIASES: Dict[str, Dict[str, Sequence[str]]] = {
-    "Payable": {
-        "vendor": ("Vendor",),
-        "invoice_no": ("Invoice No", "Invoice #", "Vendor No."),
-        "cost_name": ("Cost Name", "Activity"),
-        "cost_code": ("Cost Code",),
-        "raw_cost_state": ("Cost State",),
-        "unit_code": ("Unit Code", "Unit"),
-        "incurred_date": ("Incurred Date",),
-        "amount": ("Amount",),
-    },
-    "Final Detail": {
-        "vendor": ("Vendor",),
-        "unit_code": ("Unit Code", "Unit"),
-        "cost_code": ("Cost Code",),
-        "amount": ("Amount",),
-        "incurred_date": ("Incurred Date", "Posting Date 1"),
-        "posting_date": ("Posting Date 1", "Final Date"),
-        "type": ("Type",),
-    },
-    "Draw request report": {
-        "vendor": ("Vendor",),
-        "unit_code": ("Unit Code",),
-        "invoice_no": ("Invoiced No", "Invoice No", "Invoice #"),
-        "draw_invoice": ("Draw Invoice",),
-        "cost_code": ("Cost Code",),
-        "amount": ("Amount",),
-        "raw_cost_state": ("Cost State",),
-    },
-}
-
-SEMANTIC_SHEET_FIXED_COLUMNS: Dict[str, Dict[str, int]] = {
-    # 语义契约：Draw Request report 的 cost_state 固定来自 C 列
-    "Draw request report": {
-        "raw_cost_state": 3,
-    }
-}
 
 
 class ExcelSemanticMapper:
@@ -188,95 +147,3 @@ class MapperFactory:
         mapper.config = sheet_config
         mapper.scan_sheet(values, label_col_idx=int(sheet_config.get("label_col_idx", 2)))
         return mapper
-
-
-def _normalize_header_token(text: Any) -> str:
-    return re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", str(text).lower())
-
-
-def resolve_sheet_field_columns(
-    headers: Sequence[Any],
-    sheet_name: str,
-    fields: Sequence[str] | None = None,
-) -> Dict[str, int]:
-    """
-    按语义字段解析列号（1-based）。
-    优先级：fixed column > exact header alias > fuzzy alias。
-    """
-    aliases = dict(SEMANTIC_SHEET_FIELD_ALIASES.get(sheet_name, {}))
-    fixed_columns = dict(SEMANTIC_SHEET_FIXED_COLUMNS.get(sheet_name, {}))
-    target_fields = list(fields) if fields is not None else list(aliases.keys())
-
-    normalized_headers = [_normalize_header_token(cell) for cell in headers]
-    resolved: Dict[str, int] = {}
-
-    for field in target_fields:
-        fixed = fixed_columns.get(field)
-        if isinstance(fixed, int) and fixed >= 1:
-            resolved[field] = fixed
-            continue
-
-        candidates = aliases.get(field, (field,))
-        normalized_candidates = [_normalize_header_token(alias) for alias in candidates if _normalize_header_token(alias)]
-        if not normalized_candidates:
-            continue
-
-        matched_col: int | None = None
-        for idx, header_token in enumerate(normalized_headers, start=1):
-            if header_token in normalized_candidates:
-                matched_col = idx
-                break
-
-        if matched_col is None:
-            for idx, header_token in enumerate(normalized_headers, start=1):
-                for candidate in normalized_candidates:
-                    if candidate and candidate in header_token:
-                        matched_col = idx
-                        break
-                if matched_col is not None:
-                    break
-
-        if matched_col is not None:
-            resolved[field] = matched_col
-
-    return resolved
-
-
-def resolve_sheet_field_columns_with_fallback(
-    headers: Sequence[Any],
-    sheet_name: str,
-    fallback_columns: Mapping[str, int],
-    fields: Sequence[str] | None = None,
-    logger: logging.Logger | None = None,
-) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
-    """
-    语义优先解析 + 物理索引兜底，并输出可审计的 fallback 事件。
-    """
-    resolved = resolve_sheet_field_columns(headers=headers, sheet_name=sheet_name, fields=fields)
-    fallback_events: List[Dict[str, Any]] = []
-    target_fields = list(fields) if fields is not None else list(fallback_columns.keys())
-    active_logger = logger or SHEET_FIELD_RESOLVER_LOGGER
-
-    for field in target_fields:
-        if field in resolved:
-            continue
-        fallback_index = fallback_columns.get(field)
-        if not isinstance(fallback_index, int) or fallback_index < 1:
-            continue
-
-        resolved[field] = fallback_index
-        event = {
-            "event_code": "FALLBACK_TO_PHYSICAL_INDEX",
-            "sheet_name": sheet_name,
-            "logical_field": field,
-            "fallback_column_index": fallback_index,
-        }
-        fallback_events.append(event)
-        active_logger.warning(
-            "FALLBACK_TO_PHYSICAL_INDEX sheet=%s field=%s column=%s",
-            sheet_name,
-            field,
-            fallback_index,
-        )
-
-    return resolved, fallback_events

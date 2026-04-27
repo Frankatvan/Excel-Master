@@ -146,77 +146,26 @@ class ClassificationService:
             setattr(self, f"_{key}" if not key.startswith("_") else key, func)
 
         self.wsp = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Payable")], 43)
-        self.wss = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Scoping")], 11)
+        self.wss = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Scoping")], 10)
         self.wsf = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Final Detail")], 30)
         self.wsb = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Unit Budget")], 16)
         self.wsm = self._ensure_column_count(sheet_map[self._sheet_key(sheet_map, "Unit Master")], 13)
 
         self.scoping_status_map = self._build_scoping_status_map(self.wss)
-        self.scoping_warranty_months_map = self._build_scoping_warranty_months_map(self.wss)
-        self.group_warranty_expiry_map = self._build_group_warranty_expiry_map(
-            self.wsb,
-            self.wsm,
-            self.scoping_warranty_months_map,
-        )
-        self.warranty_expiry_date = max(self.group_warranty_expiry_map.values()) if self.group_warranty_expiry_map else None
+        self.warranty_expiry_date = self._calculate_warranty_expiry_date(self.wsm)
         self.unit_schedule_map = self._build_unit_budget_schedule_map(self.wsb, self._load_default_unit_budget_schedule_overrides())
         self.final_detail_index = self._build_final_detail_classification_index(self.wsf, self.scoping_status_map, self.unit_schedule_map)
 
-    def _build_scoping_warranty_months_map(self, wss: pd.DataFrame) -> Dict[int, float]:
-        group_col = self._find_col_in_row(wss, 0, "Group Number") or 2
-        warranty_col = (
-            self._find_col_in_row(wss, 0, "Warranty Months")
-            or self._find_col_in_row(wss, 0, "保修月数")
-            or 10
-        )
-        out: Dict[int, float] = {}
-        for r in range(len(wss)):
-            code = self._to_float(self._get_cell(wss, r, group_col))
-            months = self._to_float(self._get_cell(wss, r, warranty_col))
-            if code is None or months is None:
-                continue
-            out[int(code)] = float(months)
-        return out
-
-    def _build_group_warranty_expiry_map(
-        self,
-        wsb: pd.DataFrame,
-        wsm: pd.DataFrame,
-        warranty_months_map: Mapping[int, float],
-    ) -> Dict[int, pd.Timestamp]:
-        latest_co_date_by_group: Dict[int, pd.Timestamp] = {}
-
-        def collect_latest(df: pd.DataFrame, group_default: int, co_default: int) -> None:
-            group_col = (
-                self._find_col_in_headers(df, "Group")
-                or self._find_col_in_row(df, 0, "Group")
-                or group_default
-            )
-            co_col = (
-                self._find_col_in_headers(df, "C/O date")
-                or self._find_col_in_row(df, 0, "C/O date")
-                or co_default
-            )
-            for row_idx in range(len(df)):
-                group_number = self._to_float(self._get_cell(df, row_idx, group_col))
-                co_date = self._normalize_date_value(self._get_cell(df, row_idx, co_col))
-                if group_number is None or co_date is None:
-                    continue
-                group_key = int(group_number)
-                existing = latest_co_date_by_group.get(group_key)
-                if existing is None or co_date > existing:
-                    latest_co_date_by_group[group_key] = co_date
-
-        collect_latest(wsm, 13, 8)
-        collect_latest(wsb, 13, 8)
-
-        out: Dict[int, pd.Timestamp] = {}
-        for group_key, latest_co_date in latest_co_date_by_group.items():
-            warranty_months = warranty_months_map.get(group_key)
-            if warranty_months is None:
-                continue
-            out[group_key] = latest_co_date + pd.to_timedelta(float(warranty_months) * 30.25, unit="D")
-        return out
+    def _calculate_warranty_expiry_date(self, wsm: pd.DataFrame) -> pd.Timestamp | None:
+        """从 Unit Master H 列（C/O Date）提取最大日期作为保修期基准。"""
+        # H 列索引为 7 (1-based 为 8)
+        co_dates = self._column_values_1based(wsm, 8)
+        valid_dates = []
+        for d in co_dates:
+            dt = self._normalize_date_value(d)
+            if dt is not None:
+                valid_dates.append(dt)
+        return max(valid_dates) if valid_dates else None
 
     def compute(self) -> Dict[str, Any]:
         payable_decisions_initial, payable_extra_initial = self._compute_payable_classifications_initial(
@@ -331,52 +280,45 @@ class ClassificationService:
                     statuses.add(status_id)
             out[key] = statuses
         return out
-    
+
     def _classify_before_actual_settlement(self, unit_code: Any, vendor: Any, statuses: set[int]) -> Tuple[str, str]:
         if self._contains_general_condition(unit_code):
             return "GC", "R101"
-            
+
         vendor_str = self._safe_string(vendor).upper()
-        
+
         # P1: Consulting (WTC + WB Texas) -> R102 / R103
         if 4 in statuses:
             if "WB TEXAS" in vendor_str:
                 return "Consulting", "R102"
             return "GC2", "R103"
-            
+
         # P2: GC Income (GMP + GC + Wan Pacific) -> R104 / R105
         if 1 in statuses and 5 in statuses:
             if "WAN PACIFIC" in vendor_str:
                 return "GC Income", "R104"
             return "GC", "R105"
-            
+
         # P3: Income (GMP + Fee + Wan Pacific) -> R106
         if 1 in statuses and 2 in statuses and "WAN PACIFIC" in vendor_str:
             return "Income", "R106"
-            
+
         # P4: ROE (GMP/Fee 兜底) -> R107
         if 1 in statuses or 2 in statuses:
             return "ROE", "R107"
-            
+
         # P5: Direct (非 GMP 兜底) -> R108
         return "Direct", "R108"
 
     def _classify_payable_record(self, unit_code, vendor, amount, cost_code, incurred_date, statuses, actual_settlement_date, tbd_acceptance_date, payable_racc_keys):
-        group_number = self._extract_tail_int(cost_code, 3)
-        group_warranty_expiry = (
-            self.group_warranty_expiry_map.get(int(group_number))
-            if group_number is not None
-            else None
-        )
         evidence = {
             "unit_code": self._safe_string(unit_code),
             "vendor": self._safe_string(vendor),
             "cost_code": self._safe_string(cost_code),
             "incurred_date": self._iso_date_text(incurred_date),
             "actual_settlement_date": self._iso_date_text(actual_settlement_date),
-            "group_number": str(group_number) if group_number is not None else "",
         }
-        
+
         # P0: 全时段文本最高优先级 - General Condition 判定
         if self._contains_general_condition(unit_code):
             return self._decision("R101", evidence=evidence)
@@ -384,12 +326,17 @@ class ClassificationService:
         actual_dt = self._normalize_date_value(actual_settlement_date)
         incurred_dt = self._normalize_date_value(incurred_date)
         tbd_dt = self._normalize_date_value(tbd_acceptance_date)
-        
-        # 仅当记录日期实际跨过结算线时，才进入结算后逻辑。
+
+        # 核心修正：
+        # 1. 满足实际结算日期
+        # 2. 或者年份硬边界：2026年及以后的记录强制视为“结算后”
         is_after_settlement = False
         if incurred_dt is not None:
             if actual_dt is not None and incurred_dt >= actual_dt:
                 is_after_settlement = True
+            elif incurred_dt.year >= 2026:
+                is_after_settlement = True
+                evidence["is_after_settlement_by_year_boundary"] = True
 
         if not is_after_settlement:
             category, rule_id = self._classify_before_actual_settlement(unit_code, vendor, statuses)
@@ -407,20 +354,14 @@ class ClassificationService:
             return self._decision("R203", evidence=evidence)
 
         # 3. R204: RACC2 (发生日 <= 保修到期日 且 符合 ROE 特征)
-        if incurred_dt and group_warranty_expiry is not None and incurred_dt <= group_warranty_expiry:
+        if incurred_dt and self.warranty_expiry_date and incurred_dt <= self.warranty_expiry_date:
             if 1 in statuses or 2 in statuses:
-                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(group_warranty_expiry)})
+                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(self.warranty_expiry_date)})
 
         # 4. R205: EXP 兜底
         return self._decision("R205", evidence=evidence)
 
     def _classify_final_detail_record(self, unit_code, vendor, amount, cost_code, activity_no, incurred_date, final_date, statuses, actual_settlement_date, tbd_acceptance_date, paired_racc_keys, record_type=None):
-        group_number = self._extract_tail_int(cost_code, 3)
-        group_warranty_expiry = (
-            self.group_warranty_expiry_map.get(int(group_number))
-            if group_number is not None
-            else None
-        )
         evidence = {
             "unit_code": self._safe_string(unit_code),
             "vendor": self._safe_string(vendor),
@@ -429,11 +370,10 @@ class ClassificationService:
             "incurred_date": self._iso_date_text(incurred_date),
             "final_date": self._iso_date_text(final_date),
             "actual_settlement_date": self._iso_date_text(actual_settlement_date),
-            "group_number": str(group_number) if group_number is not None else "",
         }
-        
+
         # R000: 前置排除
-        if self._normalize_text_key(record_type) == "SHARING": 
+        if self._normalize_text_key(record_type) == "SHARING":
             return self._decision("R000", evidence=evidence)
 
         # P0: 全时段文本最高优先级 - General Condition 判定
@@ -445,12 +385,16 @@ class ClassificationService:
         final_dt = self._normalize_date_value(final_date)
         tbd_dt = self._normalize_date_value(tbd_acceptance_date)
         event_dt = incurred_dt or final_dt
-        
-        # 只要 Final Date 或 Incurred Date 任何一个实际跨过结算线，才进入结算后逻辑。
+
+        # 核心修正：
+        # 只要 Final Date 或 Incurred Date 任何一个跨过了结算线（或进入2026年硬边界），就进入结算后逻辑
         is_after_settlement = False
         if event_dt is not None:
             if actual_dt is not None and event_dt >= actual_dt:
                 is_after_settlement = True
+            elif event_dt.year >= 2026:
+                is_after_settlement = True
+                evidence["is_after_settlement_by_year_boundary"] = True
 
         if not is_after_settlement:
             category, rule_id = self._classify_before_actual_settlement(unit_code, vendor, statuses)
@@ -458,12 +402,12 @@ class ClassificationService:
 
         # 第三类：结算后逻辑 (After Settlement)
         # 1. R201: ACC (仅有 Final Date)
-        if final_dt is not None and incurred_dt is None: 
+        if final_dt is not None and incurred_dt is None:
             return self._decision("R201", evidence=evidence)
-        
+
         # 2. R202: RACC 配对 (Final Detail 端)
         pair_key = self._make_final_detail_pair_key(vendor, activity_no, amount, cost_code)
-        if pair_key in paired_racc_keys: 
+        if pair_key in paired_racc_keys:
             return self._decision("R202", evidence={**evidence, "pair_key": list(pair_key)})
 
         # 3. R203: TBD (日期 > TBD 接收日 且 Scoping J列=6)
@@ -471,9 +415,9 @@ class ClassificationService:
             return self._decision("R203", evidence=evidence)
 
         # 4. R204: RACC2 (发生日 <= 保修到期日 且 符合 ROE 特征)
-        if event_dt and group_warranty_expiry is not None and event_dt <= group_warranty_expiry:
+        if event_dt and self.warranty_expiry_date and event_dt <= self.warranty_expiry_date:
             if 1 in statuses or 2 in statuses:
-                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(group_warranty_expiry)})
+                return self._decision("R204", evidence={**evidence, "warranty_expiry": self._iso_date_text(self.warranty_expiry_date)})
 
         # 5. R205: EXP 兜底
         return self._decision("R205", evidence=evidence)
@@ -607,7 +551,7 @@ class ClassificationService:
             unit_code = unit_codes[i]
             amount_val = amounts[i]
             group_number = self._extract_tail_int(cost_code, 3)
-            
+
             statuses = scoping_status_map.get(int(group_number), set()) if group_number is not None else set()
             unit_schedule = self._resolve_unit_budget_schedule(unit_schedule_map, unit_code)
             decision = self._classify_payable_record(
