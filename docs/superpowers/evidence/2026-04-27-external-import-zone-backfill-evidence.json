@@ -1,0 +1,50 @@
+{
+  "status": "BACKFILLED",
+  "scope": "External Import staging semantic import zone metadata only",
+  "spreadsheet_id": "1g17SLJDKIT9rM5Vi4xQoD_pa4byvDPE6gJvRwi5bQDw",
+  "backfill_operation": "backfill_external_import_zones",
+  "metadata_request_count": 14,
+  "verified_zone_count": 7,
+  "verified_zones": [
+    {
+      "sheet": "Unit Budget",
+      "source_role": "unit_budget",
+      "zone_key": "external_import.unit_budget_raw"
+    },
+    {
+      "sheet": "Payable",
+      "source_role": "payable",
+      "zone_key": "external_import.payable_raw"
+    },
+    {
+      "sheet": "Final Detail",
+      "source_role": "final_detail",
+      "zone_key": "external_import.final_detail_raw"
+    },
+    {
+      "sheet": "Draw request report",
+      "source_role": "draw_request",
+      "zone_key": "external_import.draw_request_raw"
+    },
+    {
+      "sheet": "Draw Invoice List",
+      "source_role": "draw_invoice_list",
+      "zone_key": "external_import.draw_invoice_list_raw"
+    },
+    {
+      "sheet": "Transfer Log",
+      "source_role": "transfer_log",
+      "zone_key": "external_import.transfer_log_raw"
+    },
+    {
+      "sheet": "Change Order Log",
+      "source_role": "change_order_log",
+      "zone_key": "external_import.change_order_log_raw"
+    }
+  ],
+  "safety_notes": [
+    "Only Google Sheets developerMetadata delete/create requests were sent.",
+    "No values clear/update, formulas, reclassify, audit sync, formula sync, or durable cutover paths were executed.",
+    "External import production write path coordinate scan returned no matches."
+  ]
+}

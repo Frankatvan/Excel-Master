@@ -19,7 +19,12 @@ for logic_dir in [api_dir / "logic", workspace_root / "excel-master-app" / "api"
     if logic_dir.exists() and logic_path not in sys.path:
         sys.path.insert(0, logic_path)
 
-from aiwb_finance.finance_engine import get_sheets_service, initialize_project_workbook, run_validate_input_data
+from aiwb_finance.finance_engine import (
+    _build_external_import_zone_metadata_requests,
+    get_sheets_service,
+    initialize_project_workbook,
+    run_validate_input_data,
+)
 from aiwb_finance.finance_utils import _get_service_account_info, _safe_string
 
 
@@ -178,6 +183,37 @@ def sanitize_project_data(
     )
 
 
+def backfill_external_import_zone_metadata(*, sheets_service, spreadsheet_id: str) -> Dict[str, Any]:
+    requests = _build_external_import_zone_metadata_requests(sheets_service, spreadsheet_id)
+    if requests:
+        sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+
+    zone_keys = []
+    source_roles = []
+    for request in requests:
+        metadata = request.get("createDeveloperMetadata", {}).get("developerMetadata", {})
+        metadata_value = metadata.get("metadataValue")
+        if not metadata_value:
+            continue
+        try:
+            payload = json.loads(metadata_value)
+        except Exception:
+            continue
+        zone_key = _safe_string(payload.get("zone_key"))
+        source_role = _safe_string(payload.get("source_role"))
+        if zone_key:
+            zone_keys.append(zone_key)
+        if source_role:
+            source_roles.append(source_role)
+
+    return {
+        "external_import_zone_metadata_request_count": len(requests),
+        "external_import_zone_count": len(zone_keys),
+        "zone_keys": zone_keys,
+        "source_roles": source_roles,
+    }
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         worker_secret = self._resolve_worker_secret()
@@ -201,6 +237,31 @@ class handler(BaseHTTPRequestHandler):
 
         operation = self._read_optional_string(data, "operation") or "bootstrap"
         spreadsheet_id = self._read_optional_string(data, "spreadsheet_id")
+
+        if operation == "backfill_external_import_zones":
+            if not spreadsheet_id:
+                self._send_error(400, "Missing required fields: spreadsheet_id")
+                return
+
+            try:
+                service = get_sheets_service()
+                summary = backfill_external_import_zone_metadata(
+                    sheets_service=service,
+                    spreadsheet_id=spreadsheet_id,
+                )
+            except Exception as error:
+                self._send_error(500, f"Processing failed: {error}")
+                return
+
+            self._send_json(
+                200,
+                {
+                    "status": "success",
+                    "spreadsheet_id": spreadsheet_id,
+                    "summary": summary,
+                },
+            )
+            return
 
         if operation == "validate_input":
             if not spreadsheet_id:

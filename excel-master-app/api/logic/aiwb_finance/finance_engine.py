@@ -2561,7 +2561,6 @@ def _build_delete_external_import_zone_metadata_request(sheet_id: int) -> Dict[s
             "dataFilter": {
                 "developerMetadataLookup": {
                     "metadataKey": IMPORT_ZONE_METADATA_KEY,
-                    "locationType": "SHEET",
                     "locationMatchingStrategy": "EXACT_LOCATION",
                     "metadataLocation": {"sheetId": int(sheet_id)},
                 }

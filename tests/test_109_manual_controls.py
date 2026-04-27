@@ -126,6 +126,12 @@ class Manual109ControlsTests(unittest.TestCase):
         self.assertEqual(14, len(requests))
         self.assertTrue(all("deleteDeveloperMetadata" in request for request in requests[:7]))
         self.assertTrue(all("createDeveloperMetadata" in request for request in requests[7:]))
+        delete_lookups = [
+            request["deleteDeveloperMetadata"]["dataFilter"]["developerMetadataLookup"]
+            for request in requests[:7]
+        ]
+        self.assertTrue(all("locationType" not in lookup for lookup in delete_lookups))
+        self.assertTrue(all(lookup["locationMatchingStrategy"] == "EXACT_LOCATION" for lookup in delete_lookups))
 
         created_by_source_role = {}
         for request in requests[7:]:
@@ -144,6 +150,18 @@ class Manual109ControlsTests(unittest.TestCase):
                 "change_order_log",
             },
             set(created_by_source_role),
+        )
+        self.assertEqual(
+            {
+                "external_import.payable_raw",
+                "external_import.final_detail_raw",
+                "external_import.unit_budget_raw",
+                "external_import.draw_request_raw",
+                "external_import.draw_invoice_list_raw",
+                "external_import.transfer_log_raw",
+                "external_import.change_order_log_raw",
+            },
+            {payload["zone_key"] for _metadata, payload in created_by_source_role.values()},
         )
 
         payable_metadata, payable_payload = created_by_source_role["payable"]
