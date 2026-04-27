@@ -306,8 +306,9 @@ class ClassificationService:
 
     def _build_scoping_status_map(self, wss: pd.DataFrame) -> Dict[int, set[int]]:
         group_col = self._find_col_in_row(wss, 0, "Group Number") or 2
+        final_gmp_col = self._find_col_in_row(wss, 0, "Final GMP")
         status_cols = {
-            1: self._find_col_in_row(wss, 0, "GMP") or 4,
+            1: final_gmp_col or self._find_col_in_row(wss, 0, "GMP") or 4,
             2: self._find_col_in_row(wss, 0, "Fee") or 5,
             3: self._find_col_in_row(wss, 0, "WIP") or 6,
             4: self._find_col_in_row(wss, 0, "WTC") or 7,
