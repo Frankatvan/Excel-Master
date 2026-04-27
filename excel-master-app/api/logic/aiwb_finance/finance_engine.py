@@ -2363,40 +2363,61 @@ def _build_unit_master_manual_input_ranges(row_count: int) -> List[str]:
     ]
 
 
-def _build_external_sheet_edit_specs() -> Dict[str, Dict[str, List[str]]]:
+def _build_external_sheet_edit_specs() -> Dict[str, Dict[str, Any]]:
     return {
         "Contract": {"editable_ranges": ["'Contract'!A:ZZ"], "clear_ranges": ["'Contract'!A:ZZ"]},
         "Unit Budget": {
+            "zone_key": "external_import.unit_budget_raw",
+            "source_role": "unit_budget",
+            "sheet_role": "Unit Budget",
             "editable_ranges": ["'Unit Budget'!S:ZZ"],
             "filter_header_ranges": ["'Unit Budget'!A1:ZZ1"],
             "clear_ranges": ["'Unit Budget'!S:ZZ"],
         },
         "Payable": {
+            "zone_key": "external_import.payable_raw",
+            "source_role": "payable",
+            "sheet_role": "Payable",
             "editable_ranges": ["'Payable'!L:AZ"],
             "filter_header_ranges": ["'Payable'!A1:ZZ1"],
             "clear_ranges": ["'Payable'!A2:ZZ"],
         },
         "Final Detail": {
+            "zone_key": "external_import.final_detail_raw",
+            "source_role": "final_detail",
+            "sheet_role": "Final Detail",
             "editable_ranges": ["'Final Detail'!N:AL"],
             "filter_header_ranges": ["'Final Detail'!A1:ZZ1"],
             "clear_ranges": ["'Final Detail'!A2:ZZ"],
         },
         "Draw request report": {
+            "zone_key": "external_import.draw_request_raw",
+            "source_role": "draw_request",
+            "sheet_role": "Draw request report",
             "editable_ranges": ["'Draw request report'!H:AR"],
             "filter_header_ranges": ["'Draw request report'!A1:ZZ2"],
             "clear_ranges": ["'Draw request report'!A3:ZZ"],
         },
         "Draw Invoice List": {
+            "zone_key": "external_import.draw_invoice_list_raw",
+            "source_role": "draw_invoice_list",
+            "sheet_role": "Draw Invoice List",
             "editable_ranges": ["'Draw Invoice List'!G:AE"],
             "filter_header_ranges": ["'Draw Invoice List'!A4:ZZ4"],
             "clear_ranges": ["'Draw Invoice List'!A5:ZZ"],
         },
         "Transfer Log": {
+            "zone_key": "external_import.transfer_log_raw",
+            "source_role": "transfer_log",
+            "sheet_role": "Transfer Log",
             "editable_ranges": ["'Transfer Log'!G:Z"],
             "filter_header_ranges": ["'Transfer Log'!A4:ZZ4"],
             "clear_ranges": ["'Transfer Log'!A5:ZZ"],
         },
         "Change Order Log": {
+            "zone_key": "external_import.change_order_log_raw",
+            "source_role": "change_order_log",
+            "sheet_role": "Change Order Log",
             "editable_ranges": ["'Change Order Log'!G:AE"],
             "filter_header_ranges": ["'Change Order Log'!A4:ZZ4"],
             "clear_ranges": ["'Change Order Log'!A5:ZZ"],
@@ -2517,13 +2538,132 @@ def _hide_system_log_sheet(service, spreadsheet_id: str) -> bool:
 
 
 def _apply_external_sheet_controls(service, spreadsheet_id: str) -> Dict[str, Any]:
-    requests = _build_external_sheet_protection_requests(service, spreadsheet_id)
+    protection_requests = _build_external_sheet_protection_requests(service, spreadsheet_id)
+    metadata_requests = _build_external_import_zone_metadata_requests(service, spreadsheet_id)
+    requests = protection_requests + metadata_requests
     if requests:
         service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
     return {
-        "external_protection_request_count": len(requests),
+        "external_protection_request_count": len(protection_requests),
+        "external_import_zone_metadata_request_count": len(metadata_requests),
         "log_hidden": _hide_system_log_sheet(service, spreadsheet_id),
     }
+
+
+IMPORT_ZONE_METADATA_KEY = "aiwb.import_zone"
+IMPORT_ZONE_CAPACITY_POLICY = "expand_within_managed_sheet"
+IMPORT_ZONE_HEADER_SIGNATURE_POLICY = "required_semantic_headers"
+
+
+def _build_delete_external_import_zone_metadata_request(sheet_id: int) -> Dict[str, Any]:
+    return {
+        "deleteDeveloperMetadata": {
+            "dataFilter": {
+                "developerMetadataLookup": {
+                    "metadataKey": IMPORT_ZONE_METADATA_KEY,
+                    "locationType": "SHEET",
+                    "locationMatchingStrategy": "EXACT_LOCATION",
+                    "metadataLocation": {"sheetId": int(sheet_id)},
+                }
+            }
+        }
+    }
+
+
+def _build_external_import_zone_grid_range(
+    range_ref: str,
+    *,
+    sheet_id: int,
+    row_count: int,
+) -> Dict[str, int]:
+    normalized = _normalize_formula_range(range_ref)
+    ref = normalized.split("!", 1)[1] if "!" in normalized else normalized
+    end_row = max(int(row_count or 0), 1)
+
+    col_only = re.fullmatch(r"([A-Z]+):([A-Z]+)", ref)
+    if col_only:
+        return {
+            "sheetId": int(sheet_id),
+            "startRowIndex": 0,
+            "endRowIndex": end_row,
+            "startColumnIndex": _column_a1_to_number(col_only.group(1)) - 1,
+            "endColumnIndex": _column_a1_to_number(col_only.group(2)),
+        }
+
+    open_ended = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)", ref)
+    if open_ended:
+        start_row = int(open_ended.group(2)) - 1
+        return {
+            "sheetId": int(sheet_id),
+            "startRowIndex": start_row,
+            "endRowIndex": max(end_row, start_row + 1),
+            "startColumnIndex": _column_a1_to_number(open_ended.group(1)) - 1,
+            "endColumnIndex": _column_a1_to_number(open_ended.group(3)),
+        }
+
+    return _a1_to_grid_range(normalized, sheet_id)
+
+
+def _external_import_zone_grid_fingerprint(zone_key: str, grid_range: Mapping[str, Any]) -> str:
+    return ":".join(
+        [
+            _safe_string(zone_key),
+            _safe_string(grid_range.get("sheetId")),
+            _safe_string(grid_range.get("startRowIndex")),
+            _safe_string(grid_range.get("startColumnIndex")),
+            _safe_string(grid_range.get("endRowIndex")),
+            _safe_string(grid_range.get("endColumnIndex")),
+        ]
+    )
+
+
+def _build_external_import_zone_metadata_requests(service, spreadsheet_id: str) -> List[Dict[str, Any]]:
+    requests: List[Dict[str, Any]] = []
+    create_requests: List[Dict[str, Any]] = []
+    for sheet_name, spec in _build_external_sheet_edit_specs().items():
+        zone_key = _safe_string(spec.get("zone_key"))
+        source_role = _safe_string(spec.get("source_role"))
+        sheet_role = _safe_string(spec.get("sheet_role")) or sheet_name
+        if not zone_key or not source_role:
+            continue
+
+        metadata = _compat_global("_get_sheet_metadata")(service, spreadsheet_id, sheet_name)
+        sheet_id = int(metadata["sheet_id"])
+        grid_range = _build_external_import_zone_grid_range(
+            (spec.get("clear_ranges") or [""])[0],
+            sheet_id=sheet_id,
+            row_count=int(metadata.get("row_count") or 0),
+        )
+        payload = {
+            "zone_key": zone_key,
+            "source_role": source_role,
+            "sheet_role": sheet_role,
+            "managed_by": "AiWB",
+            "schema_version": 1,
+            "capacity_policy": IMPORT_ZONE_CAPACITY_POLICY,
+            "header_signature_policy": IMPORT_ZONE_HEADER_SIGNATURE_POLICY,
+            "start_row_index": int(grid_range.get("startRowIndex", 0)),
+            "start_column_index": int(grid_range.get("startColumnIndex", 0)),
+            "end_row_index": int(grid_range.get("endRowIndex", max(int(metadata.get("row_count") or 0), 1))),
+            "end_column_index": int(grid_range.get("endColumnIndex", int(metadata.get("column_count") or 0))),
+        }
+        payload["grid_fingerprint"] = _external_import_zone_grid_fingerprint(zone_key, grid_range)
+
+        requests.append(_build_delete_external_import_zone_metadata_request(sheet_id))
+        create_requests.append(
+            {
+                "createDeveloperMetadata": {
+                    "developerMetadata": {
+                        "metadataKey": IMPORT_ZONE_METADATA_KEY,
+                        "metadataValue": json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        "visibility": "DOCUMENT",
+                        "location": {"sheetId": sheet_id},
+                    }
+                }
+            }
+        )
+    requests.extend(create_requests)
+    return requests
 
 
 def _a1_to_grid_range_flexible(a1: str, sheet_id: int, column_count: int | None = None) -> Dict[str, int]:

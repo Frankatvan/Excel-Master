@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 
 import { getServerSession } from "next-auth/next";
 
+import { getExternalImportStatus } from "@/lib/external-import/import-manifest-service";
 import { ProjectAccessError, requireProjectAccess } from "@/lib/project-access";
 import { authOptions } from "../auth/[...nextauth]";
 
@@ -34,12 +35,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await requireProjectAccess(spreadsheetId, session.user.email);
 
-    return res.status(200).json({
-      spreadsheet_id: spreadsheetId,
-      job_id: readQueryString(req, "job_id") ?? null,
-      status: "not_started",
-      manifest_items: [],
+    const status = await getExternalImportStatus({
+      spreadsheetId,
+      jobId: readQueryString(req, "job_id"),
     });
+
+    return res.status(200).json(status);
   } catch (error) {
     if (error instanceof ProjectAccessError) {
       return res.status(error.statusCode).json({ error: error.message, code: error.code });

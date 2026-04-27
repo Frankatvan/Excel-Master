@@ -1,6 +1,8 @@
+import json
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -98,6 +100,67 @@ class Manual109ControlsTests(unittest.TestCase):
         self.assertFalse(payload["warningOnly"])
         self.assertEqual(["robot@example.com"], payload["editors"]["users"])
         self.assertEqual(2, len(payload["unprotectedRanges"]))
+
+    def test_build_external_import_zone_metadata_requests_replaces_seven_zone_markers(self):
+        sheet_ids = {
+            "Payable": 101,
+            "Final Detail": 102,
+            "Unit Budget": 103,
+            "Draw request report": 104,
+            "Draw Invoice List": 105,
+            "Transfer Log": 106,
+            "Change Order Log": 107,
+        }
+
+        def fake_get_sheet_metadata(_service, _spreadsheet_id, sheet_name):
+            return {
+                "sheet_id": sheet_ids[sheet_name],
+                "row_count": 20000,
+                "column_count": 50,
+                "protected_ranges": [],
+            }
+
+        with patch.object(fe, "_get_sheet_metadata", side_effect=fake_get_sheet_metadata):
+            requests = fe._build_external_import_zone_metadata_requests(object(), "spreadsheet-123")
+
+        self.assertEqual(14, len(requests))
+        self.assertTrue(all("deleteDeveloperMetadata" in request for request in requests[:7]))
+        self.assertTrue(all("createDeveloperMetadata" in request for request in requests[7:]))
+
+        created_by_source_role = {}
+        for request in requests[7:]:
+            metadata = request["createDeveloperMetadata"]["developerMetadata"]
+            payload = json.loads(metadata["metadataValue"])
+            created_by_source_role[payload["source_role"]] = (metadata, payload)
+
+        self.assertEqual(
+            {
+                "payable",
+                "final_detail",
+                "unit_budget",
+                "draw_request",
+                "draw_invoice_list",
+                "transfer_log",
+                "change_order_log",
+            },
+            set(created_by_source_role),
+        )
+
+        payable_metadata, payable_payload = created_by_source_role["payable"]
+        self.assertEqual("aiwb.import_zone", payable_metadata["metadataKey"])
+        self.assertEqual("DOCUMENT", payable_metadata["visibility"])
+        self.assertEqual({"sheetId": 101}, payable_metadata["location"])
+        self.assertEqual("external_import.payable_raw", payable_payload["zone_key"])
+        self.assertEqual("Payable", payable_payload["sheet_role"])
+        self.assertEqual("AiWB", payable_payload["managed_by"])
+        self.assertEqual(1, payable_payload["schema_version"])
+        self.assertEqual("expand_within_managed_sheet", payable_payload["capacity_policy"])
+        self.assertEqual("required_semantic_headers", payable_payload["header_signature_policy"])
+        self.assertEqual(1, payable_payload["start_row_index"])
+        self.assertEqual(0, payable_payload["start_column_index"])
+        self.assertEqual(20000, payable_payload["end_row_index"])
+        self.assertEqual(702, payable_payload["end_column_index"])
+        self.assertEqual("external_import.payable_raw:101:1:0:20000:702", payable_payload["grid_fingerprint"])
 
 
 if __name__ == "__main__":
