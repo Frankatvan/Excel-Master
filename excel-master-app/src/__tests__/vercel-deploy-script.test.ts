@@ -6,10 +6,11 @@ import path from "path";
 const projectRoot = path.resolve(__dirname, "../..");
 const scriptPath = path.join(projectRoot, "scripts/vercel_deploy.mjs");
 
-function runDeployScript(env: NodeJS.ProcessEnv, args = ["--prod", "--dry-run"]) {
+function runDeployScript(env: Record<string, string | undefined>, args = ["--prod", "--dry-run"]) {
   return spawnSync(process.execPath, [scriptPath, ...args], {
     cwd: env.AIWB_DEPLOY_PROJECT_ROOT || projectRoot,
     env: {
+      NODE_ENV: "test",
       PATH: process.env.PATH || "",
       HOME: process.env.HOME || "",
       ...env,
@@ -31,22 +32,49 @@ describe("vercel deploy script", () => {
   });
 
   it("prints a redacted production pull/deploy plan in dry-run mode", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aiwb-deploy-dry-run-"));
+    fs.mkdirSync(path.join(tempRoot, ".vercel"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRoot, ".vercel", "project.json"),
+      JSON.stringify({ projectName: "excel-master-app", projectId: "prj_test", orgId: "team_test" }),
+    );
+    fs.writeFileSync(
+      path.join(tempRoot, ".env.local"),
+      [
+        "NEXTAUTH_URL=https://audit.frankzh.top",
+        "NEXTAUTH_SECRET=secret",
+        "NEXT_PUBLIC_SUPABASE_URL=https://supabase.example.com",
+        "NEXT_PUBLIC_SUPABASE_ANON_KEY=anon",
+        "SUPABASE_SERVICE_ROLE_KEY=service",
+        "GOOGLE_CLIENT_ID=client-id",
+        "GOOGLE_CLIENT_SECRET=client-secret",
+        "GOOGLE_CLIENT_EMAIL=service@example.com",
+        "GOOGLE_PRIVATE_KEY=private-key",
+        "GOOGLE_SHEET_ID=sheet-id",
+        "GOOGLE_SHEET_TEMPLATE_ID=template-id",
+        "AIWB_WORKER_SECRET=worker-secret",
+      ].join("\n"),
+    );
+
     const result = runDeployScript({
+      AIWB_DEPLOY_PROJECT_ROOT: tempRoot,
       VERCEL_TOKEN: "vcp_test_token_for_dry_run_only",
       VERCEL_OIDC_TOKEN: "",
       AIWB_DEPLOY_GIT_DIR: "/tmp/aiwb-vercel-git-disabled-test",
     });
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("syncing 11 required env vars to production");
+    expect(result.stdout).toContain("syncing 12 required env vars to production");
     expect(result.stdout).toContain("would sync NEXTAUTH_URL to production");
     expect(result.stdout).toContain("would sync GOOGLE_SHEET_TEMPLATE_ID to production");
+    expect(result.stdout).toContain("would sync AIWB_WORKER_SECRET to production");
     expect(result.stdout).toContain("vercel@52.0.0 pull --yes --environment=production --token <redacted>");
     expect(result.stdout).toContain("vercel@52.0.0 deploy --archive=tgz --prod --yes --token <redacted>");
     expect(result.stdout).not.toContain("--prebuilt");
     expect(result.stdout).toContain("with Git metadata disabled");
     expect(result.stdout).toContain("NPM_CONFIG_CACHE=/tmp/npm-cache");
     expect(result.stdout).not.toContain("vcp_test_token_for_dry_run_only");
+    expect(result.stdout).not.toContain("worker-secret");
   });
 
   it("runs the source deploy from the project root with git metadata disabled", () => {
@@ -72,6 +100,7 @@ describe("vercel deploy script", () => {
         "GOOGLE_PRIVATE_KEY=private-key",
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
+        "AIWB_WORKER_SECRET=worker-secret",
       ].join("\n"),
     );
     fs.writeFileSync(
@@ -125,6 +154,7 @@ describe("vercel deploy script", () => {
         "GOOGLE_PRIVATE_KEY=private-key",
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
+        "AIWB_WORKER_SECRET=worker-secret",
       ].join("\n"),
     );
     fs.writeFileSync(
@@ -175,6 +205,7 @@ describe("vercel deploy script", () => {
         "GOOGLE_PRIVATE_KEY=private-key",
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
+        "AIWB_WORKER_SECRET=worker-secret",
       ].join("\n"),
     );
 
@@ -210,6 +241,7 @@ describe("vercel deploy script", () => {
       "GOOGLE_PRIVATE_KEY=private-key",
       "GOOGLE_SHEET_ID=sheet-id",
       "GOOGLE_SHEET_TEMPLATE_ID=template-id",
+      "AIWB_WORKER_SECRET=worker-secret",
     ].join("\n");
     fs.writeFileSync(path.join(tempRoot, ".env.local"), validLocalEnv);
     fs.writeFileSync(

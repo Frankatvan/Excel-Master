@@ -51,6 +51,27 @@ describe("deployment packaging guardrails", () => {
     );
   });
 
+  it("declares enough runtime for validate input action and bootstrap worker", () => {
+    const projectRoot = path.resolve(__dirname, "../..");
+    const vercelConfigPath = path.join(projectRoot, "vercel.json");
+
+    expect(fs.existsSync(vercelConfigPath)).toBe(true);
+
+    const vercelConfig = JSON.parse(fs.readFileSync(vercelConfigPath, "utf8"));
+    const functions = vercelConfig.functions || {};
+
+    expect(functions).toEqual(
+      expect.objectContaining({
+        "src/pages/api/projects/action.ts": expect.objectContaining({
+          maxDuration: expect.any(Number),
+        }),
+        "api/project_bootstrap.py": expect.objectContaining({
+          maxDuration: expect.any(Number),
+        }),
+      }),
+    );
+  });
+
   it("includes a migration for project serial metadata columns", () => {
     const projectRoot = path.resolve(__dirname, "../..");
     const migrationsDir = path.join(projectRoot, "supabase/migrations");

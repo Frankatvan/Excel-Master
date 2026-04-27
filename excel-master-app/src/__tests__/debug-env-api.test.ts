@@ -28,7 +28,7 @@ describe("/api/debug-env", () => {
     process.env.GOOGLE_PROJECT_ID = "project-id";
     process.env.GOOGLE_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----";
     process.env.GOOGLE_CLIENT_EMAIL = "worker@example.iam.gserviceaccount.com";
-    process.env.RECLASSIFY_WORKER_URL = "https://worker.example.com/api/reclassify_job";
+    process.env.RECLASSIFY_WORKER_URL = "https://worker.example.com/api/internal/reclassify_job";
     process.env.VERCEL_GIT_COMMIT_SHA = "abcdef1234567890";
     process.env.VERCEL_ENV = "production";
 

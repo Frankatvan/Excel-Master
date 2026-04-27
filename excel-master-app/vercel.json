@@ -6,7 +6,23 @@
   "regions": ["sfo1"],
   "outputDirectory": ".next",
   "functions": {
-    "api/reclassify_job.py": {
+    "src/pages/api/audit_sync.ts": {
+      "maxDuration": 60,
+      "regions": ["sfo1"]
+    },
+    "src/pages/api/projects/action.ts": {
+      "maxDuration": 60,
+      "regions": ["sfo1"]
+    },
+    "api/formula_sync.py": {
+      "maxDuration": 60,
+      "regions": ["sfo1"]
+    },
+    "api/project_bootstrap.py": {
+      "maxDuration": 60,
+      "regions": ["sfo1"]
+    },
+    "api/internal/reclassify_job.py": {
       "maxDuration": 60,
       "regions": ["sfo1"]
     }

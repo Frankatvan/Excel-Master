@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 
+import { BUNDLED_INTERNAL_COMPANIES } from "@/lib/internal-company-seed";
 import { DEFAULT_SUPABASE_URL } from "@/lib/project-registry";
 
 export type InternalCompanyRegistryRow = {
@@ -61,6 +62,22 @@ function getSupabaseAdminClient() {
   return createClient(supabaseUrl, serviceRoleKey);
 }
 
+function isMissingInternalCompaniesTableError(error: unknown) {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: string }).code === "PGRST205"
+  );
+}
+
+function getBundledInternalCompanies(): InternalCompanyRegistryRow[] {
+  return BUNDLED_INTERNAL_COMPANIES.map((row) => ({
+    company_name: row.company_name,
+    normalized_name: row.normalized_name,
+  }));
+}
+
 export async function readInternalCompanies(): Promise<InternalCompanyRegistryRow[]> {
   const supabase = getSupabaseAdminClient();
   const { data, error } = await supabase
@@ -69,11 +86,22 @@ export async function readInternalCompanies(): Promise<InternalCompanyRegistryRo
     .order("company_name", { ascending: true });
 
   if (error) {
+    if (isMissingInternalCompaniesTableError(error)) {
+      console.warn("[Audit] internal_companies table is missing. Falling back to bundled registry.");
+      return getBundledInternalCompanies();
+    }
     throw error;
   }
 
-  return (data || []).map((row) => ({
+  const rows = (data || []).map((row) => ({
     company_name: row.company_name,
     normalized_name: row.normalized_name,
   }));
+
+  if (rows.length === 0) {
+    console.warn("[Audit] internal_companies table is empty. Falling back to bundled registry.");
+    return getBundledInternalCompanies();
+  }
+
+  return rows;
 }

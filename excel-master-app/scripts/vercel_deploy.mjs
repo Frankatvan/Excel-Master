@@ -22,6 +22,7 @@ const REQUIRED_ENV_KEYS = [
   "GOOGLE_PRIVATE_KEY",
   "GOOGLE_SHEET_ID",
   "GOOGLE_SHEET_TEMPLATE_ID",
+  "AIWB_WORKER_SECRET",
 ];
 
 function parseArgs(argv) {

@@ -48,6 +48,7 @@ async function verify() {
     const res = await drive.permissions.list({
       fileId: googleSheetId,
       fields: "permissions(emailAddress,role)",
+      supportsAllDrives: true,
     });
 
     const permissions = res.data.permissions || [];
