@@ -1,27 +1,27 @@
 # External Data Import Design
 
 Date: 2026-04-27
-Status: Approved for implementation planning
+Status: Superseded for implementation by `docs/superpowers/plans/2026-04-27-external-import-permission-durable-jobs.md`
 
 ## Goal
 
-Replace manual copy/paste of external database exports with a controlled import flow inside AiWB. The importer must support repeated partial uploads, write each source table into the correct workbench offset range, and automatically run input validation after each successful write.
+Replace manual copy/paste of external database exports with a controlled import flow inside AiWB. The importer must support repeated partial uploads, write each source table into the correct semantic import zone, and automatically run input validation after each successful write.
 
 ## Background
 
-The current workbench already separates internal AiWB calculation/classification columns from externally imported raw data columns. This means imports must not overwrite each sheet from `A1`. They must write into the existing external-data zones:
+The current workbench already separates internal AiWB calculation/classification columns from externally imported raw data columns. This means imports must not overwrite each sheet from the top-left corner. They must resolve and write to AiWB-managed semantic import zones from spreadsheet developer metadata.
 
-| Source table | Workbench target | Raw write start |
-| --- | --- | --- |
-| Payable | `Payable` | `L1` |
-| Final Detail | `Final Detail` | `N1` |
-| Unit Budget | `Unit Budget` | `S1` |
-| Draw request report | `Draw request report` | `H1` |
-| Draw Invoice List | `Draw Invoice List` | `G1` |
-| Transfer Log | `Transfer Log` | `G1` |
-| Change Order Log | `Change Order Log` | `G1` |
+| Source table | Semantic import zone |
+| --- | --- |
+| Payable | `external_import.payable_raw` |
+| Final Detail | `external_import.final_detail_raw` |
+| Unit Budget | `external_import.unit_budget_raw` |
+| Draw request report | `external_import.draw_request_report_raw` |
+| Draw Invoice List | `external_import.draw_invoice_list_raw` |
+| Transfer Log | `external_import.transfer_log_raw` |
+| Change Order Log | `external_import.change_order_log_raw` |
 
-This offset is the main reason copy/paste is error-prone.
+These managed zones are the main reason copy/paste is error-prone: the target is semantic to the system but easy for humans to misplace manually.
 
 ## Source Workbook Discovery
 
@@ -42,10 +42,10 @@ For `_Draw request report_*.xlsx`, only the `Draw request report` sheet is impor
 1. User uploads one or more Excel files from the project page.
 2. The backend creates an import job and parses each workbook.
 3. The parser detects which import roles are present.
-4. The UI shows a preview: source file, detected sheet, target range, row count, column count, amount total, header signature, and validation warnings.
+4. The UI shows a preview: source file, detected sheet, target zone, row count, column count, amount total, header signature, and validation warnings.
 5. User confirms the import.
-6. The backend clears only the target raw-data range for each detected table.
-7. The backend writes the parsed data into the matching offset range in Google Sheets.
+6. The backend resolves the semantic target zone from developer metadata and clears only that managed raw-data zone for each detected table.
+7. The backend writes the parsed data into the matching semantic zone in Google Sheets.
 8. The backend automatically runs the existing `validate_input` operation.
 9. The project stage advances only if validation succeeds.
 
@@ -65,7 +65,7 @@ Validation always runs against the full current project state, not just the newl
 
 ## Manifest
 
-Each project keeps an external import manifest. First implementation should store it in a hidden Google Sheet named `AiWB_External_Import_Manifest` so the audit trail travels with the workbook. Supabase mirroring can be added later for multi-project dashboards.
+Each project keeps an external import manifest in Supabase durable job tables. The manifest and durable job record are a single logical truth source; the workbook must not contain a hidden workbook-local manifest, and there is no later secondary copy step.
 
 Manifest fields:
 
@@ -82,11 +82,12 @@ Manifest fields:
 | `row_count` | Imported row count |
 | `column_count` | Imported column count |
 | `amount_total` | Total of the detected amount column, where applicable |
-| `target_range` | Google Sheet range written |
+| `target_zone_key` | Semantic import zone written |
+| `resolved_zone_fingerprint` | Fingerprint of the resolved developer-metadata zone |
 | `status` | `parsed`, `imported`, `validated`, `failed`, or `stale` |
 | `validation_message` | Human-readable validation summary |
 
-The manifest supports partial re-upload by preserving the last known version of every external source table.
+The manifest supports partial re-upload by preserving the last known version of every external source table. A successful later upload for the same source table supersedes the previous active manifest item while keeping prior versions auditable as stale/history; a failed later upload does not replace the last validated version.
 
 ## Validation Rules
 
@@ -101,7 +102,7 @@ Pre-write validation prevents obvious bad uploads before touching the project wo
 - Amount columns parse as numeric where required.
 - Date fields are recognizable where required.
 - Duplicate file hash is flagged before writing.
-- Target range is known and compatible with the detected table width.
+- Target semantic zone is known and compatible with the detected table width.
 
 ### Post-write validation
 
@@ -170,9 +171,9 @@ Included:
 - Source detection by headers and sheet names.
 - Draw request report single-sheet extraction.
 - Preview and user confirmation.
-- Offset-aware writes into existing workbench raw-data zones.
+- Semantic-zone writes into existing workbench raw-data zones.
 - Automatic `validate_input` after successful write.
-- Hidden-sheet manifest.
+- Supabase durable job and import manifest records as the only persisted audit truth.
 - User-visible import status and validation result.
 
 Out of scope for MVP:
@@ -187,7 +188,7 @@ Out of scope for MVP:
 
 - A user can upload only Payable and the system replaces only Payable's raw import zone.
 - A user can upload `_Draw request report_*.xlsx` and only the `Draw request report` sheet is imported.
-- A user can upload all known files in one job and all detected tables write to the correct offset ranges.
+- A user can upload all known files in one job and all detected tables write to the correct semantic zones.
 - Every successful write automatically triggers `validate_input`.
 - Project stage advances to `external_data_ready` only after validation succeeds.
 - Validation failure leaves imported data visible, records failure status, and blocks the next stage.

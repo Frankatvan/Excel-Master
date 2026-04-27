@@ -99,6 +99,7 @@ describe("external import manifest service", () => {
     ]);
     expect(client.queries[0].query.operations).toEqual(
       expect.arrayContaining([
+        { name: "select", args: [expect.not.stringContaining("payload")] },
         { name: "eq", args: ["spreadsheet_id", "sheet-123"] },
         { name: "eq", args: ["job_type", "external_import"] },
         { name: "eq", args: ["id", "job-123"] },

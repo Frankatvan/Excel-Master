@@ -1,21 +1,28 @@
 import {
   classifyJobStatus,
   createJob,
+  createImportManifest,
+  createImportManifestItem,
   heartbeatJob,
   markJobCancelled,
   markJobFailed,
   markJobRunning,
   markJobSucceeded,
+  updateImportManifestItemStatus,
 } from "@/lib/job-service";
 
-function createSupabaseFake(response: { data?: unknown; error?: unknown } = { data: { id: "job-123" }, error: null }) {
+function createSupabaseFake(
+  response: { data?: unknown; error?: unknown } = { data: { id: "job-123" }, error: null },
+  options: { allowedTables?: string[] } = {},
+) {
   const single = jest.fn().mockResolvedValue(response);
   const select = jest.fn().mockReturnValue({ single });
   const eq = jest.fn().mockReturnValue({ select, single });
   const insert = jest.fn().mockReturnValue({ select });
   const update = jest.fn().mockReturnValue({ eq });
   const from = jest.fn((table: string) => {
-    if (table !== "jobs") {
+    const allowedTables = options.allowedTables ?? ["jobs"];
+    if (!allowedTables.includes(table)) {
       throw new Error(`Unexpected table: ${table}`);
     }
     return { insert, update };
@@ -138,5 +145,110 @@ describe("job-service", () => {
         { staleAfterMs: 10 * 60 * 1000 },
       ),
     ).toBe("stale");
+  });
+
+  it("creates an external import manifest linked to a durable job", async () => {
+    const fake = createSupabaseFake(
+      { data: { id: "manifest-123", job_id: "job-123", status: "parsed" }, error: null },
+      { allowedTables: ["external_import_manifests"] },
+    );
+
+    await createImportManifest(
+      {
+        jobId: "job-123",
+        projectId: "project-123",
+        spreadsheetId: "sheet-123",
+        status: "parsed",
+        importedBy: "actor@example.com",
+        resultMeta: { source_count: 2 },
+      },
+      fake.client,
+    );
+
+    expect(fake.calls.from).toHaveBeenCalledWith("external_import_manifests");
+    expect(fake.calls.insert).toHaveBeenCalledWith({
+      job_id: "job-123",
+      project_id: "project-123",
+      spreadsheet_id: "sheet-123",
+      status: "parsed",
+      imported_by: "actor@example.com",
+      imported_at: "2026-04-27T10:00:00.000Z",
+      result_meta: { source_count: 2 },
+      error: null,
+    });
+  });
+
+  it("creates and updates external import manifest items", async () => {
+    const itemFake = createSupabaseFake(
+      { data: { id: "item-123", status: "parsed" }, error: null },
+      { allowedTables: ["external_import_manifest_items"] },
+    );
+
+    await createImportManifestItem(
+      {
+        manifestId: "manifest-123",
+        jobId: "job-123",
+        projectId: "project-123",
+        spreadsheetId: "sheet-123",
+        sourceTable: "payable",
+        sourceFileName: "payable.xlsx",
+        sourceSheetName: "Payable",
+        fileHash: "file-hash",
+        headerSignature: "header-signature",
+        rowCount: 10,
+        columnCount: 5,
+        amountTotal: 1200.5,
+        targetZoneKey: "external_import.payable_raw",
+        resolvedZoneFingerprint: "zone-fingerprint",
+        status: "parsed",
+        schemaDrift: { warnings: [] },
+      },
+      itemFake.client,
+    );
+
+    expect(itemFake.calls.insert).toHaveBeenCalledWith({
+      manifest_id: "manifest-123",
+      job_id: "job-123",
+      project_id: "project-123",
+      spreadsheet_id: "sheet-123",
+      source_table: "payable",
+      source_file_name: "payable.xlsx",
+      source_sheet_name: "Payable",
+      file_hash: "file-hash",
+      header_signature: "header-signature",
+      row_count: 10,
+      column_count: 5,
+      amount_total: 1200.5,
+      target_zone_key: "external_import.payable_raw",
+      resolved_zone_fingerprint: "zone-fingerprint",
+      status: "parsed",
+      validation_message: null,
+      schema_drift: { warnings: [] },
+      result_meta: {},
+      error: null,
+    });
+
+    const updateFake = createSupabaseFake(
+      { data: { id: "item-123", status: "validated" }, error: null },
+      { allowedTables: ["external_import_manifest_items"] },
+    );
+    await updateImportManifestItemStatus(
+      {
+        itemId: "item-123",
+        status: "validated",
+        validationMessage: "ok",
+        resultMeta: { validated: true },
+      },
+      updateFake.client,
+    );
+
+    expect(updateFake.calls.update).toHaveBeenCalledWith({
+      status: "validated",
+      validation_message: "ok",
+      result_meta: { validated: true },
+      error: null,
+      imported_at: "2026-04-27T10:00:00.000Z",
+    });
+    expect(updateFake.calls.eq).toHaveBeenCalledWith("id", "item-123");
   });
 });

@@ -395,6 +395,27 @@ interface LiveSheetStatusView {
   protections: LiveSheetProtectionSummary[];
 }
 
+interface ExternalImportTableStatus {
+  detected_table: string;
+  file_name: string;
+  source_sheet: string;
+  row_count: number;
+  amount_total: number;
+  semantic_target_zone: string;
+  status: string;
+  warnings: string[];
+  blocking: string[];
+}
+
+interface ExternalImportStatusView {
+  status?: string;
+  import_job_id?: string;
+  updated_at?: string;
+  preview_hash?: string;
+  confirm_allowed?: boolean;
+  tables: ExternalImportTableStatus[];
+}
+
 const tabs = ["overview", "external-recon", "manual-input", "reclass-audit", "compare-109"] as const;
 const TAB_LABELS: Record<(typeof tabs)[number], string> = {
   overview: "总览",
@@ -909,6 +930,131 @@ function normalizeLiveSheetStatus(payload: unknown): LiveSheetStatusView | null 
   };
 }
 
+function getStringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function normalizeExternalImportTableStatus(value: unknown): ExternalImportTableStatus | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const detectedTable =
+    typeof value.detected_table === "string"
+      ? value.detected_table
+      : typeof value.source_role === "string"
+        ? value.source_role
+        : typeof value.source_table === "string"
+          ? value.source_table
+          : typeof value.table_name === "string"
+            ? value.table_name
+            : "";
+
+  return {
+    detected_table: detectedTable,
+    file_name:
+      typeof value.file_name === "string"
+        ? value.file_name
+        : typeof value.source_file_name === "string"
+          ? value.source_file_name
+          : "",
+    source_sheet:
+      typeof value.source_sheet === "string"
+        ? value.source_sheet
+        : typeof value.source_sheet_name === "string"
+          ? value.source_sheet_name
+          : "",
+    row_count: Number(value.row_count || 0),
+    amount_total: Number(value.amount_total || value.total_amount || 0),
+    semantic_target_zone:
+      typeof value.semantic_target_zone === "string"
+        ? value.semantic_target_zone
+        : typeof value.target_zone_id === "string"
+          ? value.target_zone_id
+          : typeof value.target_zone_key === "string"
+            ? value.target_zone_key
+            : "",
+    status: typeof value.status === "string" ? value.status : "",
+    warnings:
+      getStringArray(value.warnings).length > 0
+        ? getStringArray(value.warnings)
+        : isRecord(value.schema_drift) && Array.isArray(value.schema_drift.warnings)
+          ? getStringArray(value.schema_drift.warnings)
+          : [],
+    blocking:
+      getStringArray(value.blocking).length > 0
+        ? getStringArray(value.blocking)
+        : getStringArray(value.blocking_issues),
+  };
+}
+
+function normalizeExternalImportStatus(payload: unknown): ExternalImportStatusView | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  const manifest = isRecord(payload.manifest) ? payload.manifest : payload;
+  const tablesCandidate =
+    (Array.isArray(manifest.tables) && manifest.tables) ||
+    (Array.isArray(manifest.statuses) && manifest.statuses) ||
+    (Array.isArray(payload.source_tables) && payload.source_tables) ||
+    (Array.isArray(payload.manifest_items) && payload.manifest_items) ||
+    (Array.isArray(payload.tables) && payload.tables) ||
+    [];
+  const tables = tablesCandidate
+    .map((item) => normalizeExternalImportTableStatus(item))
+    .filter((item): item is ExternalImportTableStatus => Boolean(item));
+
+  return {
+    status: typeof payload.status === "string" ? payload.status : typeof manifest.status === "string" ? manifest.status : undefined,
+    import_job_id:
+      typeof payload.import_job_id === "string"
+        ? payload.import_job_id
+        : typeof payload.job_id === "string"
+          ? payload.job_id
+          : undefined,
+    preview_hash: typeof payload.preview_hash === "string" ? payload.preview_hash : undefined,
+    confirm_allowed: typeof payload.confirm_allowed === "boolean" ? payload.confirm_allowed : undefined,
+    updated_at:
+      typeof payload.updated_at === "string"
+        ? payload.updated_at
+        : typeof manifest.updated_at === "string"
+          ? manifest.updated_at
+          : undefined,
+    tables,
+  };
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function readFileAsBase64(file: File) {
+  if (typeof file.arrayBuffer === "function") {
+    return file.arrayBuffer().then(arrayBufferToBase64);
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read import file."));
+    reader.onload = () => {
+      const result = reader.result;
+      if (result instanceof ArrayBuffer) {
+        resolve(arrayBufferToBase64(result));
+        return;
+      }
+      reject(new Error("Failed to read import file."));
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 function panelClassName(extra = "") {
   return `${cardClassName} ${extra}`.trim();
 }
@@ -1028,6 +1174,13 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
   const [snapshotDiffPreviewById, setSnapshotDiffPreviewById] = useState<Record<string, SnapshotDiffPreview>>({});
   const [liveSheetStatus, setLiveSheetStatus] = useState<LiveSheetStatusView | null>(null);
   const [liveSheetStatusLoading, setLiveSheetStatusLoading] = useState(false);
+  const [externalImportStatus, setExternalImportStatus] = useState<ExternalImportStatusView | null>(null);
+  const [externalImportStatusLoading, setExternalImportStatusLoading] = useState(false);
+  const [externalImportFile, setExternalImportFile] = useState<File | null>(null);
+  const [externalImportPreviewHash, setExternalImportPreviewHash] = useState<string | null>(null);
+  const [externalImportPreviewing, setExternalImportPreviewing] = useState(false);
+  const [externalImportConfirming, setExternalImportConfirming] = useState(false);
+  const [externalImportMessage, setExternalImportMessage] = useState<string | null>(null);
 
   const isLegacySpreadsheetId = normalizedSpreadsheetId === LEGACY_DEFAULT_SPREADSHEET_ID;
   const routeSpreadsheetId =
@@ -1056,6 +1209,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       : WORKBENCH_STAGES.PROJECT_CREATED;
   const hasWritableProjectState = Boolean(activeProjectState) && projectStateLoadStatus === "ready";
   const canWriteProject = activeProjectState?.can_write ?? true;
+  const canWriteExternalImport = hasWritableProjectState && canWriteProject;
   const isDriveOwner = activeProjectState?.is_drive_owner ?? activeProjectState?.is_owner_or_admin ?? false;
   const availableActions = getAvailableProjectActions({
     current_stage: normalizedStage,
@@ -1490,6 +1644,48 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
     }
   }
 
+  async function loadExternalImportStatus(spreadsheetId: string, importJobId?: string | null) {
+    if (!spreadsheetId) {
+      if (!latestSpreadsheetIdRef.current) {
+        setExternalImportStatus(null);
+      }
+      return null;
+    }
+
+    if (latestSpreadsheetIdRef.current === spreadsheetId) {
+      setExternalImportStatusLoading(true);
+    }
+
+    try {
+      const params = new URLSearchParams({ spreadsheet_id: spreadsheetId });
+      if (importJobId) {
+        params.set("job_id", importJobId);
+      }
+      const res = await fetch(`/api/external_import/status?${params.toString()}`);
+      const data = await parseResponseBody(res);
+      if (!res.ok) {
+        throw new Error(resolveErrorMessage(data, "外部导入状态读取失败"));
+      }
+      if (latestSpreadsheetIdRef.current !== spreadsheetId) {
+        return null;
+      }
+      const nextStatus = normalizeExternalImportStatus(data);
+      setExternalImportStatus(nextStatus);
+      return nextStatus;
+    } catch (statusError) {
+      if (latestSpreadsheetIdRef.current !== spreadsheetId) {
+        return null;
+      }
+      const message = statusError instanceof Error ? statusError.message : "外部导入状态读取失败";
+      setExternalImportMessage(message);
+      return null;
+    } finally {
+      if (latestSpreadsheetIdRef.current === spreadsheetId) {
+        setExternalImportStatusLoading(false);
+      }
+    }
+  }
+
   async function loadProjectList() {
     setProjectListLoading(true);
     setError(null);
@@ -1779,6 +1975,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       loadDashboard(targetId),
       loadSnapshotHistory(targetId),
       loadLiveSheetStatus(targetId),
+      loadExternalImportStatus(targetId),
     ]);
   }
 
@@ -1905,6 +2102,110 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       setError(message);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function refreshAfterExternalImportConfirm(targetId: string, importJobId?: string | null) {
+    const immediateStatus = await loadExternalImportStatus(targetId, importJobId);
+    const latestStatus = immediateStatus?.status || "";
+    if (latestStatus === "succeeded" || latestStatus === "failed" || latestStatus === "partial") {
+      await refreshWorkbenchData(targetId);
+      return;
+    }
+
+    window.setTimeout(() => {
+      if (latestSpreadsheetIdRef.current === targetId) {
+        void loadExternalImportStatus(targetId, importJobId);
+      }
+    }, 3000);
+  }
+
+  async function handleExternalImportPreview() {
+    if (!currentId || !externalImportFile || !canWriteExternalImport || externalImportPreviewing) {
+      return;
+    }
+
+    const targetId = currentId;
+
+    setExternalImportPreviewing(true);
+    setExternalImportPreviewHash(null);
+    setExternalImportMessage(null);
+    setError(null);
+
+    try {
+      const contentBase64 = await readFileAsBase64(externalImportFile);
+      const res = await fetch("/api/external_import/preview", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          spreadsheet_id: targetId,
+          files: [
+            {
+              file_name: externalImportFile.name,
+              content_base64: contentBase64,
+            },
+          ],
+        }),
+      });
+      const data = await parseResponseBody(res);
+      if (!res.ok) {
+        throw new Error(resolveErrorMessage(data, "外部数据导入预览失败"));
+      }
+
+      const preview = normalizeExternalImportStatus(data);
+      setExternalImportStatus(preview);
+      setExternalImportPreviewHash(preview?.preview_hash || null);
+      setExternalImportMessage(preview?.confirm_allowed === false ? "预览存在阻塞问题，不能确认导入" : "预览完成，可以确认导入");
+    } catch (previewError) {
+      const message = previewError instanceof Error ? previewError.message : "外部数据导入预览失败";
+      setExternalImportMessage(message);
+      setError(message);
+    } finally {
+      setExternalImportPreviewing(false);
+    }
+  }
+
+  async function handleExternalImportConfirm() {
+    if (!currentId || !externalImportPreviewHash || !canWriteExternalImport || externalImportConfirming) {
+      return;
+    }
+
+    const targetId = currentId;
+    setExternalImportConfirming(true);
+    setExternalImportMessage(null);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/external_import/confirm", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ spreadsheet_id: targetId, preview_hash: externalImportPreviewHash }),
+      });
+      const data = await parseResponseBody(res);
+      if (!res.ok) {
+        throw new Error(resolveErrorMessage(data, "外部数据导入提交失败"));
+      }
+
+      const importJobId =
+        isRecord(data) && typeof data.import_job_id === "string"
+          ? data.import_job_id
+          : isRecord(data) && typeof data.job_id === "string"
+            ? data.job_id
+          : null;
+      setExternalImportMessage("外部数据导入已提交，正在刷新状态");
+      setExternalImportFile(null);
+      setExternalImportPreviewHash(null);
+      await refreshAfterExternalImportConfirm(targetId, importJobId);
+    } catch (confirmError) {
+      const message = confirmError instanceof Error ? confirmError.message : "外部数据导入提交失败";
+      setExternalImportMessage(message);
+      setError(message);
+    } finally {
+      setExternalImportConfirming(false);
     }
   }
 
@@ -2152,6 +2453,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       setAuditLogs([]);
       setEditLogs([]);
       setLiveSheetStatus(null);
+      setExternalImportStatus(null);
       return;
     }
 
@@ -2180,6 +2482,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
         setSnapshotHistory([]);
         setSnapshotDiffPreviewById({});
         setLiveSheetStatus(null);
+        setExternalImportStatus(null);
       }
       return;
     }
@@ -2189,6 +2492,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
       loadDashboard(currentId),
       loadSnapshotHistory(currentId),
       loadLiveSheetStatus(currentId),
+      loadExternalImportStatus(currentId),
     ]);
   }, [canShowProjectDetail, currentId, session?.user?.email]);
 
@@ -2197,6 +2501,9 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
     setRulesOpen(false);
     setAmountDetailState(null);
     setSnapshotDiffPreviewById({});
+    setExternalImportFile(null);
+    setExternalImportPreviewHash(null);
+    setExternalImportMessage(null);
   }, [currentId]);
 
   return (
@@ -2628,6 +2935,124 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
                           : "项目状态加载失败，写操作已禁用"}
                       </div>
                     )}
+                    <div className="rounded-2xl border border-[#D8E3DD] bg-[#F8FBF9] px-4 py-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h2 className="text-sm font-semibold text-[#102A38]">外部数据导入</h2>
+                        <span className="text-xs text-[#5B7A88]">
+                          {externalImportStatusLoading
+                            ? "状态读取中"
+                            : externalImportStatus?.status || externalImportStatus?.updated_at
+                              ? [externalImportStatus.status, formatTimestamp(externalImportStatus.updated_at)]
+                                  .filter(Boolean)
+                                  .join(" · ")
+                              : "暂无导入任务"}
+                        </span>
+                      </div>
+                      <div className="mt-2 grid gap-1 text-xs leading-5 text-[#335768]">
+                        <div>只会替换本次识别到的外部表。未上传的表保留当前版本。</div>
+                        <div>导入成功后会自动验证录入数据。</div>
+                        {!canWriteExternalImport && <div>Reader/Commenter 只能查看导入状态，不能上传。</div>}
+                      </div>
+
+                      {canWriteExternalImport && (
+                        <div className="mt-3 grid gap-2">
+                          <label
+                            htmlFor="external-import-file"
+                            className="block text-xs font-semibold text-[#335768]"
+                          >
+                            选择外部导入文件
+                          </label>
+                          <input
+                            id="external-import-file"
+                            type="file"
+                            accept=".xlsx,.xls,.csv"
+                            aria-label="选择外部导入文件"
+                            onChange={(event) => {
+                              setExternalImportFile(event.target.files?.[0] || null);
+                              setExternalImportPreviewHash(null);
+                            }}
+                            className="block w-full text-xs text-[#335768] file:mr-3 file:rounded-xl file:border file:border-[#C9D8D1] file:bg-[#FFFDF7] file:px-3 file:py-2 file:text-xs file:font-semibold file:text-[#102A38]"
+                          />
+                          {externalImportFile && (
+                            <div className="break-all text-xs font-medium text-[#1F6049]">
+                              已选择 {externalImportFile.name}
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            onClick={handleExternalImportPreview}
+                            disabled={!externalImportFile || externalImportPreviewing}
+                            className={secondaryButtonClassName}
+                          >
+                            {externalImportPreviewing ? "预览中" : "预览导入"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleExternalImportConfirm}
+                            disabled={!externalImportPreviewHash || externalImportStatus?.confirm_allowed === false || externalImportConfirming}
+                            className={secondaryButtonClassName}
+                          >
+                            {externalImportConfirming ? "提交中" : "确认导入"}
+                          </button>
+                        </div>
+                      )}
+
+                      {externalImportMessage && (
+                        <div className="mt-3 rounded-xl border border-[#D8E3DD] bg-[#FFFDF7] px-3 py-2 text-xs text-[#335768]">
+                          {externalImportMessage}
+                        </div>
+                      )}
+
+                      {(externalImportStatus?.tables.length || 0) > 0 ? (
+                        <div className="mt-3 overflow-x-auto">
+                          <table className="min-w-[720px] w-full text-left text-xs">
+                            <thead>
+                              <tr className="border-b border-[#D8E3DD] text-[#5B7A88]">
+                                <th className="pb-2 pr-3 font-medium">detected table</th>
+                                <th className="pb-2 pr-3 font-medium">file name</th>
+                                <th className="pb-2 pr-3 font-medium">source sheet</th>
+                                <th className="pb-2 pr-3 text-right font-medium">row count</th>
+                                <th className="pb-2 pr-3 text-right font-medium">amount total</th>
+                                <th className="pb-2 pr-3 font-medium">semantic target zone</th>
+                                <th className="pb-2 pr-3 font-medium">status</th>
+                                <th className="pb-2 font-medium">warnings/blocking</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {externalImportStatus?.tables.map((table, index) => (
+                                <tr
+                                  key={`${table.detected_table}-${table.file_name}-${index}`}
+                                  className="border-b border-[#E2EBE6] align-top"
+                                >
+                                  <td className="py-2 pr-3 font-semibold text-[#102A38]">{table.detected_table || "-"}</td>
+                                  <td className="py-2 pr-3 break-all text-[#335768]">{table.file_name || "-"}</td>
+                                  <td className="py-2 pr-3 text-[#335768]">{table.source_sheet || "-"}</td>
+                                  <td className="py-2 pr-3 text-right text-[#335768]">{formatNumber(table.row_count)}</td>
+                                  <td className="py-2 pr-3 text-right text-[#335768]">
+                                    {formatCurrency(table.amount_total, { showZero: true })}
+                                  </td>
+                                  <td className="py-2 pr-3 break-all text-[#335768]">{table.semantic_target_zone || "-"}</td>
+                                  <td className="py-2 pr-3 font-semibold text-[#335768]">{table.status || "-"}</td>
+                                  <td className="py-2 text-[#335768]">
+                                    {[...table.warnings, ...table.blocking].length > 0
+                                      ? [...table.warnings, ...table.blocking].map((message) => (
+                                          <div key={message} className="break-words">
+                                            {message}
+                                          </div>
+                                        ))
+                                      : "-"}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="mt-3 rounded-xl border border-[#E2EBE6] bg-[#FFFDF7] px-3 py-2 text-xs text-[#5B7A88]">
+                          暂无外部导入 manifest
+                        </div>
+                      )}
+                    </div>
                     {visibleActions.includes("validate_input") && (
                       <button
                         onClick={() => handleProjectAction("validate_input")}

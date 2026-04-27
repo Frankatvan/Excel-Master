@@ -552,6 +552,192 @@ describe("phase 1 workbench page", () => {
     expect(screen.queryByRole("button", { name: "提交审计确认" })).toBeNull();
   });
 
+  it("lets writable collaborators select an external import file, confirm it, and refresh status", async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "external_data_ready",
+            is_owner_or_admin: false,
+            can_write: true,
+            drive_role: "writer",
+            is_drive_owner: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      if (url.startsWith("/api/external_import/status")) {
+        return jsonResponse({
+          manifest: {
+            tables: [
+              {
+                detected_table: "Payable",
+                file_name: "payable-april.xlsx",
+                source_sheet: "Payable",
+                row_count: 128,
+                amount_total: 45000,
+                semantic_target_zone: "external_data.payable",
+                status: "preview_ready",
+                warnings: ["Amount column normalized"],
+                blocking: [],
+              },
+              {
+                detected_table: "Final Detail",
+                file_name: "final-detail-current.xlsx",
+                source_sheet: "Final Detail",
+                row_count: 64,
+                amount_total: 32000,
+                semantic_target_zone: "external_data.final_detail",
+                status: "retained",
+                warnings: [],
+                blocking: [],
+              },
+            ],
+          },
+        });
+      }
+      if (url.startsWith("/api/external_import/preview")) {
+        expect(init?.method).toBe("POST");
+        expect(init?.body).toEqual(expect.any(String));
+        return jsonResponse({
+          status: "preview_ready",
+          spreadsheet_id: "sheet-123",
+          preview_hash: "preview-hash-123",
+          confirm_allowed: true,
+          source_tables: [
+            {
+              source_role: "payable",
+              source_sheet_name: "Payable",
+              row_count: 128,
+              amount_total: 45000,
+              target_zone_id: "external_import.payable_raw",
+              status: "preview_ready",
+              warnings: ["Amount column normalized"],
+              blocking_issues: [],
+            },
+          ],
+          files: [],
+        });
+      }
+      if (url.startsWith("/api/external_import/confirm")) {
+        expect(init?.method).toBe("POST");
+        expect(init?.body).toBe(JSON.stringify({ spreadsheet_id: "sheet-123", preview_hash: "preview-hash-123" }));
+        return jsonResponse({ status: "queued", job_id: "job-123" });
+      }
+      return jsonResponse({});
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByText("外部数据导入")).toBeTruthy());
+    expect(screen.getByText("只会替换本次识别到的外部表。未上传的表保留当前版本。")).toBeTruthy();
+    expect(screen.getByText("导入成功后会自动验证录入数据。")).toBeTruthy();
+    expect(screen.getAllByText("Payable").length).toBeGreaterThan(0);
+    expect(screen.getByText("payable-april.xlsx")).toBeTruthy();
+    expect(screen.getByText("external_data.payable")).toBeTruthy();
+    expect(screen.getByText("Amount column normalized")).toBeTruthy();
+    expect(screen.getAllByText("Final Detail").length).toBeGreaterThan(0);
+    expect(screen.getByText("retained")).toBeTruthy();
+
+    const file = new File(["demo"], "payable-april.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    fireEvent.change(screen.getByLabelText("选择外部导入文件"), { target: { files: [file] } });
+    expect(screen.getByText("已选择 payable-april.xlsx")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "预览导入" }));
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/preview"))).toBe(true),
+    );
+    expect(screen.getByText("预览完成，可以确认导入")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认导入" }));
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/confirm"))).toBe(true),
+    );
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/external_import/status")).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("shows external import status to readonly collaborators without upload controls", async () => {
+    global.fetch = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "external_data_ready",
+            is_owner_or_admin: false,
+            can_write: false,
+            drive_role: "reader",
+            is_drive_owner: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      if (url.startsWith("/api/external_import/status")) {
+        return jsonResponse({
+          manifest: {
+            tables: [
+              {
+                detected_table: "Payable",
+                file_name: "payable-april.xlsx",
+                source_sheet: "Payable",
+                row_count: 128,
+                amount_total: 45000,
+                semantic_target_zone: "external_data.payable",
+                status: "succeeded",
+                warnings: [],
+                blocking: [],
+              },
+              {
+                detected_table: "Draw Request report",
+                file_name: "current-drive-version",
+                source_sheet: "Draw Request report",
+                row_count: 42,
+                amount_total: 12000,
+                semantic_target_zone: "external_data.draw_request",
+                status: "retained",
+                warnings: ["No file uploaded in this run"],
+                blocking: ["Waiting for collaborator upload"],
+              },
+            ],
+          },
+        });
+      }
+      return jsonResponse({});
+    }) as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByText("外部数据导入")).toBeTruthy());
+    expect(screen.getByText("Reader/Commenter 只能查看导入状态，不能上传。")).toBeTruthy();
+    expect(screen.queryByLabelText("选择外部导入文件")).toBeNull();
+    expect(screen.queryByRole("button", { name: "确认导入" })).toBeNull();
+    await waitFor(() => expect(screen.getAllByText("Payable").length).toBeGreaterThan(0));
+    expect(screen.getAllByText("Draw Request report").length).toBeGreaterThan(0);
+    expect(screen.getByText("No file uploaded in this run")).toBeTruthy();
+    expect(screen.getByText("Waiting for collaborator upload")).toBeTruthy();
+  });
+
   it("requires a three-digit project serial before allowing project creation", async () => {
     routerState.query = {};
     routerState.asPath = "/";

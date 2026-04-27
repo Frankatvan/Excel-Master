@@ -108,7 +108,6 @@ const JOB_COLUMNS = [
   "lock_token",
   "created_by",
   "progress",
-  "payload",
   "result",
   "result_meta",
   "error",

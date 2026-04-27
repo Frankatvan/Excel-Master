@@ -18,6 +18,7 @@ export interface ParsedExternalImportTable {
   warnings: string[];
   blockingIssues: string[];
   headers: string[];
+  rows: SerializableCellValue[][];
 }
 
 export interface ParsedExternalImportWorkbook {
@@ -26,6 +27,7 @@ export interface ParsedExternalImportWorkbook {
 }
 
 type CellValue = string | number | boolean | Date | null | undefined;
+type SerializableCellValue = string | number | boolean | null;
 
 function trimTrailingEmptyCells(row: CellValue[]): CellValue[] {
   const trimmed = [...row];
@@ -87,6 +89,16 @@ function formatCellValue(value: CellValue): string {
   }
 
   return String(value ?? "");
+}
+
+function serializableCellValue(value: CellValue): SerializableCellValue {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
+    return value;
+  }
+  return null;
 }
 
 function parseAmount(value: CellValue, allowBlank = false): { value: number; valid: boolean } {
@@ -273,6 +285,7 @@ export function parseWorkbookBuffer(buffer: Buffer | ArrayBuffer | Uint8Array, f
         warnings: buildWarnings(detection),
         blockingIssues: buildBlockingIssues(detection, dataRows.length, valueIssues),
         headers: headerRow.headers,
+        rows: dataRows.map((row) => headerRow.headers.map((_header, index) => serializableCellValue(row[index]))),
       },
     ];
   });

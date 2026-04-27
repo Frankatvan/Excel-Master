@@ -44,6 +44,48 @@ export interface CreateJobInput {
   payload?: Record<string, unknown>;
 }
 
+export type ExternalImportManifestStatus = "parsed" | "warning" | "imported" | "validated" | "failed" | "stale";
+
+export interface CreateImportManifestInput {
+  jobId: string;
+  projectId?: string | null;
+  spreadsheetId: string;
+  status: ExternalImportManifestStatus;
+  importedBy?: string | null;
+  resultMeta?: Record<string, unknown>;
+  error?: Record<string, unknown> | null;
+}
+
+export interface CreateImportManifestItemInput {
+  manifestId: string;
+  jobId: string;
+  projectId?: string | null;
+  spreadsheetId: string;
+  sourceTable: string;
+  sourceFileName?: string | null;
+  sourceSheetName?: string | null;
+  fileHash?: string | null;
+  headerSignature?: string | null;
+  rowCount: number;
+  columnCount: number;
+  amountTotal: number;
+  targetZoneKey: string;
+  resolvedZoneFingerprint?: string | null;
+  status: ExternalImportManifestStatus;
+  validationMessage?: string | null;
+  schemaDrift?: Record<string, unknown>;
+  resultMeta?: Record<string, unknown>;
+  error?: Record<string, unknown> | null;
+}
+
+export interface UpdateImportManifestItemStatusInput {
+  itemId: string;
+  status: ExternalImportManifestStatus;
+  validationMessage?: string | null;
+  resultMeta?: Record<string, unknown>;
+  error?: Record<string, unknown> | null;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -69,6 +111,32 @@ function updateById<T>(client: SupabaseLike, jobId: string, payload: Record<stri
   }
   const query = table.update(payload) as { eq(column: string, value: string): unknown };
   return selectSingle<T>(query.eq("id", jobId));
+}
+
+function insertSingle<T>(
+  client: SupabaseLike,
+  tableName: string,
+  payload: Record<string, unknown>,
+): Promise<SupabaseResult<T>> {
+  const table = client.from(tableName);
+  if (!table.insert) {
+    throw new Error(`Supabase ${tableName} insert is unavailable.`);
+  }
+  return selectSingle<T>(table.insert(payload));
+}
+
+function updateSingleById<T>(
+  client: SupabaseLike,
+  tableName: string,
+  rowId: string,
+  payload: Record<string, unknown>,
+): Promise<SupabaseResult<T>> {
+  const table = client.from(tableName);
+  if (!table.update) {
+    throw new Error(`Supabase ${tableName} update is unavailable.`);
+  }
+  const query = table.update(payload) as { eq(column: string, value: string): unknown };
+  return selectSingle<T>(query.eq("id", rowId));
 }
 
 function throwIfSupabaseError(error: unknown) {
@@ -102,6 +170,68 @@ export async function createJob(input: CreateJobInput, client: SupabaseLike = ge
     error: null,
   };
   const { data, error } = await selectSingle<DurableJobRow>(table.insert(payload));
+  throwIfSupabaseError(error);
+  return data;
+}
+
+export async function createImportManifest(
+  input: CreateImportManifestInput,
+  client: SupabaseLike = getSupabaseClient(),
+) {
+  const { data, error } = await insertSingle(client, "external_import_manifests", {
+    job_id: input.jobId,
+    project_id: input.projectId ?? null,
+    spreadsheet_id: input.spreadsheetId,
+    status: input.status,
+    imported_by: input.importedBy ?? null,
+    imported_at: nowIso(),
+    result_meta: input.resultMeta ?? {},
+    error: input.error ?? null,
+  });
+  throwIfSupabaseError(error);
+  return data;
+}
+
+export async function createImportManifestItem(
+  input: CreateImportManifestItemInput,
+  client: SupabaseLike = getSupabaseClient(),
+) {
+  const { data, error } = await insertSingle(client, "external_import_manifest_items", {
+    manifest_id: input.manifestId,
+    job_id: input.jobId,
+    project_id: input.projectId ?? null,
+    spreadsheet_id: input.spreadsheetId,
+    source_table: input.sourceTable,
+    source_file_name: input.sourceFileName ?? null,
+    source_sheet_name: input.sourceSheetName ?? null,
+    file_hash: input.fileHash ?? null,
+    header_signature: input.headerSignature ?? null,
+    row_count: input.rowCount,
+    column_count: input.columnCount,
+    amount_total: input.amountTotal,
+    target_zone_key: input.targetZoneKey,
+    resolved_zone_fingerprint: input.resolvedZoneFingerprint ?? null,
+    status: input.status,
+    validation_message: input.validationMessage ?? null,
+    schema_drift: input.schemaDrift ?? {},
+    result_meta: input.resultMeta ?? {},
+    error: input.error ?? null,
+  });
+  throwIfSupabaseError(error);
+  return data;
+}
+
+export async function updateImportManifestItemStatus(
+  input: UpdateImportManifestItemStatusInput,
+  client: SupabaseLike = getSupabaseClient(),
+) {
+  const { data, error } = await updateSingleById(client, "external_import_manifest_items", input.itemId, {
+    status: input.status,
+    validation_message: input.validationMessage ?? null,
+    result_meta: input.resultMeta ?? {},
+    error: input.error ?? null,
+    imported_at: nowIso(),
+  });
   throwIfSupabaseError(error);
   return data;
 }

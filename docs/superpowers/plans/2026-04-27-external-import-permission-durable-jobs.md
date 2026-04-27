@@ -139,15 +139,12 @@ rg -n "\\b[A-Z]{1,3}\\$?[0-9]+\\b|![A-Z]{1,3}:|![A-Z]{1,3}\\$?\\d" \
 
 Expected: no matches in external import production code for hardcoded spreadsheet target coordinates.
 
-```bash
-FORBIDDEN_IMPORT_STATE_PATTERN="AiWB_External_Import_"'Manifest|Sheet[- ]resident.*manifest|Supabase.*mirror'
-rg -n "$FORBIDDEN_IMPORT_STATE_PATTERN" \
-  excel-master-app/src \
-  excel-master-app/api \
-  --glob '!**/*.test.*'
-```
+Run a production-code scan for hidden workbook manifest names and secondary-store mirror language across:
 
-Expected: no matches in production code. Documentation reviews still check that Supabase remains the only authoritative store, but this production scan must not self-match against its own audit pattern.
+- `excel-master-app/src`
+- `excel-master-app/api`
+
+Expected: no matches in production code. Documentation reviews still check that Supabase remains the only authoritative store, but this production scan must not self-match against its own audit instruction.
 
 ```bash
 cd excel-master-app
