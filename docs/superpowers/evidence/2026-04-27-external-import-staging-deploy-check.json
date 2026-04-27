@@ -1,0 +1,42 @@
+{
+  "checked_at": "2026-04-27T12:31:08Z",
+  "branch": "feat-audit-workbench-phase1",
+  "commits": {
+    "staging_remediation": "10022f6",
+    "worker_runtime": "597b8cd",
+    "worker_wrapper": "07c582b"
+  },
+  "vercel_preview_env": {
+    "branch": "feat-audit-workbench-phase1",
+    "external_import_worker_url": "synced",
+    "external_import_worker_secret": "synced",
+    "required_env_sync": "completed except GOOGLE_PRIVATE_KEY needed stdin because it is multiline; rerun succeeded"
+  },
+  "deployments": {
+    "git_preview": {
+      "url": "https://excel-master-p3ikvfauw-frankatvans-projects.vercel.app",
+      "status": "error",
+      "reason": "Vercel Git build used repository root package/build path and could not resolve xlsx"
+    },
+    "cli_preview": {
+      "url": "https://excel-master-fkexvbpcy-frankatvans-projects.vercel.app",
+      "status": "ready",
+      "build": "succeeded from excel-master-app root"
+    },
+    "production_custom_domain": {
+      "url": "https://audit.frankzh.top",
+      "status": "reachable",
+      "note": "old production deployment; /api/debug-env did not include new external import worker fields"
+    }
+  },
+  "local_connectivity": {
+    "cli_preview_vercel_app": {
+      "status": "blocked",
+      "error": "curl could not connect to *.vercel.app from this environment"
+    },
+    "production_custom_domain": {
+      "status": "reachable",
+      "http_status": 200
+    }
+  }
+}

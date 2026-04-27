@@ -2,25 +2,38 @@
 
 Date: 2026-04-27
 Branch: `feat-audit-workbench-phase1`
-Remediation commit: `10022f6 fix: remediate external import staging blockers`
+Remediation commits:
+- `10022f6 fix: remediate external import staging blockers`
+- `597b8cd fix: enable external import worker endpoint`
+- `07c582b fix: expose external import worker handler`
 
 ## Release Gate
 
 Status: **NOT READY FOR PRODUCTION DEPLOY**
 
-Reason: remediation code and focused automated acceptance are green, but the local/staging environment still lacks `EXTERNAL_IMPORT_WORKER_URL` and `EXTERNAL_IMPORT_WORKER_SECRET`. Live collaborator confirm, durable Supabase row capture, and authenticated reader/commenter browser screenshots remain pending until worker config and staging sessions are available.
+Reason: remediation code, worker endpoint build, and focused automated acceptance are green, and local/Preview worker env keys are now present. The live staging acceptance pass is still blocked before durable persistence:
+
+- Supabase is missing `jobs`, `external_import_manifests`, and `external_import_manifest_items` in the schema cache.
+- A previous collaborator confirm attempt failed before job creation because the staging spreadsheet lacks AiWB semantic import zone metadata for source role `payable`.
+- A fresh CLI Preview deployment is `READY`, but this environment cannot connect to the `*.vercel.app` preview URL, so fresh live API/browser smoke could not be completed against that deployment.
+- The staging Drive permissions inspected for `GOOGLE_SHEET_ID` include writer/organizer/fileOrganizer users only; no reader/commenter accounts are available for live readonly browser smoke.
 
 ## Worker Config Readiness
 
-Local `.env.local` presence check:
+Acceptance pass on 2026-04-27:
 
-| Variable | Result |
+| Check | Result |
 | --- | --- |
-| `NEXTAUTH_URL` | present |
-| `NEXT_PUBLIC_SUPABASE_URL` | present |
-| `SUPABASE_SERVICE_ROLE_KEY` | present |
-| `EXTERNAL_IMPORT_WORKER_URL` | missing |
-| `EXTERNAL_IMPORT_WORKER_SECRET` | missing |
+| Local `.env.local` `NEXTAUTH_URL` | present |
+| Local `.env.local` `NEXT_PUBLIC_SUPABASE_URL` | present |
+| Local `.env.local` `SUPABASE_SERVICE_ROLE_KEY` | present |
+| Local `.env.local` `EXTERNAL_IMPORT_WORKER_URL` | present |
+| Local `.env.local` `EXTERNAL_IMPORT_WORKER_SECRET` | present |
+| Vercel Preview branch env `EXTERNAL_IMPORT_WORKER_URL` | synced for `feat-audit-workbench-phase1` |
+| Vercel Preview branch env `EXTERNAL_IMPORT_WORKER_SECRET` | synced for `feat-audit-workbench-phase1` |
+| CLI Preview deployment | `READY`: `https://excel-master-fkexvbpcy-frankatvans-projects.vercel.app` |
+| Local connectivity to Preview deployment | blocked: curl cannot connect to `*.vercel.app` from this environment |
+| Production custom domain `/api/debug-env` | reachable, but still old production deployment without new external import debug fields |
 
 Code remediation:
 
@@ -33,6 +46,12 @@ Production fallback:
 
 - If the worker URL/secret are omitted, confirm is unavailable.
 - Existing audit, reclassify, formula sync, and status viewing flows do not depend on the external import worker config.
+
+Current acceptance note:
+
+- `.env.local` now contains `EXTERNAL_IMPORT_WORKER_URL` and `EXTERNAL_IMPORT_WORKER_SECRET`.
+- Vercel CLI Preview build/deploy succeeded from `excel-master-app`.
+- The earlier Git-triggered Preview deploy failed because Vercel used the repository root package/build path; the CLI Preview deploy used the correct app root.
 
 ## Real File Parser Remediation
 
@@ -77,12 +96,23 @@ Automated UI/API coverage:
 | Preview/status API require auth | `external-import-api.test.ts` |
 | Preview/confirm require collaborator access | `external-import-api.test.ts` |
 
-Live browser evidence pending:
+Live browser/API evidence from this pass:
 
-- Reader screenshot
-- Commenter screenshot
-- Collaborator preview screenshot
-- Collaborator status-after-confirm screenshot
+| Role | Result | Evidence |
+| --- | --- | --- |
+| Reader | blocked; no Drive reader permission found for staging spreadsheet | permission scan showed no reader account |
+| Commenter | blocked; no Drive commenter permission found for staging spreadsheet | permission scan showed no commenter account |
+| Collaborator | passed readonly/write-control visibility; upload, preview, and confirm controls visible for writer session | `docs/superpowers/evidence/2026-04-27-external-import-collaborator-smoke.png` |
+
+Real collaborator API smoke:
+
+| Step | Result |
+| --- | --- |
+| OTP credential login | HTTP `200`; session authenticated |
+| Payable Report preview | HTTP `200`; `status=preview_ready`, `confirm_allowed=true`, `worker_configured=true` |
+| Confirm | HTTP `500`; `IMPORT_ZONE_NOT_FOUND:No AiWB semantic import zone metadata found for source role payable.` |
+
+Confirm did not create a job or manifest id. This collaborator smoke was captured before the worker endpoint wrapper fix; it is still useful for the semantic-zone blocker, but it does not prove the latest Preview deployment is browser-accessible from this environment.
 
 ## Durable Job And Manifest Coverage
 
@@ -95,14 +125,26 @@ Automated API coverage:
 | Validation failure marks job/manifest/item failed | `external-import-api.test.ts` |
 | Failed validation preserves persisted item evidence | `external-import-api.test.ts` |
 
-Live Supabase evidence pending:
+Live Supabase evidence from this pass:
 
-- `jobs` row
-- `external_import_manifests` row
-- `external_import_manifest_items` rows
-- validation result JSON
-- partial-upload retained-table evidence
-- intentional validation-failure evidence
+Evidence artifacts:
+- `docs/superpowers/evidence/2026-04-27-external-import-staging-durable-rows.json`
+- `docs/superpowers/evidence/2026-04-27-external-import-staging-supabase-current.json`
+
+| Table | Result |
+| --- | --- |
+| `projects` | previously reachable; 4 rows |
+| `email_login_otps` | previously reachable; 2 rows before test OTP reseed |
+| `jobs` | missing; Supabase `PGRST205` schema-cache error |
+| `external_import_manifests` | missing; Supabase `PGRST205` schema-cache error |
+| `external_import_manifest_items` | missing; Supabase `PGRST205` schema-cache error |
+
+Durable row capture remains blocked:
+
+- No `jobs` row was created.
+- No `external_import_manifests` row was created.
+- No `external_import_manifest_items` rows were created.
+- Partial-upload retained-table evidence and intentional validation-failure evidence cannot be run until confirm can create durable rows.
 
 ## Verification
 
@@ -120,8 +162,31 @@ npm test -- --runInBand --runTestsByPath \
 
 Result: 5 suites / 90 tests passed.
 
+Fresh result from this pass: 5 suites / 90 tests passed.
+
+Worker endpoint verification:
+
+```bash
+python3 -m pytest tests/test_external_import_worker.py -q
+cd excel-master-app
+npx --yes vercel@52.0.0 build
+```
+
+Result:
+
+- Python worker tests: 11 passed.
+- Vercel local build: completed successfully.
+- CLI Preview deployment: ready.
+
 ## Decision
 
 Do not deploy to production yet.
 
-Next action: configure staging `EXTERNAL_IMPORT_WORKER_URL` and `EXTERNAL_IMPORT_WORKER_SECRET`, then rerun live role smoke and durable-row capture. Architecture upgrade remains explicitly out of scope until this staging remediation gate is accepted.
+Next actions before rerun:
+
+1. Apply or repair the staging Supabase durable job/import manifest tables.
+2. Backfill AiWB semantic import zone developer metadata on the staging spreadsheet for at least `external_import.payable_raw`.
+3. Use an accessible Preview or controlled custom staging domain for fresh live API/browser smoke.
+4. Provide or grant reader/commenter staging permissions, then rerun readonly browser smoke.
+
+Architecture upgrade remains explicitly out of scope until this staging remediation gate is accepted.

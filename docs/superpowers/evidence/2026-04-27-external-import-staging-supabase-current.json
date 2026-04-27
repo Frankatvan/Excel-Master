@@ -1,0 +1,23 @@
+{
+  "checked_at": "2026-04-27T12:32:04.495Z",
+  "tables": {
+    "jobs": {
+      "reachable": false,
+      "error": "Could not find the table 'public.jobs' in the schema cache",
+      "row_count": 0,
+      "rows": []
+    },
+    "external_import_manifests": {
+      "reachable": false,
+      "error": "Could not find the table 'public.external_import_manifests' in the schema cache",
+      "row_count": 0,
+      "rows": []
+    },
+    "external_import_manifest_items": {
+      "reachable": false,
+      "error": "Could not find the table 'public.external_import_manifest_items' in the schema cache",
+      "row_count": 0,
+      "rows": []
+    }
+  }
+}

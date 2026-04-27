@@ -1,0 +1,62 @@
+{
+  "generated_at": "2026-04-27T12:19:12.349Z",
+  "staging_spreadsheet_id": "1g17SLJDKIT9rM5Vi4xQoD_pa4byvDPE6gJvRwi5bQDw",
+  "worker_config": {
+    "env_local_url_present": true,
+    "env_local_secret_present": true,
+    "debug_env_has_external_import_worker_url": true,
+    "debug_env_has_external_import_worker_secret": true,
+    "deploy_prod_check": "passed",
+    "authorized_empty_payload_status": 404,
+    "authorized_empty_payload_looked_like_worker_contract": false
+  },
+  "supabase_tables": {
+    "projects": {
+      "ok": true,
+      "count": 4
+    },
+    "email_login_otps": {
+      "ok": true,
+      "count": 2
+    },
+    "jobs": {
+      "ok": false,
+      "code": "PGRST205",
+      "error": "Could not find the table 'public.jobs' in the schema cache"
+    },
+    "external_import_manifests": {
+      "ok": false,
+      "code": "PGRST205",
+      "error": "Could not find the table 'public.external_import_manifests' in the schema cache"
+    },
+    "external_import_manifest_items": {
+      "ok": false,
+      "code": "PGRST205",
+      "error": "Could not find the table 'public.external_import_manifest_items' in the schema cache"
+    }
+  },
+  "collaborator_confirm_attempt": {
+    "collaborator": "redacted:gmail.com",
+    "login_status": 200,
+    "session_authenticated": true,
+    "preview_status": 200,
+    "preview": {
+      "status": "preview_ready",
+      "confirm_allowed": true,
+      "worker_configured": true,
+      "file_count": 1,
+      "preview_hash_present": true,
+      "input_file": "docs/Payable Report_20260427023857.xlsx"
+    },
+    "confirm_status": 500,
+    "confirm_error": "IMPORT_ZONE_NOT_FOUND:No AiWB semantic import zone metadata found for source role payable.",
+    "job_id_present": false,
+    "manifest_id_present": false
+  },
+  "durable_row_capture": {
+    "jobs_row": null,
+    "external_import_manifest_row": null,
+    "external_import_manifest_items_rows": [],
+    "reason": "Confirm failed before job creation because the staging spreadsheet lacks AiWB semantic import zone metadata for source role payable; Supabase durable tables are also absent from the schema cache."
+  }
+}
