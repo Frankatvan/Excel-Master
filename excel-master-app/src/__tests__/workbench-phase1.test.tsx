@@ -1305,12 +1305,10 @@ describe("phase 1 workbench page", () => {
     expect(screen.queryByRole("button", { name: "解除锁定数据" })).toBeNull();
   });
 
-  it("starts async audit sync before refreshing state and dashboard when clicking 同步数据", async () => {
+  it("runs audit sync inline before refreshing state and dashboard when clicking 同步数据", async () => {
     let stateCalls = 0;
     let dashboardCalls = 0;
     let auditSyncCalls = 0;
-    let auditSyncStatusCalls = 0;
-    let auditSyncStatusUrl = "";
     let auditSyncBody: unknown = null;
 
     global.fetch = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1329,28 +1327,13 @@ describe("phase 1 workbench page", () => {
         dashboardCalls += 1;
         return jsonResponse(baseDashboardPayload());
       }
-      if (url.startsWith("/api/audit_sync_status")) {
-        auditSyncStatusCalls += 1;
-        auditSyncStatusUrl = url;
-        return jsonResponse({
-          spreadsheet_id: "sheet-123",
-          project_id: "project-123",
-          latest_run: {
-            sync_run_id: "run-123",
-            status: "running",
-            created_at: "2026-04-26T12:00:00.000Z",
-          },
-        });
-      }
       if (url.startsWith("/api/audit_sync")) {
         auditSyncCalls += 1;
         auditSyncBody = init?.body ? JSON.parse(String(init.body)) : null;
         return jsonResponse({
-          status: "accepted",
-          mode: "async",
+          status: "success",
           spreadsheet_id: "sheet-123",
-          sync_run_id: "run-123",
-          message: "同步已开始，后台完成后会刷新快照",
+          last_synced_at: "2026-04-27T12:00:00.000Z",
         });
       }
       return jsonResponse({});
@@ -1364,10 +1347,8 @@ describe("phase 1 workbench page", () => {
     await waitFor(() => expect(stateCalls).toBeGreaterThanOrEqual(2));
     await waitFor(() => expect(dashboardCalls).toBeGreaterThanOrEqual(2));
     expect(auditSyncCalls).toBe(1);
-    expect(auditSyncStatusCalls).toBeGreaterThanOrEqual(1);
-    expect(auditSyncStatusUrl).toContain("sync_run_id=run-123");
-    expect(auditSyncBody).toEqual({ spreadsheet_id: "sheet-123", mode: "async" });
-    expect(screen.getByText(/后台同步中/)).toBeTruthy();
+    expect(auditSyncBody).toEqual({ spreadsheet_id: "sheet-123" });
+    expect(screen.getByText(/同步完成/)).toBeTruthy();
   });
 
   it("drops stale responses from previous spreadsheetId", async () => {

@@ -1,9 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
 import { getServerSession } from "next-auth/next";
-import { after } from "next/server";
 
-import { startAuditSummarySync, syncAuditSummary } from "@/lib/audit-service";
+import { syncAuditSummary } from "@/lib/audit-service";
 import { authOptions } from "./auth/[...nextauth]";
 
 type AuditValidationPayload = {
@@ -42,15 +41,6 @@ function readHeaderValue(value: string | string[] | undefined) {
   }
 
   return value;
-}
-
-function shouldRunAsync(body: NextApiRequest["body"]) {
-  if (!body || typeof body !== "object") {
-    return false;
-  }
-
-  const candidate = body as { mode?: unknown; async?: unknown };
-  return candidate.mode === "async" || candidate.async === true;
 }
 
 function resolveWorkerUrl(req: NextApiRequest) {
@@ -169,25 +159,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const spreadsheetId = readSpreadsheetId(req.body);
     if (!spreadsheetId) {
       return res.status(400).json({ error: "缺少 spreadsheet_id" });
-    }
-
-    if (shouldRunAsync(req.body)) {
-      const started = await startAuditSummarySync(spreadsheetId);
-      after(async () => {
-        await runValidation(req, spreadsheetId).catch((error) => {
-          console.error("[Audit] async audit_sync validation failed:", error);
-        });
-        await started.run().catch((error) => {
-          console.error("[Audit] async audit_sync failed:", error);
-        });
-      });
-      return res.status(202).json({
-        status: "accepted",
-        mode: "async",
-        spreadsheet_id: spreadsheetId,
-        sync_run_id: started.sync_run_id,
-        message: "同步已开始，后台完成后会刷新快照",
-      });
     }
 
     const validation = await runValidation(req, spreadsheetId);

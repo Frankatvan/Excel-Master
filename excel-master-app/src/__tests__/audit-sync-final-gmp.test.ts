@@ -1,18 +1,13 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
 import { getServerSession } from "next-auth/next";
-import { after } from "next/server";
 
 import auditSyncHandler from "../pages/api/audit_sync";
 
-import { startAuditSummarySync, syncAuditSummary } from "@/lib/audit-service";
+import { syncAuditSummary } from "@/lib/audit-service";
 
 jest.mock("next-auth/next", () => ({
   getServerSession: jest.fn(),
-}));
-
-jest.mock("next/server", () => ({
-  after: jest.fn(),
 }));
 
 jest.mock("../pages/api/auth/[...nextauth]", () => ({
@@ -20,13 +15,10 @@ jest.mock("../pages/api/auth/[...nextauth]", () => ({
 }));
 
 jest.mock("@/lib/audit-service", () => ({
-  startAuditSummarySync: jest.fn(),
   syncAuditSummary: jest.fn(),
 }));
 
 const mockGetServerSession = getServerSession as jest.MockedFunction<typeof getServerSession>;
-const mockAfter = after as jest.MockedFunction<typeof after>;
-const mockStartAuditSummarySync = startAuditSummarySync as jest.MockedFunction<typeof startAuditSummarySync>;
 const mockSyncAuditSummary = syncAuditSummary as jest.MockedFunction<typeof syncAuditSummary>;
 const originalFetch = global.fetch;
 
@@ -98,12 +90,11 @@ describe("/api/audit_sync Final GMP schema guard", () => {
     );
   });
 
-  it("runs validation worker before the async snapshot run", async () => {
-    const run = jest.fn().mockResolvedValue(undefined);
-    mockStartAuditSummarySync.mockResolvedValue({
+  it("treats async requests as synchronous syncs without next/server after", async () => {
+    mockSyncAuditSummary.mockResolvedValue({
       spreadsheetId: "sheet-123",
-      sync_run_id: "run-123",
-      run,
+      last_synced_at: "2026-04-27T12:01:00.000Z",
+      snapshot: {},
     } as never);
 
     const req = {
@@ -115,7 +106,6 @@ describe("/api/audit_sync Final GMP schema guard", () => {
     const res = createMockRes();
 
     await auditSyncHandler(req, res);
-    await (mockAfter.mock.calls[0][0] as () => Promise<void>)();
 
     expect(global.fetch).toHaveBeenCalledWith(
       "https://worker.example.com/api/internal/reclassify_job",
@@ -128,7 +118,14 @@ describe("/api/audit_sync Final GMP schema guard", () => {
       }),
     );
     expect((global.fetch as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
-      run.mock.invocationCallOrder[0],
+      mockSyncAuditSummary.mock.invocationCallOrder[0],
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "success",
+        spreadsheet_id: "sheet-123",
+      }),
     );
   });
 });

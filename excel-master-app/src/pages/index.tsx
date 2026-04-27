@@ -1843,7 +1843,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ spreadsheet_id: targetId, mode: "async" }),
+        body: JSON.stringify({ spreadsheet_id: targetId }),
       });
       const data = await parseResponseBody(res);
       if (!res.ok) {
