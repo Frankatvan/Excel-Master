@@ -170,6 +170,25 @@ function updateSingleByColumn<T>(
   return selectSingle<T>(query.eq(column, value));
 }
 
+function updateManyByColumn<T>(
+  client: SupabaseLike,
+  tableName: string,
+  column: string,
+  value: string,
+  payload: Record<string, unknown>,
+): Promise<SupabaseResult<T[]>> {
+  const table = client.from(tableName);
+  if (!table.update) {
+    throw new Error(`Supabase ${tableName} update is unavailable.`);
+  }
+  const query = table.update(payload) as { eq(column: string, value: string): unknown };
+  const filtered = query.eq(column, value) as { select?: (columns?: string) => Promise<SupabaseResult<T[]>> };
+  if (!filtered.select) {
+    throw new Error(`Supabase ${tableName} bulk update select is unavailable.`);
+  }
+  return filtered.select();
+}
+
 function throwIfSupabaseError(error: unknown) {
   if (!error) {
     return;
@@ -295,7 +314,7 @@ export async function updateImportManifestItemStatus(
   };
   const { data, error } = input.itemId
     ? await updateSingleById(client, "external_import_manifest_items", input.itemId, payload)
-    : await updateSingleByColumn(client, "external_import_manifest_items", "job_id", input.jobId ?? "", payload);
+    : await updateManyByColumn(client, "external_import_manifest_items", "job_id", input.jobId ?? "", payload);
   throwIfSupabaseError(error);
   return data;
 }

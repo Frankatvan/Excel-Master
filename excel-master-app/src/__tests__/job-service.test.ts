@@ -277,4 +277,45 @@ describe("job-service", () => {
     });
     expect(updateFake.calls.eq).toHaveBeenCalledWith("id", "item-123");
   });
+
+  it("updates all external import manifest items for a job without coercing to a single row", async () => {
+    const response = {
+      data: [
+        { id: "item-1", status: "validated" },
+        { id: "item-2", status: "validated" },
+        { id: "item-3", status: "validated" },
+        { id: "item-4", status: "validated" },
+        { id: "item-5", status: "validated" },
+        { id: "item-6", status: "validated" },
+        { id: "item-7", status: "validated" },
+      ],
+      error: null,
+    };
+    const select = jest.fn().mockResolvedValue(response);
+    const eq = jest.fn().mockReturnValue({ select });
+    const update = jest.fn().mockReturnValue({ eq });
+    const from = jest.fn(() => ({ update }));
+
+    await expect(
+      updateImportManifestItemStatus(
+        {
+          jobId: "job-123",
+          status: "validated",
+          resultMeta: { validation: { ok: true } },
+        },
+        { from } as never,
+      ),
+    ).resolves.toEqual(response.data);
+
+    expect(from).toHaveBeenCalledWith("external_import_manifest_items");
+    expect(update).toHaveBeenCalledWith({
+      status: "validated",
+      validation_message: null,
+      result_meta: { validation: { ok: true } },
+      error: null,
+      imported_at: "2026-04-27T10:00:00.000Z",
+    });
+    expect(eq).toHaveBeenCalledWith("job_id", "job-123");
+    expect(select).toHaveBeenCalledWith();
+  });
 });

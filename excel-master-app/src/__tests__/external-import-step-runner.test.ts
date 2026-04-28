@@ -134,6 +134,21 @@ function manifestStatus(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function manifestItems(count: number, overrides: Record<string, unknown> = {}) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `manifest-item-${index + 1}`,
+    manifest_id: "manifest-123",
+    job_id: "job-123",
+    source_table: `table-${index + 1}`,
+    target_zone_key: `external_import.table_${index + 1}`,
+    status: "imported",
+    row_count: 10,
+    column_count: 5,
+    result_meta: {},
+    ...overrides,
+  }));
+}
+
 function sheetsRecorder() {
   const calls: Array<{ spreadsheetId: string; requestBody: { requests: Record<string, unknown>[] } }> = [];
   return {
@@ -391,6 +406,44 @@ describe("external import step runner", () => {
     );
   });
 
+  it("marks all manifest items validated after validation succeeds for a seven-table import", async () => {
+    const sevenItems = manifestItems(7);
+    mockGetExternalImportStatus.mockResolvedValue(manifestStatus({ manifest_items: sevenItems }) as never);
+    mockDownloadExternalImportJsonArtifact.mockResolvedValue(
+      artifact({
+        chunks: [],
+        validation: { ok: true, checked_tables: sevenItems.map((item) => item.source_table) },
+      }) as never,
+    );
+
+    const result = await runExternalImportJobStep({
+      job: job({ result_meta: { current_step: "validation" } }) as never,
+      maxRowsPerStep: 500,
+      sheets: sheetsRecorder().sheets,
+    });
+
+    expect(result).toMatchObject({
+      status: "succeeded",
+      has_next_step: false,
+      step: { kind: "validation" },
+    });
+    expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        status: "validated",
+        resultMeta: expect.objectContaining({
+          validation: expect.objectContaining({ ok: true }),
+        }),
+      }),
+    );
+    expect(mockUpdateExternalImportJobProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "succeeded",
+        result: expect.objectContaining({ imported_table_count: 7 }),
+      }),
+    );
+  });
+
   it("marks failed evidence and does not advance next stage when validation fails", async () => {
     mockDownloadExternalImportJsonArtifact.mockResolvedValue(
       artifact({
@@ -425,6 +478,50 @@ describe("external import step runner", () => {
     );
     expect(mockUpdateExternalImportJobProgress).toHaveBeenCalledWith(
       expect.objectContaining({ status: "failed", error: expectedError }),
+    );
+  });
+
+  it("marks all manifest items failed after validation fails for a seven-table import", async () => {
+    const sevenItems = manifestItems(7);
+    const validation = { ok: false, errors: [{ code: "ROW_TOTAL_MISMATCH", message: "Totals differ" }] };
+    mockGetExternalImportStatus.mockResolvedValue(manifestStatus({ manifest_items: sevenItems }) as never);
+    mockDownloadExternalImportJsonArtifact.mockResolvedValue(
+      artifact({
+        chunks: [],
+        validation,
+      }) as never,
+    );
+
+    const result = await runExternalImportJobStep({
+      job: job({ result_meta: { current_step: "validation" } }) as never,
+      maxRowsPerStep: 500,
+      sheets: sheetsRecorder().sheets,
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      has_next_step: false,
+      step: { kind: "validation" },
+    });
+    expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        status: "failed",
+        validationMessage: "External import validation failed.",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_VALIDATION_FAILED",
+          details: { validation },
+        }),
+      }),
+    );
+    expect(mockUpdateExternalImportJobProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_VALIDATION_FAILED",
+          details: { validation },
+        }),
+      }),
     );
   });
 });
