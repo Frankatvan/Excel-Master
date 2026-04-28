@@ -27,6 +27,7 @@ interface SupabaseLike {
   from(table: string): {
     insert?(payload: Record<string, unknown>): unknown;
     update?(payload: Record<string, unknown>): unknown;
+    select?(columns?: string): unknown;
   };
 }
 
@@ -79,7 +80,8 @@ export interface CreateImportManifestItemInput {
 }
 
 export interface UpdateImportManifestItemStatusInput {
-  itemId: string;
+  itemId?: string;
+  jobId?: string;
   status: ExternalImportManifestStatus;
   validationMessage?: string | null;
   resultMeta?: Record<string, unknown>;
@@ -102,6 +104,20 @@ function getSupabaseClient(): SupabaseLike {
 function selectSingle<T>(query: unknown): Promise<SupabaseResult<T>> {
   const selectable = query as { select(columns?: string): { single(): Promise<SupabaseResult<T>> } };
   return selectable.select().single();
+}
+
+function maybeSingle<T>(query: unknown): Promise<SupabaseResult<T>> {
+  const selectable = query as {
+    maybeSingle?: () => Promise<SupabaseResult<T>>;
+    single?: () => Promise<SupabaseResult<T>>;
+  };
+  if (selectable.maybeSingle) {
+    return selectable.maybeSingle();
+  }
+  if (selectable.single) {
+    return selectable.single();
+  }
+  throw new Error("Supabase maybeSingle is unavailable.");
 }
 
 function updateById<T>(client: SupabaseLike, jobId: string, payload: Record<string, unknown>): Promise<SupabaseResult<T>> {
@@ -137,6 +153,21 @@ function updateSingleById<T>(
   }
   const query = table.update(payload) as { eq(column: string, value: string): unknown };
   return selectSingle<T>(query.eq("id", rowId));
+}
+
+function updateSingleByColumn<T>(
+  client: SupabaseLike,
+  tableName: string,
+  column: string,
+  value: string,
+  payload: Record<string, unknown>,
+): Promise<SupabaseResult<T>> {
+  const table = client.from(tableName);
+  if (!table.update) {
+    throw new Error(`Supabase ${tableName} update is unavailable.`);
+  }
+  const query = table.update(payload) as { eq(column: string, value: string): unknown };
+  return selectSingle<T>(query.eq(column, value));
 }
 
 function throwIfSupabaseError(error: unknown) {
@@ -193,6 +224,17 @@ export async function createJob(input: CreateJobInput, client: SupabaseLike = ge
   return data;
 }
 
+export async function getJob(jobId: string, client: SupabaseLike = getSupabaseClient()) {
+  const table = client.from("jobs");
+  if (!table.select) {
+    throw new Error("Supabase jobs select is unavailable.");
+  }
+  const query = table.select("*") as { eq(column: string, value: string): unknown };
+  const { data, error } = await maybeSingle<DurableJobRow>(query.eq("id", jobId));
+  throwIfSupabaseError(error);
+  return data;
+}
+
 export async function createImportManifest(
   input: CreateImportManifestInput,
   client: SupabaseLike = getSupabaseClient(),
@@ -244,39 +286,112 @@ export async function updateImportManifestItemStatus(
   input: UpdateImportManifestItemStatusInput,
   client: SupabaseLike = getSupabaseClient(),
 ) {
-  const { data, error } = await updateSingleById(client, "external_import_manifest_items", input.itemId, {
+  const payload = {
     status: input.status,
     validation_message: input.validationMessage ?? null,
     result_meta: input.resultMeta ?? {},
     error: input.error ?? null,
     imported_at: nowIso(),
-  });
+  };
+  const { data, error } = input.itemId
+    ? await updateSingleById(client, "external_import_manifest_items", input.itemId, payload)
+    : await updateSingleByColumn(client, "external_import_manifest_items", "job_id", input.jobId ?? "", payload);
+  throwIfSupabaseError(error);
+  return data;
+}
+
+export async function updateImportManifestStatus(
+  input: {
+    manifestId?: string;
+    jobId?: string;
+    status: ExternalImportManifestStatus;
+    resultMeta?: Record<string, unknown>;
+    error?: Record<string, unknown> | null;
+  },
+  client: SupabaseLike = getSupabaseClient(),
+) {
+  const payload = {
+    status: input.status,
+    result_meta: input.resultMeta ?? {},
+    error: input.error ?? null,
+    imported_at: nowIso(),
+  };
+  const { data, error } = input.manifestId
+    ? await updateSingleById(client, "external_import_manifests", input.manifestId, payload)
+    : await updateSingleByColumn(client, "external_import_manifests", "job_id", input.jobId ?? "", payload);
   throwIfSupabaseError(error);
   return data;
 }
 
 export async function markJobRunning(
-  input: { jobId: string; lockToken: string },
+  input: { jobId: string; lockToken: string; progress?: number; resultMeta?: Record<string, unknown> },
   client: SupabaseLike = getSupabaseClient(),
 ) {
   const timestamp = nowIso();
-  const { data, error } = await updateById<DurableJobRow>(client, input.jobId, {
+  const payload: Record<string, unknown> = {
     status: "running",
     lock_token: input.lockToken,
     started_at: timestamp,
     heartbeat_at: timestamp,
+  };
+  if (typeof input.progress === "number") {
+    payload.progress = input.progress;
+  }
+  if (input.resultMeta) {
+    payload.result_meta = input.resultMeta;
+  }
+  const { data, error } = await updateById<DurableJobRow>(client, input.jobId, {
+    ...payload,
   });
   throwIfSupabaseError(error);
   return data;
 }
 
 export async function heartbeatJob(
-  input: { jobId: string; progress?: number },
+  input: { jobId: string; progress?: number; resultMeta?: Record<string, unknown> },
   client: SupabaseLike = getSupabaseClient(),
 ) {
   const payload: Record<string, unknown> = { heartbeat_at: nowIso() };
   if (typeof input.progress === "number") {
     payload.progress = input.progress;
+  }
+  if (input.resultMeta) {
+    payload.result_meta = input.resultMeta;
+  }
+  const { data, error } = await updateById<DurableJobRow>(client, input.jobId, payload);
+  throwIfSupabaseError(error);
+  return data;
+}
+
+export async function updateExternalImportJobProgress(
+  input: {
+    jobId: string;
+    status?: "running" | "succeeded" | "failed";
+    progress: number;
+    resultMeta: Record<string, unknown>;
+    result?: Record<string, unknown>;
+    error?: Record<string, unknown> | null;
+  },
+  client: SupabaseLike = getSupabaseClient(),
+) {
+  const timestamp = nowIso();
+  const payload: Record<string, unknown> = {
+    heartbeat_at: timestamp,
+    progress: input.status === "succeeded" ? 100 : input.progress,
+    result_meta: input.resultMeta,
+  };
+  if (input.status) {
+    payload.status = input.status;
+  }
+  if (input.status === "succeeded" || input.status === "failed") {
+    payload.finished_at = timestamp;
+  }
+  if (input.status === "succeeded") {
+    payload.result = input.result ?? {};
+    payload.error = null;
+  }
+  if (input.status === "failed") {
+    payload.error = input.error ?? {};
   }
   const { data, error } = await updateById<DurableJobRow>(client, input.jobId, payload);
   throwIfSupabaseError(error);

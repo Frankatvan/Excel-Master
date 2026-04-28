@@ -198,3 +198,33 @@ export async function uploadExternalImportJsonArtifact(input: {
     sha256: crypto.createHash("sha256").update(body).digest("hex"),
   };
 }
+
+export async function downloadExternalImportJsonArtifact<T = unknown>(input: {
+  spreadsheetId: string;
+  ref: ExternalImportStoredJsonRef;
+  expectedFormat?: string;
+}): Promise<T> {
+  if (input.expectedFormat && input.ref.format !== input.expectedFormat) {
+    throw new Error(`Unsupported external import artifact format: ${input.ref.format}`);
+  }
+
+  assertUploadPathInSpreadsheetScope(input.spreadsheetId, input.ref.path);
+  const supabase = createSupabaseStorageClient();
+  const { data, error } = await supabase.storage.from(input.ref.bucket).download(input.ref.path);
+  if (error) {
+    throw new Error(error.message || "Failed to download external import payload artifact.");
+  }
+  if (!data) {
+    throw new Error("External import payload artifact is missing.");
+  }
+
+  const body = (await blobToBuffer(data)).toString("utf8");
+  if (input.ref.sha256) {
+    const actualHash = crypto.createHash("sha256").update(body).digest("hex");
+    if (actualHash !== input.ref.sha256) {
+      throw new Error("External import payload artifact hash mismatch.");
+    }
+  }
+
+  return JSON.parse(body) as T;
+}
