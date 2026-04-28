@@ -1003,7 +1003,11 @@ function normalizeExternalImportTableStatus(value: unknown): ExternalImportTable
     blocking:
       getStringArray(value.blocking).length > 0
         ? getStringArray(value.blocking)
-        : getStringArray(value.blocking_issues),
+        : getStringArray(value.blocking_issues).length > 0
+          ? getStringArray(value.blocking_issues)
+          : isRecord(value.schema_drift) && Array.isArray(value.schema_drift.blocking_issues)
+            ? getStringArray(value.schema_drift.blocking_issues)
+            : [],
   };
 }
 

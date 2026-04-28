@@ -538,6 +538,14 @@ function findManifestItem(items: ExternalImportManifestItemStatus[], chunk: Exte
   return items.find((item) => item.source_table === chunk.source_table || item.target_zone_key === chunk.target_zone_key) ?? null;
 }
 
+function isRetainedManifestItem(item: ExternalImportManifestItemStatus) {
+  return item.status === "stale" || item.status === "retained" || item.result_meta?.retained === true;
+}
+
+function importedManifestItems(items: ExternalImportManifestItemStatus[]) {
+  return items.filter((item) => !isRetainedManifestItem(item));
+}
+
 async function executeBatchUpdate(input: { spreadsheetId: string; requests: Record<string, unknown>[]; sheets?: unknown }) {
   if (!input.requests.length) {
     return { request_count: 0 };
@@ -686,13 +694,20 @@ async function completeValidationStep(input: {
       resultMeta: meta,
       error,
     });
-    await updateImportManifestItemStatus({
-      jobId: input.job.id,
-      status: "failed",
-      validationMessage: error.message,
-      resultMeta: meta,
-      error,
-    });
+    await Promise.all(
+      importedManifestItems(status.manifest_items).map((item) =>
+        updateImportManifestItemStatus({
+          itemId: item.id,
+          status: "failed",
+          validationMessage: error.message,
+          resultMeta: {
+            ...(item.result_meta ?? {}),
+            ...meta,
+          },
+          error,
+        }),
+      ),
+    );
     await updateExternalImportJobProgress({
       jobId: input.job.id,
       status: "failed",
@@ -719,18 +734,27 @@ async function completeValidationStep(input: {
     resultMeta: meta,
     error: null,
   });
-  await updateImportManifestItemStatus({
-    jobId: input.job.id,
-    status: "validated",
-    resultMeta: meta,
-    error: null,
-  });
+  const importedItems = importedManifestItems(status.manifest_items);
+  await Promise.all(
+    importedItems.map((item) =>
+      updateImportManifestItemStatus({
+        itemId: item.id,
+        status: "validated",
+        resultMeta: {
+          ...(item.result_meta ?? {}),
+          ...meta,
+        },
+        error: null,
+      }),
+    ),
+  );
   await updateExternalImportJobProgress({
     jobId: input.job.id,
     status: "succeeded",
     progress: 100,
     result: {
-      imported_table_count: status.manifest_items.length,
+      imported_table_count: importedItems.length,
+      retained_table_count: status.manifest_items.length - importedItems.length,
       validation,
     },
     resultMeta: meta,

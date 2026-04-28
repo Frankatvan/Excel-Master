@@ -16,6 +16,26 @@ export type TargetZoneKey =
   | "external_import.transfer_log_raw"
   | "external_import.change_order_log_raw";
 
+export const EXPECTED_EXTERNAL_IMPORT_SOURCE_ROLES: ExternalImportSourceRole[] = [
+  "payable",
+  "final_detail",
+  "unit_budget",
+  "draw_request",
+  "draw_invoice_list",
+  "transfer_log",
+  "change_order_log",
+];
+
+export const EXTERNAL_IMPORT_TARGET_ZONE_BY_SOURCE_ROLE: Record<ExternalImportSourceRole, TargetZoneKey> = {
+  payable: "external_import.payable_raw",
+  final_detail: "external_import.final_detail_raw",
+  unit_budget: "external_import.unit_budget_raw",
+  draw_request: "external_import.draw_request_raw",
+  draw_invoice_list: "external_import.draw_invoice_list_raw",
+  transfer_log: "external_import.transfer_log_raw",
+  change_order_log: "external_import.change_order_log_raw",
+};
+
 export interface SourceDetectionRule {
   sourceRole: ExternalImportSourceRole;
   targetZoneKey: TargetZoneKey;

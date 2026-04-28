@@ -307,7 +307,7 @@ function readResultMetaStatus(item: ExternalImportManifestItemStatus) {
 
 function isCompletedItem(item: ExternalImportManifestItemStatus) {
   const statuses = [item.status, readResultMetaStatus(item)];
-  return statuses.some((status) => status === "validated" || status === "imported" || status === "succeeded");
+  return statuses.some((status) => status === "validated" || status === "imported" || status === "succeeded" || status === "stale" || status === "retained");
 }
 
 function isFailedItem(item: ExternalImportManifestItemStatus) {

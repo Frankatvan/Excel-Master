@@ -908,32 +908,32 @@ describe("phase 1 workbench page", () => {
       }
       if (url.startsWith("/api/external_import/status")) {
         return jsonResponse({
-          manifest: {
-            tables: [
-              {
-                detected_table: "Payable",
-                file_name: "payable-april.xlsx",
-                source_sheet: "Payable",
-                row_count: 128,
-                amount_total: 45000,
-                semantic_target_zone: "external_data.payable",
-                status: "succeeded",
-                warnings: [],
-                blocking: [],
-              },
-              {
-                detected_table: "Draw Request report",
-                file_name: "current-drive-version",
-                source_sheet: "Draw Request report",
-                row_count: 42,
-                amount_total: 12000,
-                semantic_target_zone: "external_data.draw_request",
-                status: "retained",
+          manifest_items: [
+            {
+              source_table: "payable",
+              source_file_name: "payable-april.xlsx",
+              source_sheet_name: "Payable",
+              row_count: 128,
+              amount_total: 45000,
+              target_zone_key: "external_import.payable_raw",
+              status: "validated",
+              schema_drift: { warnings: [] },
+            },
+            {
+              source_table: "draw_request",
+              source_file_name: null,
+              source_sheet_name: null,
+              row_count: 0,
+              amount_total: 0,
+              target_zone_key: "external_import.draw_request_raw",
+              status: "stale",
+              schema_drift: {
                 warnings: ["No file uploaded in this run"],
-                blocking: ["Waiting for collaborator upload"],
+                blocking_issues: ["Waiting for collaborator upload"],
               },
-            ],
-          },
+              result_meta: { retained: true },
+            },
+          ],
         });
       }
       return jsonResponse({});
@@ -945,8 +945,9 @@ describe("phase 1 workbench page", () => {
     expect(screen.getByText("Reader/Commenter 只能查看导入状态，不能上传。")).toBeTruthy();
     expect(screen.queryByLabelText("选择外部导入文件")).toBeNull();
     expect(screen.queryByRole("button", { name: "确认导入" })).toBeNull();
-    await waitFor(() => expect(screen.getAllByText("Payable").length).toBeGreaterThan(0));
-    expect(screen.getAllByText("Draw Request report").length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getAllByText("payable").length).toBeGreaterThan(0));
+    expect(screen.getAllByText("draw_request").length).toBeGreaterThan(0);
+    expect(screen.getByText("stale")).toBeTruthy();
     expect(screen.getByText("No file uploaded in this run")).toBeTruthy();
     expect(screen.getByText("Waiting for collaborator upload")).toBeTruthy();
   });

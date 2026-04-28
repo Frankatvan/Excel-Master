@@ -219,4 +219,56 @@ describe("external import manifest service", () => {
       },
     });
   });
+
+  it("treats stale retained manifest items as terminal evidence in progress counts", async () => {
+    const client = new FakeSupabaseClient({
+      jobs: {
+        data: {
+          id: "job-partial-123",
+          spreadsheet_id: "sheet-123",
+          status: "succeeded",
+          progress: 100,
+          result_meta: { current_step: "complete" },
+        },
+        error: null,
+      },
+      external_import_manifests: {
+        data: { id: "manifest-123", job_id: "job-partial-123", spreadsheet_id: "sheet-123", status: "validated" },
+        error: null,
+      },
+      external_import_manifest_items: {
+        data: [
+          { id: "item-payable", manifest_id: "manifest-123", source_table: "payable", status: "validated", result_meta: {} },
+          {
+            id: "item-final-detail",
+            manifest_id: "manifest-123",
+            source_table: "final_detail",
+            status: "stale",
+            result_meta: { retained: true, retention_status: "stale" },
+          },
+        ],
+        error: null,
+      },
+    });
+
+    const status = await getExternalImportStatus(
+      { spreadsheetId: "sheet-123", jobId: "job-partial-123" },
+      client as never,
+    );
+
+    expect(status).toMatchObject({
+      status: "succeeded",
+      manifest_items: [
+        { source_table: "payable", status: "validated" },
+        { source_table: "final_detail", status: "stale" },
+      ],
+      progress: {
+        percent: 100,
+        total_items: 2,
+        completed_items: 2,
+        failed_items: 0,
+        pending_items: 0,
+      },
+    });
+  });
 });

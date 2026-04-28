@@ -6,6 +6,11 @@ import { getServerSession } from "next-auth/next";
 
 import { findPreviewRecord, type ExternalImportPreviewRecord } from "@/lib/external-import/preview-store";
 import { resolveImportZone, type ResolvedImportZone } from "@/lib/external-import/import-zone-resolver";
+import {
+  EXPECTED_EXTERNAL_IMPORT_SOURCE_ROLES,
+  EXTERNAL_IMPORT_TARGET_ZONE_BY_SOURCE_ROLE,
+  type ExternalImportSourceRole,
+} from "@/lib/external-import/source-detection";
 import { uploadExternalImportJsonArtifact, type ExternalImportStoredJsonRef } from "@/lib/external-import/upload-storage";
 import { getGoogleServiceAccountCredentials } from "@/lib/google-service-account";
 import { createImportManifest, createImportManifestItem, createJob } from "@/lib/job-service";
@@ -111,6 +116,16 @@ function buildParsedTableChunks(previewRecord: ExternalImportPreviewRecord) {
         blocking_issues: table.blocking_issues,
       },
     })),
+  );
+}
+
+function uploadedSourceRoles(previewRecord: ExternalImportPreviewRecord) {
+  return new Set(
+    previewRecord.files.flatMap((file) =>
+      file.tables.map((table) => table.source_role).filter((role): role is ExternalImportSourceRole =>
+        EXPECTED_EXTERNAL_IMPORT_SOURCE_ROLES.includes(role as ExternalImportSourceRole),
+      ),
+    ),
   );
 }
 
@@ -230,6 +245,44 @@ async function createQueuedManifest(input: {
         error: null,
       });
     }
+  }
+
+  const uploadedRoles = uploadedSourceRoles(input.previewRecord);
+  for (const sourceRole of EXPECTED_EXTERNAL_IMPORT_SOURCE_ROLES) {
+    if (uploadedRoles.has(sourceRole)) {
+      continue;
+    }
+    const targetZoneKey = EXTERNAL_IMPORT_TARGET_ZONE_BY_SOURCE_ROLE[sourceRole];
+    await createImportManifestItem({
+      manifestId: manifest.id,
+      jobId: input.jobId,
+      spreadsheetId: input.spreadsheetId,
+      sourceTable: sourceRole,
+      sourceFileName: null,
+      sourceSheetName: null,
+      fileHash: null,
+      headerSignature: null,
+      rowCount: 0,
+      columnCount: 0,
+      amountTotal: 0,
+      targetZoneKey,
+      resolvedZoneFingerprint: input.resolvedZones[targetZoneKey]?.fingerprint ?? null,
+      status: "stale",
+      validationMessage: "No file uploaded in this run; retained current worksheet data.",
+      schemaDrift: {
+        warnings: ["No file uploaded in this run; retained current worksheet data."],
+        blocking_issues: [],
+      },
+      resultMeta: {
+        source: "retained",
+        preview_hash: input.previewRecord.previewHash,
+        execution_artifact: input.executionArtifact,
+        retained: true,
+        retention_status: "stale",
+        retained_reason: "not_uploaded",
+      },
+      error: null,
+    });
   }
 
   return manifest;

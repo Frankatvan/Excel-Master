@@ -500,19 +500,96 @@ describe("external import step runner", () => {
       has_next_step: false,
       step: { kind: "validation" },
     });
-    expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+    for (const item of sevenItems) {
+      expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+        expect.objectContaining({
+          itemId: item.id,
+          status: "validated",
+          resultMeta: expect.objectContaining({
+            validation: expect.objectContaining({ ok: true }),
+          }),
+        }),
+      );
+    }
+    expect(mockUpdateImportManifestItemStatus).not.toHaveBeenCalledWith(
       expect.objectContaining({
         jobId: "job-123",
         status: "validated",
-        resultMeta: expect.objectContaining({
-          validation: expect.objectContaining({ ok: true }),
-        }),
       }),
     );
     expect(mockUpdateExternalImportJobProgress).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "succeeded",
         result: expect.objectContaining({ imported_table_count: 7 }),
+      }),
+    );
+  });
+
+  it("leaves stale retained manifest items stale after partial validation succeeds", async () => {
+    const partialItems = [
+      {
+        id: "manifest-item-payable",
+        manifest_id: "manifest-123",
+        job_id: "job-123",
+        source_table: "payable",
+        target_zone_key: "external_import.payable_raw",
+        status: "imported",
+        row_count: 10,
+        column_count: 5,
+        result_meta: {},
+      },
+      ...manifestItems(6, {
+        status: "stale",
+        result_meta: { retained: true, retention_status: "stale" },
+      }).map((item, index) => ({
+        ...item,
+        id: `manifest-item-stale-${index + 1}`,
+        source_table: [
+          "final_detail",
+          "unit_budget",
+          "draw_request",
+          "draw_invoice_list",
+          "transfer_log",
+          "change_order_log",
+        ][index],
+      })),
+    ];
+    mockGetExternalImportStatus.mockResolvedValue(manifestStatus({ manifest_items: partialItems }) as never);
+    mockDownloadExternalImportJsonArtifact.mockResolvedValue(
+      artifact({
+        chunks: [chunk],
+        validation: { ok: true, checked_tables: ["payable"] },
+      }) as never,
+    );
+
+    const result = await runExternalImportJobStep({
+      job: job({ result_meta: { current_step: "validation", cursor: { phase: "validation", chunk_index: 1, row_offset: 0 } } }) as never,
+      maxRowsPerStep: 500,
+      sheets: sheetsRecorder().sheets,
+    });
+
+    expect(result).toMatchObject({
+      status: "succeeded",
+      has_next_step: false,
+    });
+    expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        itemId: "manifest-item-payable",
+        status: "validated",
+      }),
+    );
+    for (const staleItem of partialItems.filter((item) => item.status === "stale")) {
+      expect(mockUpdateImportManifestItemStatus).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          itemId: staleItem.id,
+          status: "validated",
+        }),
+      );
+    }
+    expect(mockUpdateImportManifestItemStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        status: "validated",
       }),
     );
   });
@@ -576,15 +653,23 @@ describe("external import step runner", () => {
       has_next_step: false,
       step: { kind: "validation" },
     });
-    expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+    for (const item of sevenItems) {
+      expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith(
+        expect.objectContaining({
+          itemId: item.id,
+          status: "failed",
+          validationMessage: "External import validation failed.",
+          error: expect.objectContaining({
+            code: "EXTERNAL_IMPORT_VALIDATION_FAILED",
+            details: { validation },
+          }),
+        }),
+      );
+    }
+    expect(mockUpdateImportManifestItemStatus).not.toHaveBeenCalledWith(
       expect.objectContaining({
         jobId: "job-123",
         status: "failed",
-        validationMessage: "External import validation failed.",
-        error: expect.objectContaining({
-          code: "EXTERNAL_IMPORT_VALIDATION_FAILED",
-          details: { validation },
-        }),
       }),
     );
     expect(mockUpdateExternalImportJobProgress).toHaveBeenCalledWith(

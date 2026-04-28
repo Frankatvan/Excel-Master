@@ -751,6 +751,61 @@ describe("/api/external_import/confirm Phase 1 async queue contract", () => {
     expect(readJson(res)).toMatchObject({ status: "queued" });
   });
 
+  it("creates stale manifest evidence for expected non-uploaded source roles during partial confirm", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    const previewHash = await createStoredPreviewHash();
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: previewHash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    const itemInputs = mockCreateImportManifestItem.mock.calls.map(([input]) => input);
+    expect(itemInputs.map((input) => input.sourceTable).sort()).toEqual([
+      "change_order_log",
+      "draw_invoice_list",
+      "draw_request",
+      "final_detail",
+      "payable",
+      "transfer_log",
+      "unit_budget",
+    ]);
+    expect(itemInputs.find((input) => input.sourceTable === "payable")).toMatchObject({
+      status: "parsed",
+      sourceFileName: "payables.xlsx",
+      targetZoneKey: "external_import.payable_raw",
+    });
+    for (const sourceRole of [
+      "final_detail",
+      "unit_budget",
+      "draw_request",
+      "draw_invoice_list",
+      "transfer_log",
+      "change_order_log",
+    ]) {
+      expect(itemInputs.find((input) => input.sourceTable === sourceRole)).toMatchObject({
+        status: "stale",
+        sourceFileName: null,
+        sourceSheetName: null,
+        fileHash: null,
+        rowCount: 0,
+        columnCount: 0,
+        amountTotal: 0,
+        resultMeta: expect.objectContaining({
+          source: "retained",
+          retained: true,
+          retention_status: "stale",
+          preview_hash: previewHash,
+        }),
+      });
+    }
+  });
+
   it.each([
     ["reader", "reader@example.com"],
     ["commenter", "commenter@example.com"],
