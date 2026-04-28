@@ -25,6 +25,10 @@ const REQUIRED_KEYS = [
   "EXTERNAL_IMPORT_WORKER_SECRET",
 ];
 
+const OPTIONAL_KEYS = [
+  "VERCEL_AUTOMATION_BYPASS_SECRET",
+];
+
 function parseArgs(argv) {
   const args = new Set(argv);
   return {
@@ -118,7 +122,12 @@ function loadRequiredLocalEnv(projectRoot) {
     );
   }
 
-  return Object.fromEntries(REQUIRED_KEYS.map((key) => [key, String(env[key]).trim()]));
+  return Object.fromEntries([
+    ...REQUIRED_KEYS.map((key) => [key, String(env[key]).trim()]),
+    ...OPTIONAL_KEYS
+      .filter((key) => String(env[key] || "").trim())
+      .map((key) => [key, String(env[key]).trim()]),
+  ]);
 }
 
 function resolveToken(env, dryRun) {
@@ -186,7 +195,7 @@ function main() {
 
   console.log(`[env-sync] project=${projectLink.projectName || "unknown"}`);
   console.log(`[env-sync] target=${target}`);
-  console.log(`[env-sync] variables=${REQUIRED_KEYS.length}`);
+  console.log(`[env-sync] variables=${Object.keys(localEnv).length}`);
 
   for (const [key, value] of Object.entries(localEnv)) {
     syncVariable({

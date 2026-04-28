@@ -137,12 +137,18 @@ async function dispatchExternalImportWorker(input: {
   workerSecret: string;
   payload: Record<string, unknown>;
 }): Promise<ExternalImportWorkerResult> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-AiWB-Worker-Secret": input.workerSecret,
+  };
+  const vercelBypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET?.trim();
+  if (vercelBypassSecret) {
+    headers["x-vercel-protection-bypass"] = vercelBypassSecret;
+  }
+
   const response = await fetch(input.workerUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-AiWB-Worker-Secret": input.workerSecret,
-    },
+    headers,
     body: JSON.stringify({
       job_id: input.jobId,
       ...input.payload,

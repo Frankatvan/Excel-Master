@@ -22,6 +22,7 @@ export default function handler(
     hasWorkerUrlOverride: !!process.env.RECLASSIFY_WORKER_URL,
     hasExternalImportWorkerUrl: !!process.env.EXTERNAL_IMPORT_WORKER_URL,
     hasExternalImportWorkerSecret: !!process.env.EXTERNAL_IMPORT_WORKER_SECRET,
+    hasVercelAutomationBypassSecret: !!process.env.VERCEL_AUTOMATION_BYPASS_SECRET,
     deploymentCommit,
     vercelEnv: process.env.VERCEL_ENV || "unknown",
   })

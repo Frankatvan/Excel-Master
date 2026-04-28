@@ -27,6 +27,10 @@ const REQUIRED_ENV_KEYS = [
   "EXTERNAL_IMPORT_WORKER_SECRET",
 ];
 
+const OPTIONAL_ENV_KEYS = [
+  "VERCEL_AUTOMATION_BYPASS_SECRET",
+];
+
 function parseArgs(argv) {
   const args = new Set(argv);
   return {
@@ -138,7 +142,12 @@ function validateLocalBuildEnv(projectRoot) {
     );
   }
 
-  return Object.fromEntries(REQUIRED_ENV_KEYS.map((key) => [key, String(env[key]).trim()]));
+  return Object.fromEntries([
+    ...REQUIRED_ENV_KEYS.map((key) => [key, String(env[key]).trim()]),
+    ...OPTIONAL_ENV_KEYS
+      .filter((key) => String(env[key] || "").trim())
+      .map((key) => [key, String(env[key]).trim()]),
+  ]);
 }
 
 function loadRequiredLocalEnv(projectRoot) {
@@ -171,7 +180,12 @@ function loadRequiredLocalEnv(projectRoot) {
     );
   }
 
-  return Object.fromEntries(REQUIRED_ENV_KEYS.map((key) => [key, String(env[key]).trim()]));
+  return Object.fromEntries([
+    ...REQUIRED_ENV_KEYS.map((key) => [key, String(env[key]).trim()]),
+    ...OPTIONAL_ENV_KEYS
+      .filter((key) => String(env[key] || "").trim())
+      .map((key) => [key, String(env[key]).trim()]),
+  ]);
 }
 
 function resolveToken(env) {
@@ -281,7 +295,7 @@ function syncRequiredEnv({ prod, token, cliVersion, env, dryRun, projectRoot }) 
   const target = prod ? "production" : "preview";
   const localEnv = loadRequiredLocalEnv(projectRoot);
 
-  console.log(`[deploy] syncing ${REQUIRED_ENV_KEYS.length} required env vars to ${target}`);
+  console.log(`[deploy] syncing ${Object.keys(localEnv).length} env vars to ${target}`);
   for (const [key, value] of Object.entries(localEnv)) {
     syncVariable({ key, value, target, token, cliVersion, env, dryRun, projectRoot });
   }

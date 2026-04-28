@@ -53,6 +53,9 @@ describe("vercel deploy script", () => {
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
         "AIWB_WORKER_SECRET=worker-secret",
+        "EXTERNAL_IMPORT_WORKER_URL=https://worker.example.com/api/external-import",
+        "EXTERNAL_IMPORT_WORKER_SECRET=external-import-secret",
+        "VERCEL_AUTOMATION_BYPASS_SECRET=vercel-bypass-secret",
       ].join("\n"),
     );
 
@@ -64,10 +67,12 @@ describe("vercel deploy script", () => {
     });
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("syncing 12 required env vars to production");
+    expect(result.stdout).toContain("syncing 15 env vars to production");
     expect(result.stdout).toContain("would sync NEXTAUTH_URL to production");
     expect(result.stdout).toContain("would sync GOOGLE_SHEET_TEMPLATE_ID to production");
     expect(result.stdout).toContain("would sync AIWB_WORKER_SECRET to production");
+    expect(result.stdout).toContain("would sync EXTERNAL_IMPORT_WORKER_SECRET to production");
+    expect(result.stdout).toContain("would sync VERCEL_AUTOMATION_BYPASS_SECRET to production");
     expect(result.stdout).toContain("vercel@52.0.0 pull --yes --environment=production --token <redacted>");
     expect(result.stdout).toContain("vercel@52.0.0 deploy --archive=tgz --prod --yes --token <redacted>");
     expect(result.stdout).not.toContain("--prebuilt");
@@ -75,6 +80,8 @@ describe("vercel deploy script", () => {
     expect(result.stdout).toContain("NPM_CONFIG_CACHE=/tmp/npm-cache");
     expect(result.stdout).not.toContain("vcp_test_token_for_dry_run_only");
     expect(result.stdout).not.toContain("worker-secret");
+    expect(result.stdout).not.toContain("external-import-secret");
+    expect(result.stdout).not.toContain("vercel-bypass-secret");
   });
 
   it("runs the source deploy from the project root with git metadata disabled", () => {
@@ -101,6 +108,9 @@ describe("vercel deploy script", () => {
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
         "AIWB_WORKER_SECRET=worker-secret",
+        "EXTERNAL_IMPORT_WORKER_URL=https://worker.example.com/api/external-import",
+        "EXTERNAL_IMPORT_WORKER_SECRET=external-import-secret",
+        "VERCEL_AUTOMATION_BYPASS_SECRET=vercel-bypass-secret",
       ].join("\n"),
     );
     fs.writeFileSync(
@@ -155,6 +165,9 @@ describe("vercel deploy script", () => {
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
         "AIWB_WORKER_SECRET=worker-secret",
+        "EXTERNAL_IMPORT_WORKER_URL=https://worker.example.com/api/external-import",
+        "EXTERNAL_IMPORT_WORKER_SECRET=external-import-secret",
+        "VERCEL_AUTOMATION_BYPASS_SECRET=vercel-bypass-secret",
       ].join("\n"),
     );
     fs.writeFileSync(
@@ -206,6 +219,9 @@ describe("vercel deploy script", () => {
         "GOOGLE_SHEET_ID=sheet-id",
         "GOOGLE_SHEET_TEMPLATE_ID=template-id",
         "AIWB_WORKER_SECRET=worker-secret",
+        "EXTERNAL_IMPORT_WORKER_URL=https://worker.example.com/api/external-import",
+        "EXTERNAL_IMPORT_WORKER_SECRET=external-import-secret",
+        "VERCEL_AUTOMATION_BYPASS_SECRET=vercel-bypass-secret",
       ].join("\n"),
     );
 
@@ -220,6 +236,45 @@ describe("vercel deploy script", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("Invalid local environment");
     expect(result.stderr).toContain("NEXT_PUBLIC_SUPABASE_URL is empty");
+  });
+
+  it("does not require the optional Vercel automation bypass secret for env checks", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aiwb-deploy-env-"));
+    fs.mkdirSync(path.join(tempRoot, ".vercel"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRoot, ".vercel", "project.json"),
+      JSON.stringify({ projectName: "excel-master-app", projectId: "prj_test", orgId: "team_test" }),
+    );
+    fs.writeFileSync(
+      path.join(tempRoot, ".env.local"),
+      [
+        "NEXTAUTH_URL=https://audit.frankzh.top",
+        "NEXTAUTH_SECRET=secret",
+        "NEXT_PUBLIC_SUPABASE_URL=https://supabase.example.com",
+        "NEXT_PUBLIC_SUPABASE_ANON_KEY=anon",
+        "SUPABASE_SERVICE_ROLE_KEY=service",
+        "GOOGLE_CLIENT_ID=client-id",
+        "GOOGLE_CLIENT_SECRET=client-secret",
+        "GOOGLE_CLIENT_EMAIL=service@example.com",
+        "GOOGLE_PRIVATE_KEY=private-key",
+        "GOOGLE_SHEET_ID=sheet-id",
+        "GOOGLE_SHEET_TEMPLATE_ID=template-id",
+        "AIWB_WORKER_SECRET=worker-secret",
+        "EXTERNAL_IMPORT_WORKER_URL=https://worker.example.com/api/external-import",
+        "EXTERNAL_IMPORT_WORKER_SECRET=external-import-secret",
+      ].join("\n"),
+    );
+
+    const result = runDeployScript(
+      {
+        AIWB_DEPLOY_PROJECT_ROOT: tempRoot,
+        VERCEL_TOKEN: "vcp_test_token_for_dry_run_only",
+      },
+      ["--prod", "--check-env-only"],
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("environment check passed");
   });
 
   it("passes env checks from local env even when pulled sensitive production values are blank", () => {
@@ -242,6 +297,9 @@ describe("vercel deploy script", () => {
       "GOOGLE_SHEET_ID=sheet-id",
       "GOOGLE_SHEET_TEMPLATE_ID=template-id",
       "AIWB_WORKER_SECRET=worker-secret",
+      "EXTERNAL_IMPORT_WORKER_URL=https://worker.example.com/api/external-import",
+      "EXTERNAL_IMPORT_WORKER_SECRET=external-import-secret",
+      "VERCEL_AUTOMATION_BYPASS_SECRET=vercel-bypass-secret",
     ].join("\n");
     fs.writeFileSync(path.join(tempRoot, ".env.local"), validLocalEnv);
     fs.writeFileSync(

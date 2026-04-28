@@ -187,12 +187,14 @@ describe("deployment packaging guardrails", () => {
 
       expect(script).toContain('"EXTERNAL_IMPORT_WORKER_URL"');
       expect(script).toContain('"EXTERNAL_IMPORT_WORKER_SECRET"');
+      expect(script).toContain('"VERCEL_AUTOMATION_BYPASS_SECRET"');
     }
   });
 
   it("reports external import worker readiness without exposing secret values", () => {
     process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/api/external-import";
     process.env.EXTERNAL_IMPORT_WORKER_SECRET = "super-secret-external-import-token";
+    process.env.VERCEL_AUTOMATION_BYPASS_SECRET = "super-secret-vercel-bypass-token";
 
     const req = {} as NextApiRequest;
     const res = createMockRes();
@@ -206,8 +208,10 @@ describe("deployment packaging guardrails", () => {
       expect.objectContaining({
         hasExternalImportWorkerUrl: true,
         hasExternalImportWorkerSecret: true,
+        hasVercelAutomationBypassSecret: true,
       }),
     );
     expect(JSON.stringify(payload)).not.toContain("super-secret-external-import-token");
+    expect(JSON.stringify(payload)).not.toContain("super-secret-vercel-bypass-token");
   });
 });

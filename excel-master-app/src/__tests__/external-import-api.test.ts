@@ -605,6 +605,7 @@ describe("/api/external_import/confirm", () => {
   beforeEach(() => {
     process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/external-import";
     process.env.EXTERNAL_IMPORT_WORKER_SECRET = "worker-secret";
+    delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -763,6 +764,9 @@ describe("/api/external_import/confirm", () => {
         headers: expect.objectContaining({ "X-AiWB-Worker-Secret": "worker-secret" }),
       }),
     );
+    expect((global.fetch as jest.Mock).mock.calls[0]?.[1]?.headers).not.toHaveProperty(
+      "x-vercel-protection-bypass",
+    );
     expect(mockMarkJobRunning).toHaveBeenCalledWith({
       jobId: "job-123",
       lockToken: expect.any(String),
@@ -816,6 +820,48 @@ describe("/api/external_import/confirm", () => {
       manifest_id: "manifest-123",
       status_url: "/api/external_import/status?spreadsheet_id=sheet-123&job_id=job-123",
     });
+  });
+
+  it("sends the Vercel automation bypass header when configured", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    mockCreateJob.mockResolvedValue({ id: "job-123", status: "queued" });
+    process.env.VERCEL_AUTOMATION_BYPASS_SECRET = "vercel-bypass-secret";
+    const buffer = workbookBuffer([
+      {
+        name: "Payable",
+        rows: [
+          ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          ["g-1", "Apex", "INV-1", 100, "CA"],
+        ],
+      },
+    ]);
+    const previewReq = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [{ file_name: "payables.xlsx", content_base64: buffer.toString("base64") }],
+      },
+    } as unknown as NextApiRequest;
+    const previewRes = createMockRes();
+    await previewHandler(previewReq, previewRes);
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: readJson(previewRes).preview_hash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect((global.fetch as jest.Mock).mock.calls[0]?.[1]?.headers).toEqual(
+      expect.objectContaining({
+        "Content-Type": "application/json",
+        "X-AiWB-Worker-Secret": "worker-secret",
+        "x-vercel-protection-bypass": "vercel-bypass-secret",
+      }),
+    );
   });
 
   it("expires stored preview hashes after the short confirmation window", async () => {
@@ -1376,6 +1422,63 @@ describe("/api/external_import/confirm", () => {
         failed_manifest_item_count: 1,
       }),
     });
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+
+  it("keeps Vercel Authentication HTML 401 clear in the failed job evidence", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    mockCreateJob.mockResolvedValue({ id: "job-123", status: "queued" });
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: false,
+      status: 401,
+      text: async () => "<!doctype html><title>Authentication Required</title>",
+    });
+    const buffer = workbookBuffer([
+      {
+        name: "Payable",
+        rows: [
+          ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          ["g-1", "Apex", "INV-1", 100, "CA"],
+        ],
+      },
+    ]);
+    const previewReq = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [{ file_name: "payables.xlsx", content_base64: buffer.toString("base64") }],
+      },
+    } as unknown as NextApiRequest;
+    const previewRes = createMockRes();
+    await previewHandler(previewReq, previewRes);
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: readJson(previewRes).preview_hash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(mockCreateImportManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+          message: expect.stringContaining("Authentication Required"),
+        }),
+      }),
+    );
+    expect(mockMarkJobFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+          message: expect.stringContaining("Authentication Required"),
+        }),
+      }),
+    );
     expect(res.status).toHaveBeenCalledWith(500);
   });
 });

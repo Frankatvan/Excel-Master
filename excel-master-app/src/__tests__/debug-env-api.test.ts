@@ -29,6 +29,7 @@ describe("/api/debug-env", () => {
     process.env.GOOGLE_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----";
     process.env.GOOGLE_CLIENT_EMAIL = "worker@example.iam.gserviceaccount.com";
     process.env.RECLASSIFY_WORKER_URL = "https://worker.example.com/api/internal/reclassify_job";
+    process.env.VERCEL_AUTOMATION_BYPASS_SECRET = "super-secret-vercel-bypass-token";
     process.env.VERCEL_GIT_COMMIT_SHA = "abcdef1234567890";
     process.env.VERCEL_ENV = "production";
 
@@ -38,17 +39,21 @@ describe("/api/debug-env", () => {
     handler(req, res);
 
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({
-      clientId: "7951705060...t.com",
-      hasSecret: true,
-      nextAuthUrl: "https://audit.frankzh.top",
-      hasServiceAccountJson: true,
-      hasGoogleProjectId: true,
-      hasGooglePrivateKey: true,
-      hasGoogleClientEmail: true,
-      hasWorkerUrlOverride: true,
-      deploymentCommit: "abcdef12",
-      vercelEnv: "production",
-    });
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        clientId: "7951705060...t.com",
+        hasSecret: true,
+        nextAuthUrl: "https://audit.frankzh.top",
+        hasServiceAccountJson: true,
+        hasGoogleProjectId: true,
+        hasGooglePrivateKey: true,
+        hasGoogleClientEmail: true,
+        hasWorkerUrlOverride: true,
+        hasVercelAutomationBypassSecret: true,
+        deploymentCommit: "abcdef12",
+        vercelEnv: "production",
+      }),
+    );
+    expect(JSON.stringify((res.json as jest.Mock).mock.calls[0][0])).not.toContain("super-secret-vercel-bypass-token");
   });
 });
