@@ -21,12 +21,15 @@ const ASYNC_EXECUTION_ARTIFACT_FORMAT = "external_import.async_execution.chunk_p
 const DEFAULT_MAX_ROWS_PER_STEP = 500;
 
 export interface ExternalImportStepCursor {
+  phase?: "setup_table" | "write_chunk" | "validation";
   chunk_index: number;
   row_offset: number;
 }
 
 export interface ExternalImportExecutionChunk {
   source_table: string;
+  source_role?: string;
+  detected?: boolean;
   source_file_name?: string | null;
   source_sheet_name?: string | null;
   headers: unknown[];
@@ -43,6 +46,7 @@ export interface ExternalImportExecutionArtifact {
   preview_hash?: string;
   resolved_zones: Record<string, ResolvedImportZone>;
   chunks: ExternalImportExecutionChunk[];
+  validation?: Record<string, unknown>;
 }
 
 export class ExternalImportStepError extends Error {
@@ -68,6 +72,10 @@ function readCursor(value: unknown): ExternalImportStepCursor {
   }
   const cursor = value as Record<string, unknown>;
   return {
+    phase:
+      cursor.phase === "setup_table" || cursor.phase === "write_chunk" || cursor.phase === "validation"
+        ? cursor.phase
+        : undefined,
     chunk_index: readNumber(cursor.chunk_index, 0),
     row_offset: readNumber(cursor.row_offset, 0),
   };
@@ -118,6 +126,8 @@ function normalizeChunk(chunk: unknown): ExternalImportExecutionChunk | null {
   const rows = normalizeRows(raw.rows);
   return {
     source_table: sourceTable,
+    source_role: typeof raw.source_role === "string" ? raw.source_role : undefined,
+    detected: raw.detected === true,
     source_file_name: typeof raw.source_file_name === "string" ? raw.source_file_name : null,
     source_sheet_name: typeof raw.source_sheet_name === "string" ? raw.source_sheet_name : null,
     headers,
@@ -149,6 +159,9 @@ function normalizeArtifact(value: unknown): ExternalImportExecutionArtifact {
     preview_hash: typeof raw.preview_hash === "string" ? raw.preview_hash : undefined,
     resolved_zones: resolvedZones,
     chunks: Array.isArray(raw.chunks) ? raw.chunks.map(normalizeChunk).filter(Boolean) as ExternalImportExecutionChunk[] : [],
+    validation: raw.validation && typeof raw.validation === "object" && !Array.isArray(raw.validation)
+      ? (raw.validation as Record<string, unknown>)
+      : undefined,
   };
 }
 
@@ -211,6 +224,112 @@ function buildExpandRequest(resolvedZone: ResolvedImportZone, rowCount: number) 
         gridProperties: { rowCount: requiredEndRowIndex },
       },
       fields: "gridProperties.rowCount",
+    },
+  };
+}
+
+function isUploadedChunk(chunk: ExternalImportExecutionChunk) {
+  const sourceRole = String(chunk.source_role ?? "").toLowerCase();
+  return sourceRole ? sourceRole === "uploaded" || sourceRole === "detected" : chunk.detected === true;
+}
+
+function boundedClearRequest(input: {
+  resolvedZone: ResolvedImportZone;
+  startRowOffset: number;
+  rowCount: number;
+  startColumnOffset: number;
+  columnCount: number;
+  enforceColumnCapacity?: boolean;
+}) {
+  if (input.rowCount <= 0 || input.columnCount <= 0) {
+    return null;
+  }
+  const range = input.enforceColumnCapacity === false
+    ? input.resolvedZone.gridRange
+    : requireZoneRange(input.resolvedZone, input.startColumnOffset + input.columnCount);
+  if (typeof range.endColumnIndex !== "number" || typeof range.endRowIndex !== "number") {
+    throw new ExternalImportStepError("EXTERNAL_IMPORT_ZONE_INVALID", "Resolved import zone is missing row or column bounds.", {
+      target_zone_key: input.resolvedZone.zoneKey,
+    });
+  }
+  return {
+    repeatCell: {
+      range: {
+        sheetId: range.sheetId,
+        startRowIndex: range.startRowIndex + input.startRowOffset,
+        endRowIndex: range.startRowIndex + input.startRowOffset + input.rowCount,
+        startColumnIndex: range.startColumnIndex + input.startColumnOffset,
+        endColumnIndex: range.startColumnIndex + input.startColumnOffset + input.columnCount,
+      },
+      cell: {},
+      fields: "userEnteredValue",
+    },
+  };
+}
+
+function readItemCount(item: ExternalImportManifestItemStatus | null, key: "row_count" | "column_count", fallback: number) {
+  const metaKey = key === "row_count" ? "previous_row_count" : "previous_column_count";
+  const metaValue = item?.result_meta?.[metaKey];
+  const value = readNumber(metaValue, readNumber(item?.[key], fallback));
+  return Math.max(value, fallback);
+}
+
+function buildSetupRequests(input: {
+  resolvedZone: ResolvedImportZone;
+  chunk: ExternalImportExecutionChunk;
+  manifestItem: ExternalImportManifestItemStatus | null;
+}) {
+  const currentRowCount = input.chunk.rows.length;
+  const currentColumnCount = input.chunk.headers.length || input.chunk.column_count;
+  const previousRowCount = readItemCount(input.manifestItem, "row_count", currentRowCount);
+  const previousColumnCount = readItemCount(input.manifestItem, "column_count", currentColumnCount);
+  const requests: Record<string, unknown>[] = [];
+  const expandRequest = buildExpandRequest(input.resolvedZone, currentRowCount);
+  if (expandRequest) {
+    requests.push(expandRequest);
+  }
+  const currentClear = boundedClearRequest({
+    resolvedZone: input.resolvedZone,
+    startRowOffset: 0,
+    rowCount: currentRowCount,
+    startColumnOffset: 0,
+    columnCount: currentColumnCount,
+  });
+  if (currentClear) {
+    requests.push(currentClear);
+  }
+  const tailClear = boundedClearRequest({
+    resolvedZone: input.resolvedZone,
+    startRowOffset: currentRowCount,
+    rowCount: Math.max(previousRowCount - currentRowCount, 0),
+    startColumnOffset: 0,
+    columnCount: Math.max(previousColumnCount, currentColumnCount),
+    enforceColumnCapacity: false,
+  });
+  if (tailClear) {
+    requests.push(tailClear);
+  }
+  const widthDriftClear = boundedClearRequest({
+    resolvedZone: input.resolvedZone,
+    startRowOffset: 0,
+    rowCount: Math.max(previousRowCount, currentRowCount),
+    startColumnOffset: currentColumnCount,
+    columnCount: Math.max(previousColumnCount - currentColumnCount, 0),
+    enforceColumnCapacity: false,
+  });
+  if (widthDriftClear) {
+    requests.push(widthDriftClear);
+  }
+
+  return {
+    requests,
+    setupMeta: {
+      setup_completed: true,
+      clear_strategy: "bounded_target_tail_width_drift",
+      previous_row_count: previousRowCount,
+      previous_column_count: previousColumnCount,
+      current_row_count: currentRowCount,
+      current_column_count: currentColumnCount,
     },
   };
 }
@@ -280,9 +399,25 @@ export function planExternalImportStep(input: {
   resolvedZones: Record<string, ResolvedImportZone>;
   cursor: ExternalImportStepCursor;
   maxRowsPerStep: number;
+  manifestItem?: ExternalImportManifestItemStatus | null;
 }) {
   const maxRowsPerStep = Math.max(1, Math.floor(input.maxRowsPerStep));
-  const chunk = input.chunks[input.cursor.chunk_index];
+  const importChunks = input.chunks.filter(isUploadedChunk);
+  if (input.cursor.phase === "validation") {
+    return {
+      chunk: null,
+      rows: [],
+      requests: [],
+      nextCursor: null,
+      hasNextStep: false,
+      completedTable: false,
+      totalChunks: totalRowBandChunks(importChunks, maxRowsPerStep),
+      completedChunks: totalRowBandChunks(importChunks, maxRowsPerStep),
+      stepKind: "validation",
+      setupMeta: {},
+    };
+  }
+  const chunk = importChunks[input.cursor.chunk_index];
   if (!chunk) {
     return {
       chunk: null,
@@ -291,8 +426,10 @@ export function planExternalImportStep(input: {
       nextCursor: null,
       hasNextStep: false,
       completedTable: false,
-      totalChunks: totalRowBandChunks(input.chunks, maxRowsPerStep),
-      completedChunks: totalRowBandChunks(input.chunks, maxRowsPerStep),
+      totalChunks: totalRowBandChunks(importChunks, maxRowsPerStep),
+      completedChunks: totalRowBandChunks(importChunks, maxRowsPerStep),
+      stepKind: "validation",
+      setupMeta: {},
     };
   }
 
@@ -304,9 +441,11 @@ export function planExternalImportStep(input: {
   }
 
   const rows = chunk.rows.slice(input.cursor.row_offset, input.cursor.row_offset + maxRowsPerStep);
-  const expandRequest = input.cursor.row_offset === 0 ? buildExpandRequest(resolvedZone, chunk.rows.length) : null;
+  const setup = input.cursor.row_offset === 0
+    ? buildSetupRequests({ resolvedZone, chunk, manifestItem: input.manifestItem ?? null })
+    : { requests: [], setupMeta: {} };
   const requests = [
-    ...(expandRequest ? [expandRequest] : []),
+    ...setup.requests,
     ...buildExternalImportRowBandRequests({
       resolvedZone,
       rows,
@@ -317,12 +456,12 @@ export function planExternalImportStep(input: {
   const nextRowOffset = input.cursor.row_offset + rows.length;
   const completedTable = nextRowOffset >= chunk.rows.length;
   const nextCursor = completedTable
-    ? input.cursor.chunk_index + 1 < input.chunks.length
+    ? input.cursor.chunk_index + 1 < importChunks.length
       ? { chunk_index: input.cursor.chunk_index + 1, row_offset: 0 }
-      : null
+      : ({ phase: "validation", chunk_index: importChunks.length, row_offset: 0 } as ExternalImportStepCursor)
     : { chunk_index: input.cursor.chunk_index, row_offset: nextRowOffset };
-  const totalChunks = totalRowBandChunks(input.chunks, maxRowsPerStep);
-  const completedChunks = completedRowBandChunks(input.chunks, nextCursor, maxRowsPerStep);
+  const totalChunks = totalRowBandChunks(importChunks, maxRowsPerStep);
+  const completedChunks = completedRowBandChunks(importChunks, nextCursor, maxRowsPerStep);
 
   return {
     chunk,
@@ -333,6 +472,8 @@ export function planExternalImportStep(input: {
     completedTable,
     totalChunks,
     completedChunks,
+    stepKind: "write_chunk",
+    setupMeta: setup.setupMeta,
   };
 }
 
@@ -360,15 +501,18 @@ function progressMeta(input: {
   totalChunks: number;
   completedChunks: number;
   executionArtifact: ExternalImportStoredJsonRef;
+  currentStep?: string;
+  validation?: Record<string, unknown>;
 }) {
   return {
-    current_step: input.cursor ? "write_chunk" : "complete",
+    current_step: input.currentStep ?? (input.cursor?.phase === "validation" ? "validation" : input.cursor ? "write_chunk" : "complete"),
     total_chunks: input.totalChunks,
     completed_chunks: input.completedChunks,
     current_table: currentTableFromCursor(input.chunks, input.cursor),
     rows_written: rowsWrittenBeforeCursor(input.chunks, input.cursor),
     cursor: input.cursor,
     execution_artifact: input.executionArtifact,
+    ...(input.validation ? { validation: input.validation } : {}),
   };
 }
 
@@ -396,6 +540,153 @@ async function executeBatchUpdate(input: { spreadsheetId: string; requests: Reco
   return { ...(result ?? {}), request_count: input.requests.length };
 }
 
+function isValidationCursor(job: DurableJobRow, cursor: ExternalImportStepCursor) {
+  return cursor.phase === "validation" || job.result_meta?.current_step === "validation";
+}
+
+function validationSucceeded(validation: Record<string, unknown>) {
+  if (validation.ok === false || validation.valid === false || validation.status === "failed") {
+    return false;
+  }
+  return validation.ok === true || validation.valid === true || validation.status === "success" || validation.status === "succeeded";
+}
+
+function validationError(validation: Record<string, unknown>) {
+  return {
+    code: "EXTERNAL_IMPORT_VALIDATION_FAILED",
+    message: "External import validation failed.",
+    details: { validation },
+  };
+}
+
+async function runValidation(input: { spreadsheetId: string; artifact: ExternalImportExecutionArtifact }) {
+  if (input.artifact.validation) {
+    return input.artifact.validation;
+  }
+
+  const workerUrl = process.env.PROJECT_BOOTSTRAP_WORKER_URL?.trim();
+  const workerSecret = (process.env.PROJECT_BOOTSTRAP_WORKER_SECRET || process.env.AIWB_WORKER_SECRET || "").trim();
+  if (!workerUrl || !workerSecret) {
+    throw new ExternalImportStepError(
+      "EXTERNAL_IMPORT_VALIDATION_UNAVAILABLE",
+      "External import validation worker is not configured.",
+    );
+  }
+
+  const response = await fetch(workerUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-aiwb-worker-secret": workerSecret,
+    },
+    body: JSON.stringify({
+      operation: "validate_input",
+      spreadsheet_id: input.spreadsheetId,
+    }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new ExternalImportStepError(
+      "EXTERNAL_IMPORT_VALIDATION_FAILED",
+      "External import validation worker returned an error.",
+      { status: response.status, validation: body },
+    );
+  }
+  return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : { ok: true, result: body };
+}
+
+async function completeValidationStep(input: {
+  job: DurableJobRow;
+  spreadsheetId: string;
+  artifact: ExternalImportExecutionArtifact;
+  executionArtifact: ExternalImportStoredJsonRef;
+  importChunks: ExternalImportExecutionChunk[];
+  maxRowsPerStep: number;
+}) {
+  const validation = await runValidation({ spreadsheetId: input.spreadsheetId, artifact: input.artifact });
+  const status = await getExternalImportStatus({ spreadsheetId: input.spreadsheetId, jobId: input.job.id });
+  const totalChunks = totalRowBandChunks(input.importChunks, input.maxRowsPerStep);
+  const meta = progressMeta({
+    chunks: input.importChunks,
+    cursor: null,
+    totalChunks,
+    completedChunks: totalChunks,
+    executionArtifact: input.executionArtifact,
+    currentStep: validationSucceeded(validation) ? "complete" : "validation",
+    validation,
+  });
+
+  if (!validationSucceeded(validation)) {
+    const error = validationError(validation);
+    await updateImportManifestStatus({
+      jobId: input.job.id,
+      status: "failed",
+      resultMeta: meta,
+      error,
+    });
+    await updateImportManifestItemStatus({
+      jobId: input.job.id,
+      status: "failed",
+      validationMessage: error.message,
+      resultMeta: meta,
+      error,
+    });
+    await updateExternalImportJobProgress({
+      jobId: input.job.id,
+      status: "failed",
+      progress: 100,
+      resultMeta: meta,
+      error,
+    });
+    return {
+      status: "failed",
+      progress: 100,
+      cursor: null,
+      has_next_step: false,
+      rows_written: 0,
+      manifest_item_id: null,
+      step: { kind: "validation", index: totalChunks + 1, total: totalChunks + 1 },
+      next_step: null,
+      error,
+    };
+  }
+
+  await updateImportManifestStatus({
+    jobId: input.job.id,
+    status: "validated",
+    resultMeta: meta,
+    error: null,
+  });
+  await updateImportManifestItemStatus({
+    jobId: input.job.id,
+    status: "validated",
+    resultMeta: meta,
+    error: null,
+  });
+  await updateExternalImportJobProgress({
+    jobId: input.job.id,
+    status: "succeeded",
+    progress: 100,
+    result: {
+      imported_table_count: status.manifest_items.length,
+      validation,
+    },
+    resultMeta: meta,
+    error: null,
+  });
+
+  return {
+    status: "succeeded",
+    progress: 100,
+    cursor: null,
+    has_next_step: false,
+    rows_written: 0,
+    manifest_item_id: null,
+    step: { kind: "validation", index: totalChunks + 1, total: totalChunks + 1 },
+    next_step: null,
+  };
+}
+
 export async function runExternalImportJobStep(input: {
   job: DurableJobRow;
   maxRowsPerStep?: number;
@@ -419,24 +710,82 @@ export async function runExternalImportJobStep(input: {
 
   const maxRowsPerStep = Math.max(1, Math.floor(input.maxRowsPerStep ?? DEFAULT_MAX_ROWS_PER_STEP));
   const cursor = readCursor(input.job.result_meta?.cursor);
+  const activeCursor = isValidationCursor(input.job, cursor)
+    ? ({ phase: "validation", chunk_index: cursor.chunk_index, row_offset: 0 } as ExternalImportStepCursor)
+    : cursor;
+  const importChunks = artifact.chunks.filter(isUploadedChunk);
+
+  if (activeCursor.phase === "validation") {
+    return completeValidationStep({
+      job: input.job,
+      spreadsheetId,
+      artifact,
+      executionArtifact,
+      importChunks,
+      maxRowsPerStep,
+    });
+  }
+
+  if (artifact.chunks.length > 0 && importChunks.length === 0) {
+    const nextCursor = { phase: "validation", chunk_index: 0, row_offset: 0 } as ExternalImportStepCursor;
+    const meta = progressMeta({
+      chunks: importChunks,
+      cursor: nextCursor,
+      totalChunks: 0,
+      completedChunks: 0,
+      executionArtifact,
+      currentStep: "validation",
+    });
+    await updateExternalImportJobProgress({
+      jobId: input.job.id,
+      status: "running",
+      progress: 0,
+      resultMeta: meta,
+      error: null,
+    });
+    return {
+      status: "running",
+      progress: 0,
+      cursor: nextCursor,
+      has_next_step: true,
+      rows_written: 0,
+      manifest_item_id: null,
+      step: { kind: "skip_non_uploaded", index: 0, total: 1 },
+      next_step: { kind: "validation", index: 1, remaining: 1 },
+    };
+  }
+
+  const status = await getExternalImportStatus({ spreadsheetId, jobId: input.job.id });
+  const currentItem = findManifestItem(status.manifest_items, importChunks[activeCursor.chunk_index] ?? null);
   const plan = planExternalImportStep({
     chunks: artifact.chunks,
     resolvedZones: artifact.resolved_zones,
-    cursor,
+    cursor: activeCursor,
     maxRowsPerStep,
+    manifestItem: currentItem,
   });
+  if (plan.stepKind === "validation") {
+    return completeValidationStep({
+      job: input.job,
+      spreadsheetId,
+      artifact,
+      executionArtifact,
+      importChunks,
+      maxRowsPerStep,
+    });
+  }
   await executeBatchUpdate({ spreadsheetId, requests: plan.requests, sheets: input.sheets });
 
-  const status = await getExternalImportStatus({ spreadsheetId, jobId: input.job.id });
   const item = findManifestItem(status.manifest_items, plan.chunk);
   const meta = progressMeta({
-    chunks: artifact.chunks,
+    chunks: importChunks,
     cursor: plan.nextCursor,
     totalChunks: plan.totalChunks,
     completedChunks: plan.completedChunks,
     executionArtifact,
+    currentStep: plan.nextCursor?.phase === "validation" ? "validation" : "write_chunk",
   });
-  const progress = plan.totalChunks ? Math.round((plan.completedChunks / plan.totalChunks) * 100) : 100;
+  const progress = plan.totalChunks ? Math.min(99, Math.round((plan.completedChunks / plan.totalChunks) * 95)) : 0;
 
   if (item) {
     await updateImportManifestItemStatus({
@@ -445,6 +794,7 @@ export async function runExternalImportJobStep(input: {
       resultMeta: {
         ...item.result_meta,
         ...meta,
+        ...plan.setupMeta,
         current_table: plan.chunk?.source_table ?? null,
         chunk_rows_written: plan.rows.length,
       },
@@ -452,36 +802,27 @@ export async function runExternalImportJobStep(input: {
     });
   }
 
-  if (!plan.hasNextStep) {
+  if (plan.nextCursor?.phase === "validation") {
     await updateImportManifestStatus({
       jobId: input.job.id,
       status: "imported",
       resultMeta: meta,
       error: null,
     });
-    await updateExternalImportJobProgress({
-      jobId: input.job.id,
-      status: "succeeded",
-      progress: 100,
-      result: { imported_table_count: artifact.chunks.length },
-      resultMeta: meta,
-      error: null,
-    });
-  } else {
-    await updateExternalImportJobProgress({
-      jobId: input.job.id,
-      status: "running",
-      progress,
-      resultMeta: meta,
-      error: null,
-    });
   }
+  await updateExternalImportJobProgress({
+    jobId: input.job.id,
+    status: "running",
+    progress,
+    resultMeta: meta,
+    error: null,
+  });
 
   return {
-    status: plan.hasNextStep ? "running" : "succeeded",
-    progress: plan.hasNextStep ? progress : 100,
+    status: "running",
+    progress,
     cursor: plan.nextCursor,
-    has_next_step: plan.hasNextStep,
+    has_next_step: true,
     rows_written: plan.rows.length,
     manifest_item_id: item?.id ?? null,
     step: {
@@ -492,9 +833,9 @@ export async function runExternalImportJobStep(input: {
     },
     next_step: plan.nextCursor
       ? {
-          kind: "write_chunk",
+          kind: plan.nextCursor.phase === "validation" ? "validation" : "write_chunk",
           index: plan.completedChunks + 1,
-          remaining: Math.max(plan.totalChunks - plan.completedChunks, 0),
+          remaining: plan.nextCursor.phase === "validation" ? 1 : Math.max(plan.totalChunks - plan.completedChunks, 0),
         }
       : null,
   };

@@ -204,6 +204,124 @@ describe("/api/external_import/step", () => {
     );
   });
 
+  it("can progress through write chunks and then report validation as the next step", async () => {
+    mockRunExternalImportJobStep.mockResolvedValue({
+      status: "running",
+      progress: 90,
+      cursor: null,
+      has_next_step: true,
+      rows_written: 25,
+      manifest_item_id: "manifest-item-123",
+      step: {
+        kind: "write_chunk",
+        index: 3,
+        total: 3,
+        manifest_item_id: "manifest-item-123",
+      },
+      next_step: {
+        kind: "validation",
+        index: 4,
+        remaining: 1,
+      },
+    } as never);
+
+    const res = createMockRes();
+    const stepHandler = loadStepHandler();
+
+    await stepHandler(reqWithSecret({ job_id: "job-123", max_rows_per_step: 25 }), res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(readJson(res)).toMatchObject({
+      ok: true,
+      advanced: true,
+      status: "running",
+      progress: 90,
+      cursor: null,
+      has_next_step: true,
+      step: {
+        kind: "write_chunk",
+        index: 3,
+        total: 3,
+        manifest_item_id: "manifest-item-123",
+      },
+      next_step: {
+        kind: "validation",
+        index: 4,
+        remaining: 1,
+      },
+    });
+  });
+
+  it("optionally chains a bounded number of steps in one request", async () => {
+    mockRunExternalImportJobStep
+      .mockResolvedValueOnce({
+        status: "running",
+        progress: 50,
+        cursor: { chunk_index: 0, row_offset: 50 },
+        has_next_step: true,
+        rows_written: 50,
+        step: { kind: "write_chunk", index: 1, total: 2 },
+        next_step: { kind: "write_chunk", index: 2, remaining: 1 },
+      } as never)
+      .mockResolvedValueOnce({
+        status: "succeeded",
+        progress: 100,
+        cursor: null,
+        has_next_step: false,
+        rows_written: 0,
+        step: { kind: "validation", index: 3, total: 3 },
+        next_step: null,
+      } as never);
+
+    const res = createMockRes();
+    const stepHandler = loadStepHandler();
+
+    await stepHandler(reqWithSecret({ job_id: "job-123", chain: true, max_steps_per_request: 2 }), res);
+
+    expect(mockRunExternalImportJobStep).toHaveBeenCalledTimes(2);
+    expect(readJson(res)).toMatchObject({
+      ok: true,
+      status: "succeeded",
+      steps_advanced: 2,
+      has_next_step: false,
+      step: { kind: "validation" },
+    });
+  });
+
+  it.each([
+    ["succeeded", 100],
+    ["failed", 55],
+  ])("returns terminal %s jobs without advancing the runner", async (status, progress) => {
+    mockGetJob.mockResolvedValue(
+      queuedJob({
+        status,
+        progress,
+        result_meta: {
+          current_step: status === "succeeded" ? "complete" : "validation",
+          validation: status === "succeeded" ? { ok: true } : { ok: false },
+        },
+      }) as never,
+    );
+
+    const res = createMockRes();
+    const stepHandler = loadStepHandler();
+
+    await stepHandler(reqWithSecret({ job_id: "job-123" }), res);
+
+    expect(mockMarkJobRunning).not.toHaveBeenCalled();
+    expect(mockRunExternalImportJobStep).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(readJson(res)).toEqual({
+      ok: true,
+      job_id: "job-123",
+      status,
+      advanced: false,
+      step: null,
+      next_step: null,
+      has_next_step: false,
+    });
+  });
+
   it("marks the job, manifest, and current manifest item failed when chunk execution fails", async () => {
     mockRunExternalImportJobStep.mockRejectedValue(new Error("Sheets write failed"));
 

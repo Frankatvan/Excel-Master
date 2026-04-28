@@ -24,6 +24,10 @@ function readPositiveInteger(value: unknown, fallback: number) {
   return typeof parsed === "number" && Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
+function readBoolean(value: unknown) {
+  return value === true || value === "true" || value === 1 || value === "1";
+}
+
 function readHeader(req: NextApiRequest, header: string) {
   const value = req.headers[header.toLowerCase()];
   return Array.isArray(value) ? value[0] : value;
@@ -109,15 +113,48 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     }
 
-    const result = await runExternalImportJobStep({
-      job,
-      maxRowsPerStep: readPositiveInteger(req.body?.max_rows_per_step, 500),
-    });
+    const maxRowsPerStep = readPositiveInteger(req.body?.max_rows_per_step, 500);
+    const chain = readBoolean(req.body?.chain);
+    const maxStepsPerRequest = Math.min(readPositiveInteger(req.body?.max_steps_per_request, 1), 20);
+    const startedAt = Date.now();
+    const results = [];
+    let currentJob = job;
+    let stopReason: string | null = null;
+
+    for (let stepIndex = 0; stepIndex < maxStepsPerRequest; stepIndex += 1) {
+      const result = await runExternalImportJobStep({
+        job: currentJob,
+        maxRowsPerStep,
+      });
+      results.push(result);
+
+      if (!chain || !result.has_next_step || result.status === "succeeded" || result.status === "failed") {
+        break;
+      }
+      if (Date.now() - startedAt > 25_000) {
+        stopReason = "time_budget";
+        break;
+      }
+      currentJob = {
+        ...currentJob,
+        status: result.status,
+        progress: result.progress,
+        result_meta: {
+          ...(currentJob.result_meta ?? {}),
+          current_step: result.next_step?.kind === "validation" ? "validation" : "write_chunk",
+          cursor: result.cursor,
+        },
+      };
+    }
+
+    const result = results[results.length - 1];
 
     return res.status(200).json({
       ok: true,
       job_id: job.id,
       advanced: true,
+      steps_advanced: results.length,
+      ...(stopReason ? { chain_stopped_reason: stopReason } : {}),
       ...result,
     });
   } catch (error) {
