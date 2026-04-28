@@ -15,6 +15,7 @@ import {
   createImportManifest,
   createImportManifestItem,
   createJob,
+  findLatestRetainableExternalImportManifestItems,
   markJobFailed,
   markJobRunning,
   markJobSucceeded,
@@ -62,6 +63,7 @@ jest.mock("@/lib/job-service", () => ({
   createImportManifest: jest.fn(),
   createImportManifestItem: jest.fn(),
   createJob: jest.fn(),
+  findLatestRetainableExternalImportManifestItems: jest.fn(),
   markJobFailed: jest.fn(),
   markJobRunning: jest.fn(),
   markJobSucceeded: jest.fn(),
@@ -121,6 +123,9 @@ const mockGetExternalImportStatus = getExternalImportStatus as jest.MockedFuncti
 const mockCreateImportManifest = createImportManifest as jest.MockedFunction<typeof createImportManifest>;
 const mockCreateImportManifestItem = createImportManifestItem as jest.MockedFunction<typeof createImportManifestItem>;
 const mockCreateJob = createJob as jest.MockedFunction<typeof createJob>;
+const mockFindLatestRetainableExternalImportManifestItems = findLatestRetainableExternalImportManifestItems as jest.MockedFunction<
+  typeof findLatestRetainableExternalImportManifestItems
+>;
 const mockMarkJobFailed = markJobFailed as jest.MockedFunction<typeof markJobFailed>;
 const mockMarkJobRunning = markJobRunning as jest.MockedFunction<typeof markJobRunning>;
 const mockMarkJobSucceeded = markJobSucceeded as jest.MockedFunction<typeof markJobSucceeded>;
@@ -620,6 +625,7 @@ describe("/api/external_import/confirm Phase 1 async queue contract", () => {
     mockCreateJob.mockResolvedValue({ id: "job-123", status: "queued" });
     mockCreateImportManifest.mockResolvedValue({ id: "manifest-123", status: "queued" });
     mockCreateImportManifestItem.mockResolvedValue({ id: "manifest-item-123", status: "parsed" });
+    mockFindLatestRetainableExternalImportManifestItems.mockResolvedValue(new Map());
     mockRequireProjectCollaborator.mockResolvedValue({
       canAccess: true,
       canWrite: true,
@@ -801,9 +807,106 @@ describe("/api/external_import/confirm Phase 1 async queue contract", () => {
           retained: true,
           retention_status: "stale",
           preview_hash: previewHash,
+          retained_from_manifest_id: null,
+          retained_from_item_id: null,
+          retained_source_missing: true,
         }),
       });
     }
+  });
+
+  it("inherits retained stale rows from the latest previous successful manifest item when available", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    const retainedFinalDetail = {
+      id: "baseline-item-final-detail",
+      manifest_id: "baseline-manifest-123",
+      job_id: "baseline-job-123",
+      spreadsheet_id: "sheet-123",
+      source_table: "final_detail",
+      source_file_name: "final-detail-baseline.xlsx",
+      source_sheet_name: "Final Detail",
+      file_hash: "baseline-final-detail-file-hash",
+      header_signature: "baseline-final-detail-header-signature",
+      row_count: 428,
+      column_count: 42,
+      amount_total: "12345.67",
+      target_zone_key: "external_import.final_detail_raw",
+      resolved_zone_fingerprint: "baseline-final-detail-zone-fingerprint",
+      status: "validated",
+      result_meta: {},
+    };
+    const retainedUnitBudget = {
+      id: "baseline-item-unit-budget",
+      manifest_id: "baseline-manifest-123",
+      job_id: "baseline-job-123",
+      spreadsheet_id: "sheet-123",
+      source_table: "unit_budget",
+      source_file_name: "unit-budget-baseline.xlsx",
+      source_sheet_name: "Unit Budget",
+      file_hash: "baseline-unit-budget-file-hash",
+      header_signature: "baseline-unit-budget-header-signature",
+      row_count: 11,
+      column_count: 9,
+      amount_total: "8888",
+      target_zone_key: "external_import.unit_budget_raw",
+      resolved_zone_fingerprint: "baseline-unit-budget-zone-fingerprint",
+      status: "validated",
+      result_meta: {},
+    };
+    mockFindLatestRetainableExternalImportManifestItems.mockResolvedValue(
+      new Map([
+        ["final_detail", retainedFinalDetail],
+        ["unit_budget", retainedUnitBudget],
+      ]) as never,
+    );
+    const previewHash = await createStoredPreviewHash();
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: previewHash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(mockFindLatestRetainableExternalImportManifestItems).toHaveBeenCalledWith({
+      spreadsheetId: "sheet-123",
+      sourceTables: ["final_detail", "unit_budget", "draw_request", "draw_invoice_list", "transfer_log", "change_order_log"],
+      excludeJobId: "job-123",
+    });
+    const itemInputs = mockCreateImportManifestItem.mock.calls.map(([input]) => input);
+    expect(itemInputs.find((input) => input.sourceTable === "final_detail")).toMatchObject({
+      status: "stale",
+      sourceFileName: "final-detail-baseline.xlsx",
+      sourceSheetName: "Final Detail",
+      fileHash: "baseline-final-detail-file-hash",
+      headerSignature: "baseline-final-detail-header-signature",
+      rowCount: 428,
+      columnCount: 42,
+      amountTotal: 12345.67,
+      targetZoneKey: "external_import.final_detail_raw",
+      resolvedZoneFingerprint: "baseline-final-detail-zone-fingerprint",
+      resultMeta: expect.objectContaining({
+        retained: true,
+        retained_from_manifest_id: "baseline-manifest-123",
+        retained_from_item_id: "baseline-item-final-detail",
+        retained_source_missing: false,
+      }),
+    });
+    expect(itemInputs.find((input) => input.sourceTable === "unit_budget")).toMatchObject({
+      status: "stale",
+      fileHash: "baseline-unit-budget-file-hash",
+      rowCount: 11,
+      columnCount: 9,
+      amountTotal: 8888,
+      resultMeta: expect.objectContaining({
+        retained_from_manifest_id: "baseline-manifest-123",
+        retained_from_item_id: "baseline-item-unit-budget",
+        retained_source_missing: false,
+      }),
+    });
   });
 
   it.each([

@@ -13,7 +13,13 @@ import {
 } from "@/lib/external-import/source-detection";
 import { uploadExternalImportJsonArtifact, type ExternalImportStoredJsonRef } from "@/lib/external-import/upload-storage";
 import { getGoogleServiceAccountCredentials } from "@/lib/google-service-account";
-import { createImportManifest, createImportManifestItem, createJob } from "@/lib/job-service";
+import {
+  createImportManifest,
+  createImportManifestItem,
+  createJob,
+  findLatestRetainableExternalImportManifestItems,
+  type RetainableExternalImportManifestItem,
+} from "@/lib/job-service";
 import { ProjectAccessError, requireProjectCollaborator } from "@/lib/project-access";
 import { authOptions } from "../auth/[...nextauth]";
 
@@ -127,6 +133,11 @@ function uploadedSourceRoles(previewRecord: ExternalImportPreviewRecord) {
       ),
     ),
   );
+}
+
+function readRetainedNumber(value: unknown) {
+  const parsed = typeof value === "string" && value.trim() ? Number(value) : value;
+  return typeof parsed === "number" && Number.isFinite(parsed) ? parsed : 0;
 }
 
 function buildAsyncExecutionArtifact(input: {
@@ -248,25 +259,33 @@ async function createQueuedManifest(input: {
   }
 
   const uploadedRoles = uploadedSourceRoles(input.previewRecord);
+  const missingRoles = EXPECTED_EXTERNAL_IMPORT_SOURCE_ROLES.filter((sourceRole) => !uploadedRoles.has(sourceRole));
+  const retainedItems = await findLatestRetainableExternalImportManifestItems({
+    spreadsheetId: input.spreadsheetId,
+    sourceTables: missingRoles,
+    excludeJobId: input.jobId,
+  });
   for (const sourceRole of EXPECTED_EXTERNAL_IMPORT_SOURCE_ROLES) {
     if (uploadedRoles.has(sourceRole)) {
       continue;
     }
     const targetZoneKey = EXTERNAL_IMPORT_TARGET_ZONE_BY_SOURCE_ROLE[sourceRole];
+    const retainedItem = retainedItems.get(sourceRole) as RetainableExternalImportManifestItem | undefined;
+    const effectiveTargetZoneKey = retainedItem?.target_zone_key ?? targetZoneKey;
     await createImportManifestItem({
       manifestId: manifest.id,
       jobId: input.jobId,
       spreadsheetId: input.spreadsheetId,
       sourceTable: sourceRole,
-      sourceFileName: null,
-      sourceSheetName: null,
-      fileHash: null,
-      headerSignature: null,
-      rowCount: 0,
-      columnCount: 0,
-      amountTotal: 0,
-      targetZoneKey,
-      resolvedZoneFingerprint: input.resolvedZones[targetZoneKey]?.fingerprint ?? null,
+      sourceFileName: retainedItem?.source_file_name ?? null,
+      sourceSheetName: retainedItem?.source_sheet_name ?? null,
+      fileHash: retainedItem?.file_hash ?? null,
+      headerSignature: retainedItem?.header_signature ?? null,
+      rowCount: readRetainedNumber(retainedItem?.row_count),
+      columnCount: readRetainedNumber(retainedItem?.column_count),
+      amountTotal: readRetainedNumber(retainedItem?.amount_total),
+      targetZoneKey: effectiveTargetZoneKey,
+      resolvedZoneFingerprint: retainedItem?.resolved_zone_fingerprint ?? input.resolvedZones[effectiveTargetZoneKey]?.fingerprint ?? null,
       status: "stale",
       validationMessage: "No file uploaded in this run; retained current worksheet data.",
       schemaDrift: {
@@ -280,6 +299,9 @@ async function createQueuedManifest(input: {
         retained: true,
         retention_status: "stale",
         retained_reason: "not_uploaded",
+        retained_from_manifest_id: retainedItem?.manifest_id ?? null,
+        retained_from_item_id: retainedItem?.id ?? null,
+        retained_source_missing: !retainedItem,
       },
       error: null,
     });

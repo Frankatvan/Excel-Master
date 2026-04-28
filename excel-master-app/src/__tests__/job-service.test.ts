@@ -3,6 +3,7 @@ import {
   createJob,
   createImportManifest,
   createImportManifestItem,
+  findLatestRetainableExternalImportManifestItems,
   heartbeatJob,
   markJobCancelled,
   markJobFailed,
@@ -317,5 +318,102 @@ describe("job-service", () => {
     });
     expect(eq).toHaveBeenCalledWith("job_id", "job-123");
     expect(select).toHaveBeenCalledWith();
+  });
+
+  it("finds latest retainable external import items and skips the current job", async () => {
+    const itemSelect = jest.fn().mockReturnThis();
+    const itemEq = jest.fn().mockReturnThis();
+    const itemOrder = jest.fn().mockReturnThis();
+    const itemLimit = jest.fn().mockResolvedValue({
+      data: [
+        {
+          id: "current-item",
+          manifest_id: "current-manifest",
+          job_id: "current-job",
+          spreadsheet_id: "sheet-123",
+          source_table: "final_detail",
+          file_hash: "current-hash",
+          status: "validated",
+        },
+        {
+          id: "missing-retained-item",
+          manifest_id: "partial-manifest",
+          job_id: "partial-job",
+          spreadsheet_id: "sheet-123",
+          source_table: "final_detail",
+          file_hash: null,
+          status: "stale",
+          result_meta: { retained: true, retained_source_missing: true },
+        },
+        {
+          id: "baseline-item",
+          manifest_id: "baseline-manifest",
+          job_id: "baseline-job",
+          spreadsheet_id: "sheet-123",
+          source_table: "final_detail",
+          file_hash: "baseline-hash",
+          status: "validated",
+        },
+      ],
+      error: null,
+    });
+    const manifestMaybeSingle = jest
+      .fn()
+      .mockResolvedValueOnce({
+        data: { id: "partial-manifest", status: "validated" },
+        error: null,
+      })
+      .mockResolvedValueOnce({
+        data: { id: "baseline-manifest", status: "validated" },
+        error: null,
+      });
+    const manifestSelect = jest.fn().mockReturnValue({
+      eq: jest.fn().mockReturnValue({ maybeSingle: manifestMaybeSingle }),
+    });
+    const jobMaybeSingle = jest
+      .fn()
+      .mockResolvedValueOnce({
+        data: { id: "partial-job", status: "succeeded" },
+        error: null,
+      })
+      .mockResolvedValueOnce({
+        data: { id: "baseline-job", status: "succeeded" },
+        error: null,
+      });
+    const jobSelect = jest.fn().mockReturnValue({
+      eq: jest.fn().mockReturnValue({ maybeSingle: jobMaybeSingle }),
+    });
+    const from = jest.fn((table: string) => {
+      if (table === "external_import_manifest_items") {
+        return { select: itemSelect.mockReturnValue({ eq: itemEq }) };
+      }
+      if (table === "external_import_manifests") {
+        return { select: manifestSelect };
+      }
+      if (table === "jobs") {
+        return { select: jobSelect };
+      }
+      throw new Error(`Unexpected table: ${table}`);
+    });
+    itemEq.mockReturnValue({ eq: itemEq, order: itemOrder });
+    itemOrder.mockReturnValue({ limit: itemLimit });
+
+    const retained = await findLatestRetainableExternalImportManifestItems(
+      {
+        spreadsheetId: "sheet-123",
+        sourceTables: ["final_detail"],
+        excludeJobId: "current-job",
+      },
+      { from } as never,
+    );
+
+    expect(retained.get("final_detail")).toMatchObject({
+      id: "baseline-item",
+      file_hash: "baseline-hash",
+    });
+    expect(itemEq).toHaveBeenCalledWith("spreadsheet_id", "sheet-123");
+    expect(itemEq).toHaveBeenCalledWith("source_table", "final_detail");
+    expect(itemOrder).toHaveBeenCalledWith("imported_at", { ascending: false });
+    expect(itemLimit).toHaveBeenCalledWith(25);
   });
 });

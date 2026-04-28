@@ -88,6 +88,25 @@ export interface UpdateImportManifestItemStatusInput {
   error?: Record<string, unknown> | null;
 }
 
+export interface RetainableExternalImportManifestItem {
+  id: string;
+  manifest_id: string;
+  job_id: string;
+  spreadsheet_id: string;
+  source_table: string;
+  source_file_name?: string | null;
+  source_sheet_name?: string | null;
+  file_hash?: string | null;
+  header_signature?: string | null;
+  row_count?: number | null;
+  column_count?: number | null;
+  amount_total?: number | string | null;
+  target_zone_key?: string | null;
+  resolved_zone_fingerprint?: string | null;
+  status?: string | null;
+  result_meta?: Record<string, unknown> | null;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -216,6 +235,114 @@ function throwIfSupabaseError(error: unknown) {
   }
 
   throw new Error("Supabase job operation failed.");
+}
+
+async function selectMany<T>(query: unknown): Promise<SupabaseResult<T[]>> {
+  return (await (query as PromiseLike<SupabaseResult<T[]>>)) as SupabaseResult<T[]>;
+}
+
+async function findImportManifestById(
+  manifestId: string,
+  client: SupabaseLike,
+): Promise<{ id: string; status?: string | null } | null> {
+  const table = client.from("external_import_manifests");
+  if (!table.select) {
+    throw new Error("Supabase external_import_manifests select is unavailable.");
+  }
+  const query = table.select("id,status") as { eq(column: string, value: string): unknown };
+  const { data, error } = await maybeSingle<{ id: string; status?: string | null }>(query.eq("id", manifestId));
+  throwIfSupabaseError(error);
+  return data;
+}
+
+async function findJobByIdForRetention(
+  jobId: string,
+  client: SupabaseLike,
+): Promise<{ id: string; status?: string | null } | null> {
+  const table = client.from("jobs");
+  if (!table.select) {
+    throw new Error("Supabase jobs select is unavailable.");
+  }
+  const query = table.select("id,status") as { eq(column: string, value: string): unknown };
+  const { data, error } = await maybeSingle<{ id: string; status?: string | null }>(query.eq("id", jobId));
+  throwIfSupabaseError(error);
+  return data;
+}
+
+function isRetainablePriorStatus(input: {
+  item: RetainableExternalImportManifestItem;
+  manifest: { status?: string | null } | null;
+  job: { status?: string | null } | null;
+}) {
+  if (input.item.status === "stale" || input.item.status === "retained") {
+    return input.item.result_meta?.retained_source_missing !== true && !!input.item.file_hash;
+  }
+  return (
+    input.item.status === "validated" ||
+    input.item.status === "imported" ||
+    input.manifest?.status === "validated" ||
+    input.manifest?.status === "imported" ||
+    input.job?.status === "succeeded"
+  );
+}
+
+export async function findLatestRetainableExternalImportManifestItems(
+  input: {
+    spreadsheetId: string;
+    sourceTables: string[];
+    excludeJobId?: string | null;
+  },
+  client: SupabaseLike = getSupabaseClient(),
+) {
+  const retainedBySourceTable = new Map<string, RetainableExternalImportManifestItem>();
+  const manifestStatusById = new Map<string, { id: string; status?: string | null } | null>();
+  const jobStatusById = new Map<string, { id: string; status?: string | null } | null>();
+
+  for (const sourceTable of input.sourceTables) {
+    const table = client.from("external_import_manifest_items");
+    if (!table.select) {
+      throw new Error("Supabase external_import_manifest_items select is unavailable.");
+    }
+    const query = table.select("*") as {
+      eq(column: string, value: string): {
+        eq(column: string, value: string): {
+          order(column: string, options?: { ascending?: boolean }): {
+            limit(count: number): unknown;
+          };
+        };
+      };
+    };
+    const { data, error } = await selectMany<RetainableExternalImportManifestItem>(
+      query
+        .eq("spreadsheet_id", input.spreadsheetId)
+        .eq("source_table", sourceTable)
+        .order("imported_at", { ascending: false })
+        .limit(25),
+    );
+    throwIfSupabaseError(error);
+
+    for (const item of data ?? []) {
+      if (input.excludeJobId && item.job_id === input.excludeJobId) {
+        continue;
+      }
+
+      if (!manifestStatusById.has(item.manifest_id)) {
+        manifestStatusById.set(item.manifest_id, await findImportManifestById(item.manifest_id, client));
+      }
+      if (!jobStatusById.has(item.job_id)) {
+        jobStatusById.set(item.job_id, await findJobByIdForRetention(item.job_id, client));
+      }
+
+      const manifest = manifestStatusById.get(item.manifest_id) ?? null;
+      const job = jobStatusById.get(item.job_id) ?? null;
+      if (isRetainablePriorStatus({ item, manifest, job })) {
+        retainedBySourceTable.set(sourceTable, item);
+        break;
+      }
+    }
+  }
+
+  return retainedBySourceTable;
 }
 
 export async function createJob(input: CreateJobInput, client: SupabaseLike = getSupabaseClient()) {
