@@ -135,14 +135,14 @@ function manifestStatus(overrides: Record<string, unknown> = {}) {
 }
 
 function sheetsRecorder() {
-  const calls: Array<{ spreadsheetId: string; body: { requests: Record<string, unknown>[] } }> = [];
+  const calls: Array<{ spreadsheetId: string; requestBody: { requests: Record<string, unknown>[] } }> = [];
   return {
     calls,
     sheets: {
       spreadsheets: {
-        batchUpdate: (input: { spreadsheetId: string; body: { requests: Record<string, unknown>[] } }) => {
+        batchUpdate: async (input: { spreadsheetId: string; requestBody: { requests: Record<string, unknown>[] } }) => {
           calls.push(input);
-          return { execute: async () => ({}) };
+          return { data: { replies: [] }, status: 200 };
         },
       },
     },
@@ -273,7 +273,7 @@ describe("external import step runner", () => {
 
     await runExternalImportJobStep({ job: job() as never, maxRowsPerStep: 500, sheets: recorder.sheets });
 
-    const requestText = JSON.stringify(recorder.calls.flatMap((call) => call.body.requests));
+    const requestText = JSON.stringify(recorder.calls.flatMap((call) => call.requestBody.requests));
     expect(requestText).toContain(`"startRowIndex":${resolvedZone.gridRange.startRowIndex + chunk.row_count}`);
     expect(requestText).toContain(`"endRowIndex":${resolvedZone.gridRange.startRowIndex + chunk.row_count + 25}`);
     expect(requestText).toContain('"fields":"userEnteredValue"');
@@ -299,10 +299,32 @@ describe("external import step runner", () => {
 
     await runExternalImportJobStep({ job: job() as never, maxRowsPerStep: 500, sheets: recorder.sheets });
 
-    const requestText = JSON.stringify(recorder.calls.flatMap((call) => call.body.requests));
+    const requestText = JSON.stringify(recorder.calls.flatMap((call) => call.requestBody.requests));
     expect(requestText).toContain(`"startColumnIndex":${resolvedZone.gridRange.startColumnIndex + chunk.column_count}`);
     expect(requestText).toContain(`"endColumnIndex":${resolvedZone.gridRange.startColumnIndex + chunk.column_count + 2}`);
     expect(requestText).toContain('"fields":"userEnteredValue"');
+  });
+
+  it("executes Sheets batchUpdate with the Node googleapis Promise style", async () => {
+    const recorder = sheetsRecorder();
+    const batchUpdate = jest.spyOn(recorder.sheets.spreadsheets, "batchUpdate");
+
+    await runExternalImportJobStep({ job: job() as never, maxRowsPerStep: 500, sheets: recorder.sheets });
+
+    expect(batchUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        spreadsheetId: "sheet-123",
+        requestBody: expect.objectContaining({
+          requests: expect.any(Array),
+        }),
+      }),
+    );
+    expect(recorder.calls).toHaveLength(1);
+    expect(mockUpdateExternalImportJobProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "running",
+      }),
+    );
   });
 
   it("leaves non-uploaded tables untouched", async () => {

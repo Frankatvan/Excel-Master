@@ -529,14 +529,14 @@ async function executeBatchUpdate(input: { spreadsheetId: string; requests: Reco
   }
   const sheets = (input.sheets ?? getSheetsClient()) as {
     spreadsheets: {
-      batchUpdate: (input: { spreadsheetId: string; body: { requests: Record<string, unknown>[] } }) => {
-        execute: () => Promise<Record<string, unknown>>;
-      };
+      batchUpdate: (input: { spreadsheetId: string; requestBody: { requests: Record<string, unknown>[] } }) => unknown;
     };
   };
-  const result = await sheets.spreadsheets
-    .batchUpdate({ spreadsheetId: input.spreadsheetId, body: { requests: input.requests } })
-    .execute();
+  const batchUpdateResult = sheets.spreadsheets.batchUpdate({
+    spreadsheetId: input.spreadsheetId,
+    requestBody: { requests: input.requests },
+  });
+  const result = await batchUpdateResult;
   return { ...(result ?? {}), request_count: input.requests.length };
 }
 
