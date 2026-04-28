@@ -59,7 +59,7 @@ describe("external import manifest service", () => {
   it("reads durable job, manifest, and item status from Supabase tables", async () => {
     const client = new FakeSupabaseClient({
       jobs: {
-        data: { id: "job-123", spreadsheet_id: "sheet-123", status: "succeeded" },
+        data: { id: "job-123", spreadsheet_id: "sheet-123", status: "succeeded", progress: 100 },
         error: null,
       },
       external_import_manifests: {
@@ -74,7 +74,8 @@ describe("external import manifest service", () => {
             job_id: "job-123",
             spreadsheet_id: "sheet-123",
             source_table: "payable",
-            status: "parsed",
+            status: "validated",
+            result_meta: { worker_status: "imported" },
           },
         ],
         error: null,
@@ -91,6 +92,13 @@ describe("external import manifest service", () => {
       job_id: "job-123",
       status: "succeeded",
       manifest_items: [{ id: "item-123", source_table: "payable" }],
+      progress: {
+        percent: 100,
+        total_items: 1,
+        completed_items: 1,
+        failed_items: 0,
+        pending_items: 0,
+      },
     });
     expect(client.queries.map((query) => query.table)).toEqual([
       "jobs",
@@ -114,5 +122,45 @@ describe("external import manifest service", () => {
         { name: "order", args: ["created_at", { ascending: true }] },
       ]),
     );
+  });
+
+  it("returns a queued job without requiring a manifest yet", async () => {
+    const client = new FakeSupabaseClient({
+      jobs: {
+        data: {
+          id: "job-queued-123",
+          spreadsheet_id: "sheet-123",
+          status: "queued",
+          progress: 0,
+          result_meta: { parsed_table_count: 3 },
+        },
+        error: null,
+      },
+      external_import_manifests: {
+        data: null,
+        error: null,
+      },
+    });
+
+    const status = await getExternalImportStatus(
+      { spreadsheetId: "sheet-123", jobId: "job-queued-123" },
+      client as never,
+    );
+
+    expect(status).toMatchObject({
+      spreadsheet_id: "sheet-123",
+      job_id: "job-queued-123",
+      status: "queued",
+      manifest: null,
+      manifest_items: [],
+      progress: {
+        percent: 0,
+        total_items: 3,
+        completed_items: 0,
+        failed_items: 0,
+        pending_items: 3,
+      },
+    });
+    expect(client.queries.map((query) => query.table)).toEqual(["jobs", "external_import_manifests"]);
   });
 });

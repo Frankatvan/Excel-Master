@@ -44,7 +44,7 @@ export interface CreateJobInput {
   payload?: Record<string, unknown>;
 }
 
-export type ExternalImportManifestStatus = "parsed" | "warning" | "imported" | "validated" | "failed" | "stale";
+export type ExternalImportManifestStatus = "queued" | "parsed" | "warning" | "imported" | "validated" | "failed" | "stale";
 
 export interface CreateImportManifestInput {
   jobId: string;

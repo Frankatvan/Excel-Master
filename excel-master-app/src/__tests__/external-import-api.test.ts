@@ -604,7 +604,316 @@ describe("/api/external_import/upload", () => {
   });
 });
 
-describe("/api/external_import/confirm", () => {
+describe("/api/external_import/confirm Phase 1 async queue contract", () => {
+  beforeEach(() => {
+    process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/external-import";
+    process.env.EXTERNAL_IMPORT_WORKER_SECRET = "worker-secret";
+    delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    delete process.env.EXTERNAL_IMPORT_INLINE_DISPATCH_MAX_BYTES;
+    global.fetch = jest.fn() as unknown as typeof fetch;
+    jest.useRealTimers();
+    jest.clearAllMocks();
+    mockCreateClient.mockReset();
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+    mockSupabaseStorage();
+    mockCreateJob.mockResolvedValue({ id: "job-123", status: "queued" });
+    mockCreateImportManifest.mockResolvedValue({ id: "manifest-123", status: "queued" });
+    mockCreateImportManifestItem.mockResolvedValue({ id: "manifest-item-123", status: "parsed" });
+    mockRequireProjectCollaborator.mockResolvedValue({
+      canAccess: true,
+      canWrite: true,
+      isDriveOwner: false,
+      driveRole: "writer",
+    });
+  });
+
+  async function createStoredPreviewHash() {
+    const buffer = workbookBuffer([
+      {
+        name: "Payable",
+        rows: [
+          ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          ["g-1", "Apex", "INV-1", 100, "CA"],
+        ],
+      },
+    ]);
+    const previewReq = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [{ file_name: "payables.xlsx", content_base64: buffer.toString("base64") }],
+      },
+    } as unknown as NextApiRequest;
+    const previewRes = createMockRes();
+    await previewHandler(previewReq, previewRes);
+    return readJson(previewRes).preview_hash as string;
+  }
+
+  it("returns 202 queued quickly and does not dispatch or advance the durable job", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    const previewHash = await createStoredPreviewHash();
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: previewHash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+    const startedAt = Date.now();
+
+    await confirmHandler(req, res);
+
+    expect(Date.now() - startedAt).toBeLessThan(250);
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(res.json).toHaveBeenCalledWith({
+      job_id: "job-123",
+      status: "queued",
+      status_url: "/api/external_import/status?spreadsheet_id=sheet-123&job_id=job-123",
+    });
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mockMarkJobRunning).not.toHaveBeenCalled();
+    expect(mockMarkJobSucceeded).not.toHaveBeenCalled();
+    expect(mockMarkJobFailed).not.toHaveBeenCalled();
+  });
+
+  it("creates the queued job, queued manifest, and parsed manifest items from the stored preview", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    const previewHash = await createStoredPreviewHash();
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: previewHash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(mockCreateJob).toHaveBeenCalledWith({
+      spreadsheetId: "sheet-123",
+      jobType: "external_import",
+      operation: "external_import",
+      createdBy: "writer@example.com",
+      payload: expect.objectContaining({
+        spreadsheet_id: "sheet-123",
+        preview_hash: previewHash,
+        payload_format: "external_import.confirm.async.v1",
+        parsed_table_count: 1,
+        source_tables: [
+          expect.objectContaining({
+            source_role: "payable",
+            target_zone_id: "external_import.payable_raw",
+            row_count: 1,
+          }),
+        ],
+      }),
+    });
+    expect(mockCreateImportManifest).toHaveBeenCalledWith({
+      jobId: "job-123",
+      spreadsheetId: "sheet-123",
+      status: "queued",
+      importedBy: "writer@example.com",
+      resultMeta: expect.objectContaining({
+        source: "confirm",
+        preview_hash: previewHash,
+        parsed_table_count: 1,
+      }),
+      error: null,
+    });
+    expect(mockCreateImportManifestItem).toHaveBeenCalledWith({
+      manifestId: "manifest-123",
+      jobId: "job-123",
+      spreadsheetId: "sheet-123",
+      sourceTable: "payable",
+      sourceFileName: "payables.xlsx",
+      sourceSheetName: "Payable",
+      fileHash: expect.any(String),
+      headerSignature: null,
+      rowCount: 1,
+      columnCount: 5,
+      amountTotal: 100,
+      targetZoneKey: "external_import.payable_raw",
+      resolvedZoneFingerprint: expect.any(String),
+      status: "parsed",
+      validationMessage: null,
+      schemaDrift: {
+        warnings: [],
+        blocking_issues: [],
+      },
+      resultMeta: expect.objectContaining({
+        source: "preview",
+      }),
+      error: null,
+    });
+    expect(readJson(res)).toMatchObject({ status: "queued" });
+  });
+
+  it.each([
+    ["reader", "reader@example.com"],
+    ["commenter", "commenter@example.com"],
+  ])("keeps %s access forbidden through requireProjectCollaborator", async (_role, email) => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email },
+    } as never);
+    mockRequireProjectCollaborator.mockRejectedValue(
+      new ProjectAccessError("Project write access is forbidden.", 403, "PROJECT_WRITE_FORBIDDEN"),
+    );
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: "hash-123" },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(mockRequireProjectCollaborator).toHaveBeenCalledWith("sheet-123", email);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Project write access is forbidden.",
+      code: "PROJECT_WRITE_FORBIDDEN",
+    });
+    expect(mockCreateJob).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("still rejects an invalid preview hash before creating queue records", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: "missing-hash" },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(readJson(res)).toMatchObject({ code: "INVALID_PREVIEW_HASH" });
+    expect(mockCreateJob).not.toHaveBeenCalled();
+    expect(mockCreateImportManifest).not.toHaveBeenCalled();
+    expect(mockCreateImportManifestItem).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("stages large parsed rows as an async execution artifact without worker dispatch", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    mockCreateJob.mockResolvedValue({ id: "job-large-123", status: "queued" });
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+    process.env.EXTERNAL_IMPORT_INLINE_DISPATCH_MAX_BYTES = "1024";
+    const { upload } = mockSupabaseStorage();
+    const sentinel = "SENTINEL-DRAW-REQUEST-ROW-VALUE";
+    const largeRows = Array.from({ length: 120 }, (_, index) => [
+      `guid-${index}`,
+      sentinel,
+      `invoice-${index}`,
+      index,
+      "CA",
+    ]);
+    savePreviewPayload({
+      status: "preview_ready",
+      spreadsheet_id: "sheet-123",
+      preview_hash: "large-preview-hash",
+      confirm_allowed: true,
+      worker_configured: true,
+      files: [
+        {
+          file_name: "draw-request.xlsx",
+          file_hash: "file-hash-large",
+          tables: [
+            {
+              source_role: "payable",
+              source_sheet_name: "Payable",
+              row_count: largeRows.length,
+              column_count: 5,
+              amount_total: 7140,
+              target_zone_key: "external_import.payable_raw",
+              target_zone_id: "external_import.payable_raw",
+              warnings: [],
+              blocking_issues: [],
+              headers: ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+              rows: largeRows,
+            },
+          ],
+        },
+      ],
+      source_tables: [
+        {
+          source_role: "payable",
+          source_sheet_name: "Payable",
+          row_count: largeRows.length,
+          column_count: 5,
+          amount_total: 7140,
+          target_zone_key: "external_import.payable_raw",
+          target_zone_id: "external_import.payable_raw",
+          warnings: [],
+          blocking_issues: [],
+          headers: ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          rows: largeRows,
+        },
+      ],
+    });
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: "large-preview-hash" },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(upload).toHaveBeenCalledWith(
+      expect.stringMatching(/^external-import\/sheet-123\/async-execution\/[^/]+\/parsed-tables\.json$/),
+      expect.stringContaining(sentinel),
+      expect.objectContaining({
+        contentType: "application/json",
+        upsert: true,
+      }),
+    );
+    const artifactBody = JSON.parse(String(upload.mock.calls[0]?.[1]));
+    expect(artifactBody).toEqual(
+      expect.objectContaining({
+        format: "external_import.async_execution.chunk_plan.v1",
+        execution_id: expect.any(String),
+        preview_hash: "large-preview-hash",
+        chunks: [
+          expect.objectContaining({
+            source_table: "payable",
+            row_count: largeRows.length,
+            rows: largeRows,
+          }),
+        ],
+      }),
+    );
+    expect(mockCreateJob.mock.calls[0]?.[0].payload).toEqual(
+      expect.objectContaining({
+        execution_artifact: expect.objectContaining({
+          bucket: "external-import-uploads",
+          path: expect.stringMatching(/^external-import\/sheet-123\/async-execution\/[^/]+\/parsed-tables\.json$/),
+          format: "external_import.async_execution.chunk_plan.v1",
+          size_bytes: expect.any(Number),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      }),
+    );
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mockMarkJobRunning).not.toHaveBeenCalled();
+    expect(mockMarkJobSucceeded).not.toHaveBeenCalled();
+    expect(mockMarkJobFailed).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(readJson(res)).toMatchObject({ job_id: "job-large-123", status: "queued" });
+  });
+});
+
+describe.skip("/api/external_import/confirm legacy synchronous worker contract", () => {
   beforeEach(() => {
     process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/external-import";
     process.env.EXTERNAL_IMPORT_WORKER_SECRET = "worker-secret";
@@ -1651,6 +1960,13 @@ describe("/api/external_import/status", () => {
       job: null,
       manifest: null,
       manifest_items: [],
+      progress: {
+        percent: null,
+        total_items: 0,
+        completed_items: 0,
+        failed_items: 0,
+        pending_items: 0,
+      },
     });
   });
 
@@ -1741,6 +2057,13 @@ describe("/api/external_import/status", () => {
           imported_at: "2026-04-27T10:00:00.000Z",
         },
       ],
+      progress: {
+        percent: 100,
+        total_items: 1,
+        completed_items: 1,
+        failed_items: 0,
+        pending_items: 0,
+      },
     };
     mockGetExternalImportStatus.mockResolvedValue(payload);
 

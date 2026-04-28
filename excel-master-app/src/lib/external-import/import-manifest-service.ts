@@ -70,6 +70,14 @@ export interface ExternalImportManifestItemStatus {
   updated_at?: string | null;
 }
 
+export interface ExternalImportProgressStatus {
+  percent: number | null;
+  total_items: number;
+  completed_items: number;
+  failed_items: number;
+  pending_items: number;
+}
+
 export interface ExternalImportStatusPayload {
   spreadsheet_id: string;
   job_id: string | null;
@@ -77,6 +85,7 @@ export interface ExternalImportStatusPayload {
   job: ExternalImportJobStatus | null;
   manifest: ExternalImportManifestStatus | null;
   manifest_items: ExternalImportManifestItemStatus[];
+  progress: ExternalImportProgressStatus;
 }
 
 interface SupabaseResult<T> {
@@ -244,6 +253,82 @@ async function findManifestItems(
   return data ?? [];
 }
 
+function readNumberOrNull(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function readMetaNumber(meta: JsonObject | null | undefined, keys: string[]) {
+  if (!meta) {
+    return null;
+  }
+  for (const key of keys) {
+    const value = readNumberOrNull(meta[key]);
+    if (value !== null) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function readResultMetaStatus(item: ExternalImportManifestItemStatus) {
+  const status = item.result_meta?.worker_status ?? item.result_meta?.status;
+  return typeof status === "string" ? status : null;
+}
+
+function isCompletedItem(item: ExternalImportManifestItemStatus) {
+  const statuses = [item.status, readResultMetaStatus(item)];
+  return statuses.some((status) => status === "validated" || status === "imported" || status === "succeeded");
+}
+
+function isFailedItem(item: ExternalImportManifestItemStatus) {
+  const statuses = [item.status, readResultMetaStatus(item)];
+  return statuses.some((status) => status === "failed");
+}
+
+function emptyProgress(percent: number | null = null): ExternalImportProgressStatus {
+  return {
+    percent,
+    total_items: 0,
+    completed_items: 0,
+    failed_items: 0,
+    pending_items: 0,
+  };
+}
+
+function buildProgressStatus(
+  job: ExternalImportJobStatus | null,
+  manifestItems: ExternalImportManifestItemStatus[],
+): ExternalImportProgressStatus {
+  if (!job) {
+    return emptyProgress();
+  }
+
+  const percent =
+    readNumberOrNull(job.progress) ?? readMetaNumber(job.result_meta, ["progress", "progress_percent", "percent"]);
+  const completedItems = manifestItems.filter(isCompletedItem).length;
+  const failedItems = manifestItems.filter(isFailedItem).length;
+  const totalItems =
+    manifestItems.length ||
+    readMetaNumber(job.result_meta, ["total_items", "source_count", "parsed_table_count"]) ||
+    completedItems + failedItems;
+  const pendingItems = Math.max(totalItems - completedItems - failedItems, 0);
+
+  return {
+    percent,
+    total_items: totalItems,
+    completed_items: completedItems,
+    failed_items: failedItems,
+    pending_items: pendingItems,
+  };
+}
+
 export async function getExternalImportStatus(
   input: GetExternalImportStatusInput,
   client: SupabaseLike = getSupabaseClient(),
@@ -257,6 +342,7 @@ export async function getExternalImportStatus(
       job: null,
       manifest: null,
       manifest_items: [],
+      progress: emptyProgress(),
     };
   }
 
@@ -270,5 +356,6 @@ export async function getExternalImportStatus(
     job,
     manifest,
     manifest_items: manifestItems,
+    progress: buildProgressStatus(job, manifestItems),
   };
 }
