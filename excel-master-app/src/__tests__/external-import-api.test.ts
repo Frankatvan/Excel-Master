@@ -9,6 +9,7 @@ import previewHandler from "../pages/api/external_import/preview";
 import statusHandler from "../pages/api/external_import/status";
 import uploadHandler from "../pages/api/external_import/upload";
 
+import { savePreviewPayload } from "@/lib/external-import/preview-store";
 import { getExternalImportStatus } from "@/lib/external-import/import-manifest-service";
 import {
   createImportManifest,
@@ -158,6 +159,7 @@ function mockSupabaseStorage({
     data: downloadBlobPart ? new Blob([downloadBlobPart]) : null,
     error: downloadBuffer ? null : new Error("missing fixture"),
   });
+  const upload = jest.fn().mockResolvedValue({ data: { path: "external-import/sheet-123/previews/preview.json" }, error: null });
   const remove = jest.fn().mockResolvedValue({ data: [], error: null });
   const storage = {
     getBucket,
@@ -165,11 +167,12 @@ function mockSupabaseStorage({
     from: jest.fn(() => ({
       createSignedUploadUrl,
       download,
+      upload,
       remove,
     })),
   };
   mockCreateClient.mockReturnValue({ storage } as never);
-  return { storage, getBucket, createBucket, createSignedUploadUrl, download, remove };
+  return { storage, getBucket, createBucket, createSignedUploadUrl, download, upload, remove };
 }
 
 function createMockRes() {
@@ -606,6 +609,7 @@ describe("/api/external_import/confirm", () => {
     process.env.EXTERNAL_IMPORT_WORKER_URL = "https://worker.example.com/external-import";
     process.env.EXTERNAL_IMPORT_WORKER_SECRET = "worker-secret";
     delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    delete process.env.EXTERNAL_IMPORT_INLINE_DISPATCH_MAX_BYTES;
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -820,6 +824,86 @@ describe("/api/external_import/confirm", () => {
       manifest_id: "manifest-123",
       status_url: "/api/external_import/status?spreadsheet_id=sheet-123&job_id=job-123",
     });
+  });
+
+  it("stages large parsed table rows in storage before worker dispatch", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    mockCreateJob.mockResolvedValue({ id: "job-large-123", status: "queued" });
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+    process.env.EXTERNAL_IMPORT_INLINE_DISPATCH_MAX_BYTES = "1024";
+    const { upload } = mockSupabaseStorage();
+    const sentinel = "SENTINEL-DRAW-REQUEST-ROW-VALUE";
+    const largeRows = Array.from({ length: 120 }, (_, index) => [
+      `guid-${index}`,
+      sentinel,
+      `invoice-${index}`,
+      index,
+      "CA",
+    ]);
+    savePreviewPayload({
+      status: "preview_ready",
+      spreadsheet_id: "sheet-123",
+      preview_hash: "large-preview-hash",
+      confirm_allowed: true,
+      worker_configured: true,
+      files: [
+        {
+          file_name: "draw-request.xlsx",
+          file_hash: "file-hash-large",
+          tables: [
+            {
+              source_role: "payable",
+              source_sheet_name: "Payable",
+              row_count: largeRows.length,
+              column_count: 5,
+              amount_total: 7140,
+              target_zone_key: "external_import.payable_raw",
+              target_zone_id: "external_import.payable_raw",
+              warnings: [],
+              blocking_issues: [],
+              headers: ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+              rows: largeRows,
+            },
+          ],
+        },
+      ],
+      source_tables: [],
+    });
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: "large-preview-hash" },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(upload).toHaveBeenCalledWith(
+      expect.stringMatching(/^external-import\/sheet-123\/worker-payloads\/job-large-123\/parsed-tables\.json$/),
+      expect.stringContaining(sentinel),
+      expect.objectContaining({
+        contentType: "application/json",
+        upsert: true,
+      }),
+    );
+    const workerBodyText = String((global.fetch as jest.Mock).mock.calls[0]?.[1]?.body);
+    const workerBody = JSON.parse(workerBodyText);
+    expect(workerBody.parsed_tables).toBeUndefined();
+    expect(workerBody.source_tables[0]).not.toHaveProperty("rows");
+    expect(workerBody.parsed_tables_ref).toEqual(
+      expect.objectContaining({
+        bucket: "external-import-uploads",
+        path: "external-import/sheet-123/worker-payloads/job-large-123/parsed-tables.json",
+        format: "external_import.parsed_tables.v1",
+        size_bytes: expect.any(Number),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    );
+    expect(workerBodyText).not.toContain(sentinel);
+    expect(res.status).toHaveBeenCalledWith(202);
   });
 
   it("sends the Vercel automation bypass header when configured", async () => {

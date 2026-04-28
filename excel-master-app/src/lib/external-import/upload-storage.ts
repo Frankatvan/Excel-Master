@@ -35,6 +35,14 @@ export interface ExternalImportStoredFileBuffer {
   buffer: Buffer;
 }
 
+export interface ExternalImportStoredJsonRef {
+  bucket: string;
+  path: string;
+  format: string;
+  size_bytes: number;
+  sha256: string;
+}
+
 function readRequiredEnv() {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || DEFAULT_SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -85,6 +93,10 @@ export function externalImportUploadPathPrefix(spreadsheetId: string) {
 function createUploadPath(spreadsheetId: string, fileName: string) {
   const uploadId = crypto.randomUUID();
   return `${externalImportUploadPathPrefix(spreadsheetId)}${uploadId}/${sanitizePathPart(fileName)}`;
+}
+
+function createScopedArtifactPath(spreadsheetId: string, pathParts: string[]) {
+  return `${externalImportUploadPathPrefix(spreadsheetId)}${pathParts.map(sanitizePathPart).join("/")}`;
 }
 
 function assertUploadPathInSpreadsheetScope(spreadsheetId: string, path: string) {
@@ -155,4 +167,34 @@ export async function downloadExternalImportStoredFiles(
       };
     }),
   );
+}
+
+export async function uploadExternalImportJsonArtifact(input: {
+  spreadsheetId: string;
+  pathParts: string[];
+  format: string;
+  payload: unknown;
+}): Promise<ExternalImportStoredJsonRef> {
+  const bucket = getUploadBucket();
+  const supabase = createSupabaseStorageClient();
+  await ensureExternalImportUploadBucket(supabase, bucket);
+
+  const body = JSON.stringify(input.payload);
+  const path = createScopedArtifactPath(input.spreadsheetId, input.pathParts);
+  assertUploadPathInSpreadsheetScope(input.spreadsheetId, path);
+  const { error } = await supabase.storage.from(bucket).upload(path, body, {
+    contentType: "application/json",
+    upsert: true,
+  });
+  if (error) {
+    throw new Error(error.message || "Failed to upload external import payload artifact.");
+  }
+
+  return {
+    bucket,
+    path,
+    format: input.format,
+    size_bytes: Buffer.byteLength(body, "utf8"),
+    sha256: crypto.createHash("sha256").update(body).digest("hex"),
+  };
 }

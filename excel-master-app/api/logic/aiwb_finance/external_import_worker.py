@@ -13,6 +13,8 @@ GridRange = dict[str, int]
 BatchUpdate = Callable[[str, list[dict[str, Any]]], Mapping[str, Any]]
 ValidateInput = Callable[[str, list[dict[str, Any]]], Mapping[str, Any]]
 
+PARSED_TABLES_REF_FORMAT = "external_import.parsed_tables.v1"
+
 
 class CapacityExceededError(ValueError):
     def __init__(self, details: Mapping[str, Any]):
@@ -57,6 +59,7 @@ def run_external_import_job(
     batch_update: BatchUpdate,
     validate_input: ValidateInput,
 ) -> dict[str, Any]:
+    payload = resolve_worker_payload_refs(payload)
     spreadsheet_id = str(payload.get("spreadsheet_id") or "")
     if not spreadsheet_id:
         raise ValueError("spreadsheet_id is required")
@@ -74,11 +77,81 @@ def run_external_import_job(
         "job_status": "succeeded" if validation_ok else "failed",
         "manifest_status": "validated" if validation_ok else "failed",
         "spreadsheet_id": spreadsheet_id,
-        "import_requests": plan["requests"],
+        "import_request_count": len(plan["requests"]),
         "manifest": plan["manifest"],
         "write_result": dict(write_result),
         "validation": dict(validation),
     }
+
+
+def resolve_worker_payload_refs(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    if payload.get("parsed_tables"):
+        return payload
+
+    parsed_tables_ref = payload.get("parsed_tables_ref")
+    if not isinstance(parsed_tables_ref, Mapping):
+        return payload
+
+    parsed_tables = download_parsed_tables_ref(payload, parsed_tables_ref)
+    return {**dict(payload), "parsed_tables": parsed_tables}
+
+
+def download_parsed_tables_ref(payload: Mapping[str, Any], parsed_tables_ref: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    ref_format = str(parsed_tables_ref.get("format") or "")
+    if ref_format != PARSED_TABLES_REF_FORMAT:
+        raise ValueError(f"Unsupported external import parsed tables ref format: {ref_format}")
+
+    spreadsheet_id = str(payload.get("spreadsheet_id") or "")
+    bucket = str(parsed_tables_ref.get("bucket") or os.environ.get("EXTERNAL_IMPORT_UPLOAD_BUCKET") or "external-import-uploads")
+    path = str(parsed_tables_ref.get("path") or "")
+    assert_storage_path_in_spreadsheet_scope(spreadsheet_id, path)
+
+    body = download_supabase_storage_text(bucket, path)
+    expected_hash = str(parsed_tables_ref.get("sha256") or "")
+    if expected_hash:
+        actual_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError("External import parsed tables payload hash mismatch")
+
+    parsed = json.loads(body or "[]")
+    if not isinstance(parsed, list):
+        raise ValueError("External import parsed tables payload must be a list")
+    return parsed
+
+
+def assert_storage_path_in_spreadsheet_scope(spreadsheet_id: str, path: str) -> None:
+    if not spreadsheet_id:
+        raise ValueError("spreadsheet_id is required for parsed tables ref")
+    safe_spreadsheet_id = sanitize_path_part(spreadsheet_id)
+    prefix = f"external-import/{safe_spreadsheet_id}/"
+    if not path.startswith(prefix):
+        raise ValueError("External import parsed tables ref is outside the requested spreadsheet scope")
+
+
+def sanitize_path_part(value: str) -> str:
+    sanitized = str(value or "").strip()
+    for char in '\\/:*?"<>|#%{}^~[]`':
+        sanitized = sanitized.replace(char, "_")
+    return " ".join(sanitized.split())[:120] or "external-import.xlsx"
+
+
+def download_supabase_storage_text(bucket: str, path: str) -> str:
+    supabase_url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    service_role_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_role_key:
+        raise ValueError("Supabase storage configuration is missing")
+
+    try:
+        from supabase import create_client
+    except Exception as error:  # pragma: no cover - import failure depends on runtime packaging
+        raise ValueError("Supabase client dependency is unavailable") from error
+
+    response = create_client(supabase_url, service_role_key).storage.from_(bucket).download(path)
+    if isinstance(response, bytes):
+        return response.decode("utf-8")
+    if hasattr(response, "decode"):
+        return response.decode("utf-8")
+    return str(response)
 
 
 def build_manifest_item_payload(

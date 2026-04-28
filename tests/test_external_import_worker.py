@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -260,8 +263,71 @@ def test_validation_failure_preserves_import_requests_but_marks_failed_outcome()
     assert result["job_status"] == "failed"
     assert result["manifest_status"] == "failed"
     assert result["validation"] == {"ok": False, "errors": [{"code": "MISSING_REQUIRED_FIELD"}]}
-    assert result["import_requests"]
+    assert result["import_request_count"] == 2
+    assert "import_requests" not in result
     assert result["write_result"] == {"replies": [{}, {}], "request_count": 2}
+
+
+def test_run_job_loads_parsed_tables_from_scoped_storage_ref(monkeypatch):
+    worker = load_worker_module()
+    payload_text = json.dumps([table("costs", rows=[["A", 10]])])
+    downloads = []
+
+    class StorageBucket:
+        def download(self, path):
+            downloads.append(path)
+            return payload_text.encode("utf-8")
+
+    class Storage:
+        def from_(self, bucket):
+            assert bucket == "external-import-uploads"
+            return StorageBucket()
+
+    class SupabaseClient:
+        storage = Storage()
+
+    supabase = types.ModuleType("supabase")
+    supabase.create_client = lambda url, key: SupabaseClient()
+    monkeypatch.setitem(sys.modules, "supabase", supabase)
+    monkeypatch.setenv("SUPABASE_URL", "https://supabase.example.com")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role-key")
+
+    result = worker.run_external_import_job(
+        {
+            "spreadsheet_id": "sheet-1",
+            "resolved_zones": {"costs": grid()},
+            "parsed_tables_ref": {
+                "bucket": "external-import-uploads",
+                "path": "external-import/sheet-1/worker-payloads/job-1/parsed-tables.json",
+                "format": "external_import.parsed_tables.v1",
+            },
+        },
+        batch_update=lambda spreadsheet_id, requests: {"request_count": len(requests)},
+        validate_input=lambda spreadsheet_id, manifest: {"ok": True, "manifest_count": len(manifest)},
+    )
+
+    assert downloads == ["external-import/sheet-1/worker-payloads/job-1/parsed-tables.json"]
+    assert result["job_status"] == "succeeded"
+    assert result["manifest"][0]["row_count"] == 1
+
+
+def test_parsed_tables_ref_rejects_paths_outside_spreadsheet_scope():
+    worker = load_worker_module()
+
+    with pytest.raises(ValueError, match="outside the requested spreadsheet scope"):
+        worker.run_external_import_job(
+            {
+                "spreadsheet_id": "sheet-1",
+                "resolved_zones": {"costs": grid()},
+                "parsed_tables_ref": {
+                    "bucket": "external-import-uploads",
+                    "path": "external-import/other-sheet/worker-payloads/job-1/parsed-tables.json",
+                    "format": "external_import.parsed_tables.v1",
+                },
+            },
+            batch_update=lambda spreadsheet_id, requests: {"request_count": len(requests)},
+            validate_input=lambda spreadsheet_id, manifest: {"ok": True},
+        )
 
 
 def test_manifest_item_payload_contains_source_and_target_audit_fields():

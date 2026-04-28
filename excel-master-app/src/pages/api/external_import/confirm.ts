@@ -6,6 +6,7 @@ import { getServerSession } from "next-auth/next";
 
 import { findPreviewRecord, type ExternalImportPreviewRecord } from "@/lib/external-import/preview-store";
 import { resolveImportZone, type ResolvedImportZone } from "@/lib/external-import/import-zone-resolver";
+import { uploadExternalImportJsonArtifact, type ExternalImportStoredJsonRef } from "@/lib/external-import/upload-storage";
 import { getGoogleServiceAccountCredentials } from "@/lib/google-service-account";
 import {
   createImportManifest,
@@ -47,6 +48,14 @@ interface ExternalImportWorkerResult {
   details?: unknown;
 }
 
+type ExternalImportWorkerPayload = Record<string, unknown> & {
+  parsed_tables?: unknown;
+  source_tables?: unknown;
+};
+
+const DEFAULT_INLINE_DISPATCH_MAX_BYTES = 4 * 1024 * 1024;
+const PARSED_TABLES_REF_FORMAT = "external_import.parsed_tables.v1";
+
 class ExternalImportWorkerFailure extends Error {
   errorCode: string;
   details?: unknown;
@@ -61,6 +70,11 @@ class ExternalImportWorkerFailure extends Error {
 
 function readString(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readPositiveInteger(value: unknown, fallback: number) {
+  const parsed = typeof value === "string" && value.trim() ? Number(value) : value;
+  return typeof parsed === "number" && Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 function readSpreadsheetId(body: NextApiRequest["body"]) {
@@ -79,6 +93,10 @@ function readPreviewHash(body: NextApiRequest["body"]) {
   }
   return readString((body as { preview_hash?: unknown; previewHash?: unknown }).preview_hash) ??
     readString((body as { preview_hash?: unknown; previewHash?: unknown }).previewHash);
+}
+
+function inlineDispatchMaxBytes() {
+  return readPositiveInteger(process.env.EXTERNAL_IMPORT_INLINE_DISPATCH_MAX_BYTES, DEFAULT_INLINE_DISPATCH_MAX_BYTES);
 }
 
 function requireExternalImportWorkerConfig() {
@@ -168,6 +186,49 @@ async function dispatchExternalImportWorker(input: {
 
   assertWorkerResultContract(responsePayload);
   return responsePayload;
+}
+
+function summarizeWorkerSourceTable(table: unknown) {
+  if (!isRecord(table)) {
+    return {};
+  }
+  return {
+    source_role: table.source_role,
+    source_sheet_name: table.source_sheet_name,
+    row_count: table.row_count,
+    column_count: table.column_count,
+    amount_total: table.amount_total,
+    target_zone_key: table.target_zone_key,
+    target_zone_id: table.target_zone_id,
+    warnings: table.warnings,
+    blocking_issues: table.blocking_issues,
+  };
+}
+
+async function compactWorkerPayloadForDispatch(input: {
+  jobId: string;
+  spreadsheetId: string;
+  payload: ExternalImportWorkerPayload;
+}): Promise<ExternalImportWorkerPayload> {
+  const inlineBodyBytes = Buffer.byteLength(JSON.stringify({ job_id: input.jobId, ...input.payload }), "utf8");
+  if (inlineBodyBytes <= inlineDispatchMaxBytes()) {
+    return input.payload;
+  }
+
+  const parsedTables = Array.isArray(input.payload.parsed_tables) ? input.payload.parsed_tables : [];
+  const parsedTablesRef: ExternalImportStoredJsonRef = await uploadExternalImportJsonArtifact({
+    spreadsheetId: input.spreadsheetId,
+    pathParts: ["worker-payloads", input.jobId, "parsed-tables.json"],
+    format: PARSED_TABLES_REF_FORMAT,
+    payload: parsedTables,
+  });
+
+  const { parsed_tables: _parsedTables, source_tables: _sourceTables, ...rest } = input.payload;
+  return {
+    ...rest,
+    source_tables: Array.isArray(_sourceTables) ? _sourceTables.map(summarizeWorkerSourceTable) : [],
+    parsed_tables_ref: parsedTablesRef,
+  };
 }
 
 function workerRejectionCode(status: number) {
@@ -502,7 +563,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const workerConfig = requireExternalImportWorkerConfig();
     const resolvedZones = await resolveZonesForPreview(spreadsheetId, previewRecord);
-    const workerPayload = {
+    const workerPayload: ExternalImportWorkerPayload = {
       spreadsheet_id: spreadsheetId,
       preview_hash: previewRecord.previewHash,
       source_tables: previewRecord.sourceTables,
@@ -554,11 +615,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     let workerResult: ExternalImportWorkerResult;
     try {
+      const dispatchPayload = await compactWorkerPayloadForDispatch({
+        jobId: job.id,
+        spreadsheetId,
+        payload: workerPayload,
+      });
       workerResult = await dispatchExternalImportWorker({
         jobId: job.id,
         workerUrl: workerConfig.url,
         workerSecret: workerConfig.secret,
-        payload: workerPayload,
+        payload: dispatchPayload,
       });
     } catch (dispatchError) {
       const workerFailure = dispatchError instanceof ExternalImportWorkerFailure ? dispatchError : null;
