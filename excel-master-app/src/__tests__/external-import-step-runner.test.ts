@@ -1,5 +1,6 @@
 import {
   buildExternalImportRowBandRequests,
+  ExternalImportStepError,
   planExternalImportStep,
   runExternalImportJobStep,
 } from "@/lib/external-import/step-runner";
@@ -205,6 +206,39 @@ describe("external import step runner", () => {
     expect(plan.rows.length).toBeLessThan(chunk.rows.length);
   });
 
+  it("bounds wide-table row bands by cell count instead of rows alone", () => {
+    const wideHeaders = Array.from({ length: 702 }, (_, index) => `col_${index}`);
+    const wideRows = Array.from({ length: 500 }, (_, rowIndex) =>
+      wideHeaders.map((_, columnIndex) => `r${rowIndex}c${columnIndex}`),
+    );
+    const wideChunk = {
+      ...chunk,
+      headers: wideHeaders,
+      rows: wideRows,
+      row_count: wideRows.length,
+      column_count: wideHeaders.length,
+    };
+    const wideZone = {
+      ...resolvedZone,
+      gridRange: {
+        ...resolvedZone.gridRange,
+        endColumnIndex: resolvedZone.gridRange.startColumnIndex + wideHeaders.length,
+      },
+    };
+
+    const plan = planExternalImportStep({
+      chunks: [wideChunk],
+      resolvedZones: { "external_import.payable_raw": wideZone },
+      cursor: { chunk_index: 0, row_offset: 0 },
+      maxRowsPerStep: 500,
+    });
+
+    expect(plan.rows.length).toBeLessThan(500);
+    expect(plan.rows.length * wideHeaders.length).toBeLessThanOrEqual(50_000);
+    expect(plan.nextCursor).toEqual({ chunk_index: 0, row_offset: plan.rows.length });
+    expect(plan.totalChunks).toBeGreaterThan(1);
+  });
+
   it("derives target coordinates from resolved zone and sheet metadata instead of hardcoded physical addresses", () => {
     const requests = buildExternalImportRowBandRequests({
       resolvedZone,
@@ -340,6 +374,45 @@ describe("external import step runner", () => {
         status: "running",
       }),
     );
+  });
+
+  it("preserves Google Sheets upstream failure evidence when a batchUpdate chunk fails", async () => {
+    const upstreamError = new Error("Bad Gateway") as Error & {
+      code?: string;
+      response?: {
+        status?: number;
+        statusText?: string;
+        data?: unknown;
+        config?: { url?: string };
+      };
+    };
+    upstreamError.code = "ERR_BAD_RESPONSE";
+    upstreamError.response = {
+      status: 502,
+      statusText: "Bad Gateway",
+      data: "Bad Gateway",
+      config: { url: "https://sheets.googleapis.com/v4/spreadsheets/sheet-123:batchUpdate?key=secret" },
+    };
+    const sheets = {
+      spreadsheets: {
+        batchUpdate: jest.fn().mockRejectedValue(upstreamError),
+      },
+    };
+
+    await expect(runExternalImportJobStep({ job: job() as never, maxRowsPerStep: 500, sheets })).rejects.toMatchObject({
+      code: "EXTERNAL_IMPORT_SHEETS_BATCH_UPDATE_FAILED",
+      message: expect.stringContaining("Google Sheets batchUpdate failed"),
+      details: expect.objectContaining({
+        upstream_service: "google_sheets",
+        upstream_operation: "spreadsheets.batchUpdate",
+        upstream_status: 502,
+        upstream_status_text: "Bad Gateway",
+        upstream_code: "ERR_BAD_RESPONSE",
+        upstream_body_summary: "Bad Gateway",
+        upstream_route: "https://sheets.googleapis.com/v4/spreadsheets/sheet-123:batchUpdate",
+        request_count: expect.any(Number),
+      }),
+    } satisfies Partial<ExternalImportStepError>);
   });
 
   it("leaves non-uploaded tables untouched", async () => {

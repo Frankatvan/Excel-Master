@@ -4,7 +4,12 @@ import { getServerSession } from "next-auth/next";
 
 import triggerHandler from "../pages/api/external_import/trigger";
 import { runExternalImportJobStep } from "@/lib/external-import/step-runner";
-import { getJob } from "@/lib/job-service";
+import {
+  getJob,
+  markJobFailed,
+  updateImportManifestItemStatus,
+  updateImportManifestStatus,
+} from "@/lib/job-service";
 import { ProjectAccessError, requireProjectCollaborator } from "@/lib/project-access";
 
 jest.mock("next-auth/next", () => ({
@@ -37,6 +42,9 @@ jest.mock("@/lib/project-access", () => {
 
 jest.mock("@/lib/job-service", () => ({
   getJob: jest.fn(),
+  markJobFailed: jest.fn(),
+  updateImportManifestStatus: jest.fn(),
+  updateImportManifestItemStatus: jest.fn(),
 }));
 
 jest.mock("@/lib/external-import/step-runner", () => ({
@@ -58,6 +66,13 @@ const mockRequireProjectCollaborator = requireProjectCollaborator as jest.Mocked
   typeof requireProjectCollaborator
 >;
 const mockGetJob = getJob as jest.MockedFunction<typeof getJob>;
+const mockMarkJobFailed = markJobFailed as jest.MockedFunction<typeof markJobFailed>;
+const mockUpdateImportManifestStatus = updateImportManifestStatus as jest.MockedFunction<
+  typeof updateImportManifestStatus
+>;
+const mockUpdateImportManifestItemStatus = updateImportManifestItemStatus as jest.MockedFunction<
+  typeof updateImportManifestItemStatus
+>;
 const mockRunExternalImportJobStep = runExternalImportJobStep as jest.MockedFunction<typeof runExternalImportJobStep>;
 
 function createMockRes() {
@@ -207,5 +222,58 @@ describe("/api/external_import/trigger", () => {
     await second;
 
     expect(mockRunExternalImportJobStep).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves sanitized upstream failure evidence when a triggered step fails", async () => {
+    const upstreamError = new Error("Bad Gateway") as Error & {
+      code?: string;
+      response?: {
+        status?: number;
+        statusText?: string;
+        data?: unknown;
+        config?: { url?: string };
+      };
+    };
+    upstreamError.code = "ERR_BAD_RESPONSE";
+    upstreamError.response = {
+      status: 502,
+      statusText: "Bad Gateway",
+      data: { error: { message: "Bad Gateway", status: "UNAVAILABLE" } },
+      config: { url: "https://sheets.googleapis.com/v4/spreadsheets/sheet-123:batchUpdate?key=secret" },
+    };
+    mockRunExternalImportJobStep.mockRejectedValue(upstreamError);
+
+    const res = createMockRes();
+
+    await triggerHandler(req({ spreadsheet_id: "sheet-123", job_id: "job-123", max_steps_per_request: 1 }), res);
+
+    const expectedError = expect.objectContaining({
+      code: "EXTERNAL_IMPORT_TRIGGER_FAILED",
+      message: "Bad Gateway",
+      details: expect.objectContaining({
+        upstream_status: 502,
+        upstream_status_text: "Bad Gateway",
+        upstream_code: "ERR_BAD_RESPONSE",
+        upstream_body_summary: expect.stringContaining("UNAVAILABLE"),
+        upstream_route: "https://sheets.googleapis.com/v4/spreadsheets/sheet-123:batchUpdate",
+      }),
+    });
+    expect(mockMarkJobFailed).toHaveBeenCalledWith({ jobId: "job-123", error: expectedError });
+    expect(mockUpdateImportManifestStatus).toHaveBeenCalledWith({ jobId: "job-123", status: "failed", error: expectedError });
+    expect(mockUpdateImportManifestItemStatus).toHaveBeenCalledWith({
+      jobId: "job-123",
+      status: "failed",
+      error: expectedError,
+    });
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(readJson(res)).toMatchObject({
+      ok: false,
+      code: "EXTERNAL_IMPORT_TRIGGER_FAILED",
+      message: "Bad Gateway",
+      details: expect.objectContaining({
+        upstream_status: 502,
+        upstream_route: "https://sheets.googleapis.com/v4/spreadsheets/sheet-123:batchUpdate",
+      }),
+    });
   });
 });

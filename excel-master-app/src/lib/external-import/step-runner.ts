@@ -10,6 +10,7 @@ import {
   downloadExternalImportJsonArtifact,
   type ExternalImportStoredJsonRef,
 } from "@/lib/external-import/upload-storage";
+import { externalImportUpstreamErrorDetails } from "@/lib/external-import/upstream-error";
 import { getGoogleServiceAccountCredentials } from "@/lib/google-service-account";
 import {
   updateExternalImportJobProgress,
@@ -19,6 +20,7 @@ import {
 
 const ASYNC_EXECUTION_ARTIFACT_FORMAT = "external_import.async_execution.chunk_plan.v1";
 const DEFAULT_MAX_ROWS_PER_STEP = 500;
+const DEFAULT_MAX_CELLS_PER_STEP = 50_000;
 
 export interface ExternalImportStepCursor {
   phase?: "setup_table" | "write_chunk" | "validation";
@@ -372,7 +374,7 @@ export function buildExternalImportRowBandRequests(input: {
 }
 
 function totalRowBandChunks(chunks: ExternalImportExecutionChunk[], maxRowsPerStep: number) {
-  return chunks.reduce((count, chunk) => count + Math.max(1, Math.ceil(chunk.rows.length / maxRowsPerStep)), 0);
+  return chunks.reduce((count, chunk) => count + Math.max(1, Math.ceil(chunk.rows.length / rowLimitForChunk(chunk, maxRowsPerStep))), 0);
 }
 
 function completedRowBandChunks(
@@ -385,13 +387,25 @@ function completedRowBandChunks(
   }
   let completed = 0;
   for (let index = 0; index < Math.min(cursor.chunk_index, chunks.length); index += 1) {
-    completed += Math.max(1, Math.ceil(chunks[index].rows.length / maxRowsPerStep));
+    const rowLimit = rowLimitForChunk(chunks[index], maxRowsPerStep);
+    completed += Math.max(1, Math.ceil(chunks[index].rows.length / rowLimit));
   }
   const currentChunk = chunks[cursor.chunk_index];
   if (currentChunk) {
-    completed += Math.min(Math.ceil(cursor.row_offset / maxRowsPerStep), Math.max(1, Math.ceil(currentChunk.rows.length / maxRowsPerStep)));
+    const rowLimit = rowLimitForChunk(currentChunk, maxRowsPerStep);
+    completed += Math.min(Math.ceil(cursor.row_offset / rowLimit), Math.max(1, Math.ceil(currentChunk.rows.length / rowLimit)));
   }
   return completed;
+}
+
+function chunkColumnCount(chunk: ExternalImportExecutionChunk) {
+  return Math.max(chunk.column_count, chunk.headers.length, 1, ...chunk.rows.map((row) => row.length));
+}
+
+function rowLimitForChunk(chunk: ExternalImportExecutionChunk, maxRowsPerStep: number) {
+  const maxRows = Math.max(1, Math.floor(maxRowsPerStep));
+  const maxRowsByCells = Math.max(1, Math.floor(DEFAULT_MAX_CELLS_PER_STEP / chunkColumnCount(chunk)));
+  return Math.min(maxRows, maxRowsByCells);
 }
 
 export function planExternalImportStep(input: {
@@ -440,7 +454,8 @@ export function planExternalImportStep(input: {
     });
   }
 
-  const rows = chunk.rows.slice(input.cursor.row_offset, input.cursor.row_offset + maxRowsPerStep);
+  const rowLimit = rowLimitForChunk(chunk, maxRowsPerStep);
+  const rows = chunk.rows.slice(input.cursor.row_offset, input.cursor.row_offset + rowLimit);
   const setup = input.cursor.row_offset === 0
     ? buildSetupRequests({ resolvedZone, chunk, manifestItem: input.manifestItem ?? null })
     : { requests: [], setupMeta: {} };
@@ -532,12 +547,24 @@ async function executeBatchUpdate(input: { spreadsheetId: string; requests: Reco
       batchUpdate: (input: { spreadsheetId: string; requestBody: { requests: Record<string, unknown>[] } }) => unknown;
     };
   };
-  const batchUpdateResult = sheets.spreadsheets.batchUpdate({
-    spreadsheetId: input.spreadsheetId,
-    requestBody: { requests: input.requests },
-  });
-  const result = await batchUpdateResult;
-  return { ...(result ?? {}), request_count: input.requests.length };
+  try {
+    const batchUpdateResult = sheets.spreadsheets.batchUpdate({
+      spreadsheetId: input.spreadsheetId,
+      requestBody: { requests: input.requests },
+    });
+    const result = await batchUpdateResult;
+    return { ...(result ?? {}), request_count: input.requests.length };
+  } catch (error) {
+    throw new ExternalImportStepError(
+      "EXTERNAL_IMPORT_SHEETS_BATCH_UPDATE_FAILED",
+      "Google Sheets batchUpdate failed.",
+      externalImportUpstreamErrorDetails(error, {
+        service: "google_sheets",
+        operation: "spreadsheets.batchUpdate",
+        requestCount: input.requests.length,
+      }),
+    );
+  }
 }
 
 function isValidationCursor(job: DurableJobRow, cursor: ExternalImportStepCursor) {
@@ -573,23 +600,58 @@ async function runValidation(input: { spreadsheetId: string; artifact: ExternalI
     );
   }
 
-  const response = await fetch(workerUrl, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-aiwb-worker-secret": workerSecret,
-    },
-    body: JSON.stringify({
-      operation: "validate_input",
-      spreadsheet_id: input.spreadsheetId,
-    }),
-  });
-  const body = await response.json().catch(() => ({}));
+  let response: Response;
+  try {
+    response = await fetch(workerUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-aiwb-worker-secret": workerSecret,
+      },
+      body: JSON.stringify({
+        operation: "validate_input",
+        spreadsheet_id: input.spreadsheetId,
+      }),
+    });
+  } catch (error) {
+    throw new ExternalImportStepError(
+      "EXTERNAL_IMPORT_VALIDATION_UPSTREAM_FAILED",
+      "External import validation worker request failed.",
+      externalImportUpstreamErrorDetails(error, {
+        service: "project_bootstrap_worker",
+        operation: "validate_input",
+        route: workerUrl,
+      }),
+    );
+  }
+  const rawBody = await response.text().catch(() => "");
+  let body: unknown = {};
+  if (rawBody.trim()) {
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      body = rawBody;
+    }
+  }
   if (!response.ok) {
     throw new ExternalImportStepError(
       "EXTERNAL_IMPORT_VALIDATION_FAILED",
       "External import validation worker returned an error.",
-      { status: response.status, validation: body },
+      externalImportUpstreamErrorDetails(
+        {
+          response: {
+            status: response.status,
+            statusText: response.statusText,
+            data: body,
+            config: { url: workerUrl },
+          },
+        },
+        {
+          service: "project_bootstrap_worker",
+          operation: "validate_input",
+          route: workerUrl,
+        },
+      ),
     );
   }
   return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : { ok: true, result: body };

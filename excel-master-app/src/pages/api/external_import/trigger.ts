@@ -3,6 +3,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth/next";
 
 import { runExternalImportJobStep, ExternalImportStepError } from "@/lib/external-import/step-runner";
+import { externalImportUpstreamErrorDetails } from "@/lib/external-import/upstream-error";
 import {
   getJob,
   markJobFailed,
@@ -36,9 +37,11 @@ function stepError(error: unknown, jobId?: string) {
       ...(jobId ? { job_id: jobId } : {}),
     };
   }
+  const details = externalImportUpstreamErrorDetails(error);
   return {
     code: "EXTERNAL_IMPORT_TRIGGER_FAILED",
     message: error instanceof Error && error.message.trim() ? error.message : "External import trigger failed.",
+    ...(Object.keys(details).length ? { details } : {}),
     ...(jobId ? { job_id: jobId } : {}),
   };
 }
