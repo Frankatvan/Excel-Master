@@ -56,6 +56,23 @@ describe("deployment packaging guardrails", () => {
     );
   });
 
+  it("allows enough runtime for full external import worker writes and validation", () => {
+    const projectRoot = path.resolve(__dirname, "../..");
+    const vercelConfigPath = path.join(projectRoot, "vercel.json");
+
+    expect(fs.existsSync(vercelConfigPath)).toBe(true);
+
+    const vercelConfig = JSON.parse(fs.readFileSync(vercelConfigPath, "utf8"));
+    const externalImportWorker = vercelConfig.functions?.["api/external_import_worker.py"];
+
+    expect(externalImportWorker).toEqual(
+      expect.objectContaining({
+        maxDuration: expect.any(Number),
+      }),
+    );
+    expect(externalImportWorker.maxDuration).toBeGreaterThanOrEqual(300);
+  });
+
   it("declares enough runtime for the audit sync API background task", () => {
     const projectRoot = path.resolve(__dirname, "../..");
     const vercelConfigPath = path.join(projectRoot, "vercel.json");

@@ -1509,6 +1509,74 @@ describe("/api/external_import/confirm", () => {
     expect(res.status).toHaveBeenCalledWith(500);
   });
 
+  it("preserves failed evidence when the worker invocation times out", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    mockCreateJob.mockResolvedValue({ id: "job-123", status: "queued" });
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => "FUNCTION_INVOCATION_TIMEOUT",
+    });
+    const buffer = workbookBuffer([
+      {
+        name: "Payable",
+        rows: [
+          ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          ["g-1", "Apex", "INV-1", 100, "CA"],
+        ],
+      },
+    ]);
+    const previewReq = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [{ file_name: "payables.xlsx", content_base64: buffer.toString("base64") }],
+      },
+    } as unknown as NextApiRequest;
+    const previewRes = createMockRes();
+    await previewHandler(previewReq, previewRes);
+
+    const req = {
+      method: "POST",
+      body: { spreadsheet_id: "sheet-123", preview_hash: readJson(previewRes).preview_hash },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await confirmHandler(req, res);
+
+    expect(mockCreateImportManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+          message: "FUNCTION_INVOCATION_TIMEOUT",
+        }),
+      }),
+    );
+    expect(mockCreateImportManifestItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifestId: "manifest-123",
+        sourceTable: "payable",
+        targetZoneKey: "external_import.payable_raw",
+        status: "failed",
+        validationMessage: "FUNCTION_INVOCATION_TIMEOUT",
+      }),
+    );
+    expect(mockMarkJobFailed).toHaveBeenCalledWith({
+      jobId: "job-123",
+      error: expect.objectContaining({
+        code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+        message: "FUNCTION_INVOCATION_TIMEOUT",
+        failed_manifest_id: "manifest-123",
+        failed_manifest_item_count: 1,
+      }),
+    });
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+
   it("keeps Vercel Authentication HTML 401 clear in the failed job evidence", async () => {
     mockGetServerSession.mockResolvedValue({
       user: { email: "writer@example.com" },

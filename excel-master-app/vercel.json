@@ -23,7 +23,7 @@
       "regions": ["sfo1"]
     },
     "api/external_import_worker.py": {
-      "maxDuration": 60,
+      "maxDuration": 300,
       "regions": ["sfo1"]
     },
     "api/internal/reclassify_job.py": {
