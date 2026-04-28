@@ -13,6 +13,10 @@ export interface ResolvedImportZone {
   capacityPolicy: "expand_within_managed_sheet" | "fixed_capacity";
   headerSignaturePolicy: string;
   gridRange: ImportZoneGridRange;
+  sheetGridProperties?: {
+    rowCount?: number;
+    columnCount?: number;
+  };
   fingerprint: string;
 }
 
@@ -43,6 +47,10 @@ interface SheetLike {
   properties?: {
     sheetId?: number;
     title?: string;
+    gridProperties?: {
+      rowCount?: number;
+      columnCount?: number;
+    };
   };
   developerMetadata?: DeveloperMetadataLike[];
 }
@@ -125,6 +133,18 @@ function zoneWidth(range: ImportZoneGridRange) {
     return undefined;
   }
   return range.endColumnIndex - range.startColumnIndex;
+}
+
+function readSheetGridProperties(sheet: SheetLike) {
+  const rowCount = readNumber(sheet.properties?.gridProperties?.rowCount);
+  const columnCount = readNumber(sheet.properties?.gridProperties?.columnCount);
+  if (typeof rowCount !== "number" && typeof columnCount !== "number") {
+    return undefined;
+  }
+  return {
+    ...(typeof rowCount === "number" ? { rowCount } : {}),
+    ...(typeof columnCount === "number" ? { columnCount } : {}),
+  };
 }
 
 function isSupportedCapacityPolicy(value: string): value is SupportedCapacityPolicy {
@@ -239,6 +259,7 @@ export function resolveImportZone(
         ...(typeof endRowIndex === "number" ? { endRowIndex } : {}),
         ...(typeof endColumnIndex === "number" ? { endColumnIndex } : {}),
       };
+      const sheetGridProperties = readSheetGridProperties(sheet);
 
       const width = zoneWidth(gridRange);
       if (
@@ -269,6 +290,7 @@ export function resolveImportZone(
           capacityPolicy,
           headerSignaturePolicy,
           gridRange,
+          ...(sheetGridProperties ? { sheetGridProperties } : {}),
           fingerprint: stableFingerprint(gridRange, zoneKey),
         },
         warnings: [],

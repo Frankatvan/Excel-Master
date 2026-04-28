@@ -141,6 +141,101 @@ def test_capacity_exceeded_blocks_import_plan():
     }
 
 
+def test_expand_within_managed_sheet_expands_rows_before_clear_and_write():
+    worker = load_worker_module()
+    source = table("costs", rows=[["A", 10], ["B", 20], ["C", 30], ["D", 40]])
+    resolved_zone = {
+        "gridRange": grid(rows=2, columns=3, start_row=1, start_column=0),
+        "capacityPolicy": "expand_within_managed_sheet",
+        "sheetGridProperties": {"rowCount": 5},
+        "fingerprint": "zone-fp",
+    }
+
+    plan = worker.build_external_import_plan({"costs": resolved_zone}, [source])
+
+    assert plan["requests"][0] == {
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": 101,
+                "gridProperties": {"rowCount": 6},
+            },
+            "fields": "gridProperties.rowCount",
+        }
+    }
+    assert plan["requests"][1]["repeatCell"]["range"]["endRowIndex"] == 6
+    assert plan["requests"][2]["updateCells"]["range"] == {
+        "sheetId": 101,
+        "startRowIndex": 1,
+        "endRowIndex": 6,
+        "startColumnIndex": 0,
+        "endColumnIndex": 2,
+    }
+    assert plan["manifest"][0]["resolved_zone_fingerprint"] == "zone-fp"
+
+
+def test_expand_within_managed_sheet_uses_current_sheet_rows_without_shrinking():
+    worker = load_worker_module()
+    source = table("costs", rows=[["A", 10], ["B", 20], ["C", 30], ["D", 40]])
+    resolved_zone = {
+        "gridRange": grid(rows=2, columns=3, start_row=1, start_column=0),
+        "capacityPolicy": "expand_within_managed_sheet",
+        "sheetGridProperties": {"rowCount": 10},
+    }
+
+    plan = worker.build_external_import_plan({"costs": resolved_zone}, [source])
+
+    assert "updateSheetProperties" not in plan["requests"][0]
+    assert plan["requests"][0]["repeatCell"]["range"]["endRowIndex"] == 10
+    assert plan["requests"][1]["updateCells"]["range"]["endRowIndex"] == 6
+
+
+def test_fixed_capacity_still_blocks_row_growth():
+    worker = load_worker_module()
+    source = table("costs", rows=[["A", 10], ["B", 20], ["C", 30], ["D", 40]])
+
+    with pytest.raises(worker.CapacityExceededError) as error:
+        worker.build_external_import_plan(
+            {
+                "costs": {
+                    "gridRange": grid(rows=2, columns=3),
+                    "capacityPolicy": "fixed_capacity",
+                }
+            },
+            [source],
+        )
+
+    assert error.value.details == {
+        "target_zone_key": "costs",
+        "required_rows": 5,
+        "available_rows": 2,
+        "required_columns": 2,
+        "available_columns": 3,
+    }
+
+
+def test_expand_within_managed_sheet_still_blocks_column_growth():
+    worker = load_worker_module()
+    source = table(
+        "costs",
+        headers=["Name", "Amount", "Memo"],
+        rows=[["A", 10, "one"]],
+    )
+
+    with pytest.raises(worker.CapacityExceededError) as error:
+        worker.build_external_import_plan(
+            {
+                "costs": {
+                    "gridRange": grid(rows=5, columns=2),
+                    "capacityPolicy": "expand_within_managed_sheet",
+                }
+            },
+            [source],
+        )
+
+    assert error.value.details["required_columns"] == 3
+    assert error.value.details["available_columns"] == 2
+
+
 def test_capacity_check_accepts_nested_grid_range_resolver_shape():
     worker = load_worker_module()
     source = table("costs", headers=["Name", "Amount"], rows=[["A", 10]])

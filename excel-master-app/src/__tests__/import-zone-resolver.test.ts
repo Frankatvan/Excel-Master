@@ -83,6 +83,31 @@ describe("import-zone-resolver", () => {
     });
   });
 
+  it("carries current sheet grid properties for managed runtime expansion", () => {
+    const resolution = resolveImportZone(
+      {
+        sheets: [
+          {
+            properties: {
+              sheetId: 101,
+              title: "Payable",
+              gridProperties: { rowCount: 50000, columnCount: 702 },
+            },
+            developerMetadata: metadataSpreadsheet.sheets[0].developerMetadata,
+          },
+        ],
+      },
+      "payable",
+    );
+
+    expect(resolution).toMatchObject({
+      ok: true,
+      zone: {
+        sheetGridProperties: { rowCount: 50000, columnCount: 702 },
+      },
+    });
+  });
+
   it("accepts numeric schema version emitted by workbook bootstrap metadata", () => {
     const resolution = resolveImportZone(
       spreadsheetWithZoneMetadata(zoneMetadata({ schema_version: 1 })),

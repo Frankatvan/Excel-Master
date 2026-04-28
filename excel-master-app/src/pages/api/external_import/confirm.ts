@@ -121,7 +121,7 @@ async function loadSpreadsheetMetadata(spreadsheetId: string) {
   const sheets = getSheetsClient();
   const response = await sheets.spreadsheets.get({
     spreadsheetId,
-    fields: "sheets(properties(sheetId,title),developerMetadata(metadataKey,metadataValue))",
+    fields: "sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)),developerMetadata(metadataKey,metadataValue))",
   });
   return response.data;
 }

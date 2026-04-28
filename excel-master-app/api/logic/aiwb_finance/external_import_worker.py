@@ -45,10 +45,12 @@ def build_external_import_plan(
         if resolved_zone is None:
             raise KeyError(f"Resolved zone is required for import table: {target_zone_key}")
 
-        assert_capacity(source_table, resolved_zone)
-        requests.append(build_clear_request(resolved_zone))
-        requests.append(build_write_request(source_table, resolved_zone))
-        manifest.append(build_manifest_item_payload(source_table, resolved_zone, status="imported"))
+        prepared_zone = prepare_resolved_zone_for_source(source_table, resolved_zone)
+        requests.extend(prepared_zone["requests"])
+        effective_zone = prepared_zone["resolved_zone"]
+        requests.append(build_clear_request(effective_zone))
+        requests.append(build_write_request(source_table, effective_zone))
+        manifest.append(build_manifest_item_payload(source_table, effective_zone, status="imported"))
 
     return {"requests": requests, "manifest": manifest}
 
@@ -185,6 +187,13 @@ def is_uploaded_or_detected(source_table: Mapping[str, Any]) -> bool:
 
 
 def assert_capacity(source_table: Mapping[str, Any], resolved_zone: Mapping[str, Any]) -> None:
+    prepare_resolved_zone_for_source(source_table, resolved_zone)
+
+
+def prepare_resolved_zone_for_source(
+    source_table: Mapping[str, Any],
+    resolved_zone: Mapping[str, Any],
+) -> dict[str, Any]:
     headers = list(source_table.get("headers") or [])
     rows = list(source_table.get("rows") or [])
     required_rows = len(rows) + 1
@@ -193,7 +202,11 @@ def assert_capacity(source_table: Mapping[str, Any], resolved_zone: Mapping[str,
     available_rows = int(zone_range["endRowIndex"]) - int(zone_range["startRowIndex"])
     available_columns = int(zone_range["endColumnIndex"]) - int(zone_range["startColumnIndex"])
 
-    if required_rows > available_rows or required_columns > available_columns:
+    capacity_policy = resolved_zone_capacity_policy(resolved_zone)
+    row_overflow = required_rows > available_rows
+    column_overflow = required_columns > available_columns
+
+    if column_overflow or (row_overflow and capacity_policy != "expand_within_managed_sheet"):
         raise CapacityExceededError(
             {
                 "target_zone_key": source_table.get("target_zone_key") or source_table.get("source_table"),
@@ -203,6 +216,63 @@ def assert_capacity(source_table: Mapping[str, Any], resolved_zone: Mapping[str,
                 "available_columns": available_columns,
             }
         )
+
+    current_row_count = int(zone_range["endRowIndex"])
+    if capacity_policy == "expand_within_managed_sheet":
+        current_row_count = max(current_row_count, resolved_sheet_row_count(resolved_zone) or 0)
+    requests: list[dict[str, Any]] = []
+    effective_end_row_index = current_row_count
+    required_end_row_index = int(zone_range["startRowIndex"]) + required_rows
+
+    if row_overflow and required_end_row_index > current_row_count:
+        requests.append(build_update_sheet_row_count_request(zone_range["sheetId"], required_end_row_index))
+        effective_end_row_index = required_end_row_index
+
+    if effective_end_row_index != int(zone_range["endRowIndex"]):
+        return {
+            "resolved_zone": with_grid_range(resolved_zone, {**zone_range, "endRowIndex": effective_end_row_index}),
+            "requests": requests,
+        }
+
+    return {"resolved_zone": resolved_zone, "requests": requests}
+
+
+def resolved_zone_capacity_policy(resolved_zone: Mapping[str, Any]) -> str:
+    policy = resolved_zone.get("capacityPolicy") or resolved_zone.get("capacity_policy")
+    return str(policy or "fixed_capacity")
+
+
+def resolved_sheet_row_count(resolved_zone: Mapping[str, Any]) -> int | None:
+    sheet_grid_properties = resolved_zone.get("sheetGridProperties") or resolved_zone.get("sheet_grid_properties")
+    if isinstance(sheet_grid_properties, Mapping):
+        row_count = sheet_grid_properties.get("rowCount") or sheet_grid_properties.get("row_count")
+        if isinstance(row_count, int) and row_count >= 0:
+            return row_count
+    row_count = resolved_zone.get("sheetRowCount") or resolved_zone.get("sheet_row_count")
+    if isinstance(row_count, int) and row_count >= 0:
+        return row_count
+    return None
+
+
+def build_update_sheet_row_count_request(sheet_id: int, row_count: int) -> dict[str, Any]:
+    return {
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": int(sheet_id),
+                "gridProperties": {"rowCount": int(row_count)},
+            },
+            "fields": "gridProperties.rowCount",
+        }
+    }
+
+
+def with_grid_range(resolved_zone: Mapping[str, Any], updated_range: Mapping[str, int]) -> dict[str, Any]:
+    effective_zone = dict(resolved_zone)
+    if "gridRange" in resolved_zone:
+        effective_zone["gridRange"] = {**dict(resolved_zone.get("gridRange") or {}), **dict(updated_range)}
+    else:
+        effective_zone.update(dict(updated_range))
+    return effective_zone
 
 
 def build_clear_request(resolved_zone: Mapping[str, Any]) -> dict[str, Any]:
