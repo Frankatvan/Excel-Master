@@ -274,6 +274,95 @@ function workerResultError(workerResult: ExternalImportWorkerResult) {
   };
 }
 
+function previewFailureItems(input: {
+  previewRecord: ExternalImportPreviewRecord;
+  resolvedZones: Record<string, ResolvedImportZone>;
+  error: Record<string, unknown>;
+}) {
+  return input.previewRecord.files.flatMap((file) =>
+    file.tables.map((table) => {
+      const targetZoneKey = table.target_zone_key || table.target_zone_id;
+      return {
+        sourceTable: table.source_role,
+        sourceFileName: file.file_name,
+        sourceSheetName: table.source_sheet_name,
+        fileHash: file.file_hash,
+        rowCount: table.row_count,
+        columnCount: table.column_count,
+        amountTotal: table.amount_total,
+        targetZoneKey,
+        resolvedZoneFingerprint: input.resolvedZones[targetZoneKey]?.fingerprint ?? null,
+        validationMessage: readString(input.error.message) ?? null,
+        schemaDrift: {
+          warnings: table.warnings,
+          blocking_issues: table.blocking_issues,
+        },
+      };
+    }),
+  );
+}
+
+async function persistExternalImportFailureFromPreview(input: {
+  jobId: string;
+  spreadsheetId: string;
+  importedBy: string;
+  previewRecord: ExternalImportPreviewRecord;
+  resolvedZones: Record<string, ResolvedImportZone>;
+  error: Record<string, unknown>;
+}) {
+  const manifest = (await createImportManifest({
+    jobId: input.jobId,
+    spreadsheetId: input.spreadsheetId,
+    status: "failed",
+    importedBy: input.importedBy,
+    resultMeta: {
+      source: "preview_fallback",
+      preview_hash: input.previewRecord.previewHash,
+    },
+    error: input.error,
+  })) as { id?: string } | null;
+
+  if (!manifest?.id) {
+    throw new Error("External import failed manifest was not created.");
+  }
+
+  const items = previewFailureItems({
+    previewRecord: input.previewRecord,
+    resolvedZones: input.resolvedZones,
+    error: input.error,
+  });
+
+  for (const item of items) {
+    await createImportManifestItem({
+      manifestId: manifest.id,
+      jobId: input.jobId,
+      spreadsheetId: input.spreadsheetId,
+      sourceTable: item.sourceTable,
+      sourceFileName: item.sourceFileName,
+      sourceSheetName: item.sourceSheetName,
+      fileHash: item.fileHash,
+      headerSignature: null,
+      rowCount: item.rowCount,
+      columnCount: item.columnCount,
+      amountTotal: item.amountTotal,
+      targetZoneKey: item.targetZoneKey,
+      resolvedZoneFingerprint: item.resolvedZoneFingerprint,
+      status: "failed",
+      validationMessage: item.validationMessage,
+      schemaDrift: item.schemaDrift,
+      resultMeta: {
+        source: "preview_fallback",
+      },
+      error: input.error,
+    });
+  }
+
+  return {
+    manifestId: manifest.id,
+    itemCount: items.length,
+  };
+}
+
 async function persistExternalImportResult(input: {
   jobId: string;
   spreadsheetId: string;
@@ -331,6 +420,41 @@ async function persistExternalImportResult(input: {
     manifestStatus,
     importedTableCount: workerManifestItems.filter((item) => normalizeManifestItemStatus(item, input.workerResult) !== "stale")
       .length,
+  };
+}
+
+function summarizePreviewTable(table: ExternalImportPreviewRecord["sourceTables"][number]) {
+  return {
+    source_role: table.source_role,
+    source_sheet_name: table.source_sheet_name,
+    row_count: table.row_count,
+    column_count: table.column_count,
+    amount_total: table.amount_total,
+    target_zone_key: table.target_zone_key,
+    target_zone_id: table.target_zone_id,
+    warnings: table.warnings,
+    blocking_issues: table.blocking_issues,
+  };
+}
+
+function buildDurableJobPayload(input: {
+  spreadsheetId: string;
+  previewRecord: ExternalImportPreviewRecord;
+  resolvedZones: Record<string, ResolvedImportZone>;
+}) {
+  return {
+    spreadsheet_id: input.spreadsheetId,
+    preview_hash: input.previewRecord.previewHash,
+    payload_format: "external_import.confirm.summary.v1",
+    omitted_row_data: true,
+    parsed_table_count: input.previewRecord.files.reduce((count, file) => count + file.tables.length, 0),
+    source_tables: input.previewRecord.sourceTables.map(summarizePreviewTable),
+    resolved_zones: input.resolvedZones,
+    files: input.previewRecord.files.map((file) => ({
+      file_name: file.file_name,
+      file_hash: file.file_hash,
+      table_count: file.tables.length,
+    })),
   };
 }
 
@@ -408,7 +532,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       jobType: "external_import",
       operation: "external_import",
       createdBy: session.user.email,
-      payload: workerPayload,
+      payload: buildDurableJobPayload({
+        spreadsheetId,
+        previewRecord,
+        resolvedZones,
+      }),
     });
 
     if (!job?.id) {
@@ -428,12 +556,38 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     } catch (dispatchError) {
       const workerFailure = dispatchError instanceof ExternalImportWorkerFailure ? dispatchError : null;
+      const failureError = {
+        code: workerFailure?.errorCode ?? "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+        message: dispatchError instanceof Error ? dispatchError.message : "External import worker dispatch failed.",
+        ...(workerFailure?.details ? { details: workerFailure.details } : {}),
+      };
+      let failedEvidence: Awaited<ReturnType<typeof persistExternalImportFailureFromPreview>> | null = null;
+      try {
+        failedEvidence = await persistExternalImportFailureFromPreview({
+          jobId: job.id,
+          spreadsheetId,
+          importedBy: session.user.email,
+          previewRecord,
+          resolvedZones,
+          error: failureError,
+        });
+      } catch (evidenceError) {
+        console.error("External import failed evidence persistence failed", {
+          job_id: job.id,
+          code: failureError.code,
+          message: evidenceError instanceof Error ? evidenceError.message : "Unknown evidence persistence error.",
+        });
+      }
       await markJobFailed({
         jobId: job.id,
         error: {
-          code: workerFailure?.errorCode ?? "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
-          message: dispatchError instanceof Error ? dispatchError.message : "External import worker dispatch failed.",
-          ...(workerFailure?.details ? { details: workerFailure.details } : {}),
+          ...failureError,
+          ...(failedEvidence
+            ? {
+                failed_manifest_id: failedEvidence.manifestId,
+                failed_manifest_item_count: failedEvidence.itemCount,
+              }
+            : {}),
         },
       });
       throw dispatchError;

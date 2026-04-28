@@ -79,6 +79,32 @@ describe("job-service", () => {
     });
   });
 
+  it("preserves Supabase object error details for operators", async () => {
+    const fake = createSupabaseFake({
+      data: null,
+      error: {
+        message: "null value in column \"project_id\" violates not-null constraint",
+        code: "23502",
+        details: "Failing row contains (...).",
+        hint: "Run the durable jobs compatibility migration.",
+      },
+    });
+
+    await expect(
+      createJob(
+        {
+          spreadsheetId: "sheet-123",
+          jobType: "external_import",
+          operation: "external_import",
+          createdBy: "actor@example.com",
+        },
+        fake.client,
+      ),
+    ).rejects.toThrow(
+      "Supabase job operation failed: null value in column \"project_id\" violates not-null constraint (code: 23502; details: Failing row contains (...).; hint: Run the durable jobs compatibility migration.)",
+    );
+  });
+
   it("marks a job running with a heartbeat and lock token", async () => {
     const fake = createSupabaseFake({ data: { id: "job-123", status: "running" }, error: null });
 

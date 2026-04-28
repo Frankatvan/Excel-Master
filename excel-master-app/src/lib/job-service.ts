@@ -146,7 +146,26 @@ function throwIfSupabaseError(error: unknown) {
   if (error instanceof Error) {
     throw error;
   }
-  throw new Error(typeof error === "string" ? error : "Supabase job operation failed.");
+  if (typeof error === "string") {
+    throw new Error(error);
+  }
+
+  if (typeof error === "object" && error !== null) {
+    const supabaseError = error as { message?: unknown; code?: unknown; details?: unknown; hint?: unknown };
+    const message = typeof supabaseError.message === "string" && supabaseError.message.trim()
+      ? supabaseError.message.trim()
+      : "Supabase job operation failed.";
+    const context = [
+      typeof supabaseError.code === "string" && supabaseError.code.trim() ? `code: ${supabaseError.code.trim()}` : null,
+      typeof supabaseError.details === "string" && supabaseError.details.trim()
+        ? `details: ${supabaseError.details.trim()}`
+        : null,
+      typeof supabaseError.hint === "string" && supabaseError.hint.trim() ? `hint: ${supabaseError.hint.trim()}` : null,
+    ].filter(Boolean);
+    throw new Error(`Supabase job operation failed: ${message}${context.length ? ` (${context.join("; ")})` : ""}`);
+  }
+
+  throw new Error("Supabase job operation failed.");
 }
 
 export async function createJob(input: CreateJobInput, client: SupabaseLike = getSupabaseClient()) {

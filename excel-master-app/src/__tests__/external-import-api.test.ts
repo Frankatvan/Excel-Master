@@ -148,8 +148,14 @@ function mockSupabaseStorage({
     },
     error: null,
   });
+  const downloadBlobPart = downloadBuffer
+    ? (downloadBuffer.buffer.slice(
+        downloadBuffer.byteOffset,
+        downloadBuffer.byteOffset + downloadBuffer.byteLength,
+      ) as ArrayBuffer)
+    : null;
   const download = jest.fn().mockResolvedValue({
-    data: downloadBuffer ? new Blob([downloadBuffer]) : null,
+    data: downloadBlobPart ? new Blob([downloadBlobPart]) : null,
     error: downloadBuffer ? null : new Error("missing fixture"),
   });
   const remove = jest.fn().mockResolvedValue({ data: [], error: null });
@@ -731,13 +737,7 @@ describe("/api/external_import/confirm", () => {
             gridRange: expect.objectContaining({ sheetId: 101 }),
           }),
         },
-        parsed_tables: [
-          expect.objectContaining({
-            source_table: "payable",
-            target_zone_key: "external_import.payable_raw",
-            rows: [["g-1", "Apex", "INV-1", 100, "CA"]],
-          }),
-        ],
+        parsed_table_count: 1,
         source_tables: [
           expect.objectContaining({
             source_role: "payable",
@@ -747,6 +747,15 @@ describe("/api/external_import/confirm", () => {
         ],
       }),
     });
+    expect(mockCreateJob.mock.calls[0]?.[0].payload).not.toHaveProperty("parsed_tables");
+    const workerRequest = JSON.parse(String((global.fetch as jest.Mock).mock.calls[0]?.[1]?.body));
+    expect(workerRequest.parsed_tables).toEqual([
+      expect.objectContaining({
+        source_table: "payable",
+        target_zone_key: "external_import.payable_raw",
+        rows: [["g-1", "Apex", "INV-1", 100, "CA"]],
+      }),
+    ]);
     expect(global.fetch).toHaveBeenCalledWith(
       "https://worker.example.com/external-import",
       expect.objectContaining({
@@ -1118,13 +1127,35 @@ describe("/api/external_import/confirm", () => {
 
     await confirmHandler(req, res);
 
-    expect(mockCreateImportManifest).not.toHaveBeenCalled();
+    expect(mockCreateImportManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        spreadsheetId: "sheet-123",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_CONTRACT_INVALID",
+        }),
+      }),
+    );
+    expect(mockCreateImportManifestItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifestId: "manifest-123",
+        sourceTable: "payable",
+        targetZoneKey: "external_import.payable_raw",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_CONTRACT_INVALID",
+        }),
+      }),
+    );
     expect(mockMarkJobFailed).toHaveBeenCalledWith({
       jobId: "job-123",
-      error: {
+      error: expect.objectContaining({
         code: "EXTERNAL_IMPORT_WORKER_CONTRACT_INVALID",
         message: "External import worker returned an invalid result contract.",
-      },
+        failed_manifest_id: "manifest-123",
+        failed_manifest_item_count: 1,
+      }),
     });
     expect(res.status).toHaveBeenCalledWith(500);
   });
@@ -1172,13 +1203,32 @@ describe("/api/external_import/confirm", () => {
 
     await confirmHandler(req, res);
 
-    expect(mockCreateImportManifest).not.toHaveBeenCalled();
+    expect(mockCreateImportManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        spreadsheetId: "sheet-123",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_CONTRACT_INVALID",
+        }),
+      }),
+    );
+    expect(mockCreateImportManifestItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifestId: "manifest-123",
+        sourceTable: "payable",
+        targetZoneKey: "external_import.payable_raw",
+        status: "failed",
+      }),
+    );
     expect(mockMarkJobFailed).toHaveBeenCalledWith({
       jobId: "job-123",
-      error: {
+      error: expect.objectContaining({
         code: "EXTERNAL_IMPORT_WORKER_CONTRACT_INVALID",
         message: "External import worker returned an invalid result contract.",
-      },
+        failed_manifest_id: "manifest-123",
+        failed_manifest_item_count: 1,
+      }),
     });
     expect(res.status).toHaveBeenCalledWith(500);
   });
@@ -1225,13 +1275,34 @@ describe("/api/external_import/confirm", () => {
 
     await confirmHandler(req, res);
 
+    expect(mockCreateImportManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        spreadsheetId: "sheet-123",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_CAPACITY_EXCEEDED",
+          details: { target_zone_key: "external_import.payable_raw" },
+        }),
+      }),
+    );
+    expect(mockCreateImportManifestItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifestId: "manifest-123",
+        sourceTable: "payable",
+        targetZoneKey: "external_import.payable_raw",
+        status: "failed",
+      }),
+    );
     expect(mockMarkJobFailed).toHaveBeenCalledWith({
       jobId: "job-123",
-      error: {
+      error: expect.objectContaining({
         code: "EXTERNAL_IMPORT_CAPACITY_EXCEEDED",
         message: "Resolved import zone capacity is too small",
         details: { target_zone_key: "external_import.payable_raw" },
-      },
+        failed_manifest_id: "manifest-123",
+        failed_manifest_item_count: 1,
+      }),
     });
     expect(res.status).toHaveBeenCalledWith(500);
   });
@@ -1274,12 +1345,36 @@ describe("/api/external_import/confirm", () => {
 
     await confirmHandler(req, res);
 
+    expect(mockCreateImportManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "job-123",
+        spreadsheetId: "sheet-123",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+          message: "worker down",
+        }),
+      }),
+    );
+    expect(mockCreateImportManifestItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifestId: "manifest-123",
+        sourceTable: "payable",
+        targetZoneKey: "external_import.payable_raw",
+        status: "failed",
+        error: expect.objectContaining({
+          code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
+        }),
+      }),
+    );
     expect(mockMarkJobFailed).toHaveBeenCalledWith({
       jobId: "job-123",
-      error: {
+      error: expect.objectContaining({
         code: "EXTERNAL_IMPORT_WORKER_DISPATCH_FAILED",
         message: "worker down",
-      },
+        failed_manifest_id: "manifest-123",
+        failed_manifest_item_count: 1,
+      }),
     });
     expect(res.status).toHaveBeenCalledWith(500);
   });
