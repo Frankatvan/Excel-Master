@@ -7,6 +7,7 @@ import {
   hashFileBuffer,
   savePreviewPayload,
 } from "@/lib/external-import/preview-store";
+import { downloadExternalImportStoredFiles } from "@/lib/external-import/upload-storage";
 import { parseWorkbookBuffer } from "@/lib/external-import/workbook-parser";
 import { ProjectAccessError, requireProjectCollaborator } from "@/lib/project-access";
 import { authOptions } from "../auth/[...nextauth]";
@@ -118,6 +119,27 @@ function readUploadedWorkbooks(body: Record<string, unknown>): UploadedWorkbookB
   });
 }
 
+async function readStorageUploadedWorkbooks(
+  spreadsheetId: string,
+  body: Record<string, unknown>,
+): Promise<UploadedWorkbookBuffer[]> {
+  const storageFiles = Array.isArray(body.storage_files) ? body.storage_files : [];
+  const refs = storageFiles.flatMap((item) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const candidate = item as { file_name?: unknown; name?: unknown; path?: unknown };
+    const fileName = readString(candidate.file_name) ?? readString(candidate.name);
+    const path = readString(candidate.path);
+    return fileName && path ? [{ file_name: fileName, path }] : [];
+  });
+  if (refs.length === 0) {
+    return [];
+  }
+
+  return downloadExternalImportStoredFiles(spreadsheetId, refs);
+}
+
 function isExternalImportWorkerConfigured() {
   return Boolean(process.env.EXTERNAL_IMPORT_WORKER_URL?.trim() && process.env.EXTERNAL_IMPORT_WORKER_SECRET?.trim());
 }
@@ -145,7 +167,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await requireProjectCollaborator(spreadsheetId, session.user.email);
 
-    const uploads = readUploadedWorkbooks(body);
+    const directUploads = readUploadedWorkbooks(body);
+    const storageUploads = await readStorageUploadedWorkbooks(spreadsheetId, body);
+    const uploads = [...directUploads, ...storageUploads];
     if (uploads.length === 0) {
       return res.status(400).json({ error: "缺少可解析的上传文件", code: "NO_IMPORT_FILES" });
     }

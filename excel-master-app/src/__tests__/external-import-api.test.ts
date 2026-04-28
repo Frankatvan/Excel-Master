@@ -1,11 +1,13 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
 import { getServerSession } from "next-auth/next";
+import { createClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
 
 import confirmHandler from "../pages/api/external_import/confirm";
 import previewHandler from "../pages/api/external_import/preview";
 import statusHandler from "../pages/api/external_import/status";
+import uploadHandler from "../pages/api/external_import/upload";
 
 import { getExternalImportStatus } from "@/lib/external-import/import-manifest-service";
 import {
@@ -64,6 +66,10 @@ jest.mock("@/lib/job-service", () => ({
   markJobSucceeded: jest.fn(),
 }));
 
+jest.mock("@supabase/supabase-js", () => ({
+  createClient: jest.fn(),
+}));
+
 jest.mock("@/lib/google-service-account", () => ({
   getGoogleServiceAccountCredentials: jest.fn(() => ({ client_email: "robot@example.com", private_key: "key" })),
 }));
@@ -117,6 +123,48 @@ const mockCreateJob = createJob as jest.MockedFunction<typeof createJob>;
 const mockMarkJobFailed = markJobFailed as jest.MockedFunction<typeof markJobFailed>;
 const mockMarkJobRunning = markJobRunning as jest.MockedFunction<typeof markJobRunning>;
 const mockMarkJobSucceeded = markJobSucceeded as jest.MockedFunction<typeof markJobSucceeded>;
+const mockCreateClient = createClient as jest.MockedFunction<typeof createClient>;
+
+function mockSupabaseStorage({
+  signedUrl = "https://storage.example.com/signed-upload",
+  downloadBuffer,
+  bucketExists = true,
+}: {
+  signedUrl?: string;
+  downloadBuffer?: Buffer;
+  bucketExists?: boolean;
+} = {}) {
+  const getBucket = jest.fn().mockResolvedValue(
+    bucketExists
+      ? { data: { id: "external-import-uploads", public: false }, error: null }
+      : { data: null, error: new Error("Bucket not found") },
+  );
+  const createBucket = jest.fn().mockResolvedValue({ data: { name: "external-import-uploads" }, error: null });
+  const createSignedUploadUrl = jest.fn().mockResolvedValue({
+    data: {
+      signedUrl,
+      path: "external-import/sheet-123/upload-1/payables.xlsx",
+      token: "signed-upload-token",
+    },
+    error: null,
+  });
+  const download = jest.fn().mockResolvedValue({
+    data: downloadBuffer ? new Blob([downloadBuffer]) : null,
+    error: downloadBuffer ? null : new Error("missing fixture"),
+  });
+  const remove = jest.fn().mockResolvedValue({ data: [], error: null });
+  const storage = {
+    getBucket,
+    createBucket,
+    from: jest.fn(() => ({
+      createSignedUploadUrl,
+      download,
+      remove,
+    })),
+  };
+  mockCreateClient.mockReturnValue({ storage } as never);
+  return { storage, getBucket, createBucket, createSignedUploadUrl, download, remove };
+}
 
 function createMockRes() {
   const res = {} as Partial<NextApiResponse>;
@@ -145,6 +193,7 @@ describe("/api/external_import/preview", () => {
   beforeEach(() => {
     jest.useRealTimers();
     jest.clearAllMocks();
+    mockCreateClient.mockReset();
     mockRequireProjectCollaborator.mockResolvedValue({
       canAccess: true,
       canWrite: true,
@@ -243,6 +292,90 @@ describe("/api/external_import/preview", () => {
     });
     expect(readJson(res).preview_hash).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/));
     expect(readJson(res).worker_configured).toBe(true);
+  });
+
+  it("parses collaborator storage upload references without receiving file bytes in the preview request", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+    const buffer = workbookBuffer([
+      {
+        name: "Payable",
+        rows: [
+          ["GuId", "Vendor", "Invoice No", "Amount", "Cost State"],
+          ["g-1", "Apex", "INV-1", 100, "CA"],
+        ],
+      },
+    ]);
+    const { download } = mockSupabaseStorage({ downloadBuffer: buffer });
+
+    const req = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        storage_files: [
+          {
+            file_name: "payables.xlsx",
+            path: "external-import/sheet-123/upload-1/payables.xlsx",
+          },
+        ],
+      },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await previewHandler(req, res);
+
+    expect(mockRequireProjectCollaborator).toHaveBeenCalledWith("sheet-123", "writer@example.com");
+    expect(download).toHaveBeenCalledWith("external-import/sheet-123/upload-1/payables.xlsx");
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(readJson(res)).toMatchObject({
+      status: "preview_ready",
+      spreadsheet_id: "sheet-123",
+      files: [
+        {
+          file_name: "payables.xlsx",
+          tables: [
+            {
+              source_role: "payable",
+              target_zone_key: "external_import.payable_raw",
+              row_count: 1,
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("rejects storage upload references outside the requested spreadsheet scope", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+    mockSupabaseStorage({ downloadBuffer: Buffer.from("unused") });
+
+    const req = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        storage_files: [
+          {
+            file_name: "payables.xlsx",
+            path: "external-import/other-sheet/upload-1/payables.xlsx",
+          },
+        ],
+      },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await previewHandler(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(readJson(res)).toEqual({
+      error: "External import upload path is outside the requested spreadsheet scope.",
+    });
   });
 
   it("previews uploaded files while reporting that confirm is unavailable when worker config is missing", async () => {
@@ -376,6 +509,89 @@ describe("/api/external_import/preview", () => {
       confirm_allowed: false,
       source_tables: [],
     });
+  });
+});
+
+describe("/api/external_import/upload", () => {
+  beforeEach(() => {
+    jest.useRealTimers();
+    jest.clearAllMocks();
+    mockCreateClient.mockReset();
+    mockRequireProjectCollaborator.mockResolvedValue({
+      canAccess: true,
+      canWrite: true,
+      isDriveOwner: false,
+      driveRole: "writer",
+    });
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+  });
+
+  it("creates collaborator-only signed storage upload reservations without receiving file bytes", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    const { createSignedUploadUrl } = mockSupabaseStorage();
+
+    const req = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [
+          {
+            file_name: "_Draw request report_2026-04-27.xlsx",
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            size: 23_000_000,
+          },
+        ],
+      },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await uploadHandler(req, res);
+
+    expect(mockRequireProjectCollaborator).toHaveBeenCalledWith("sheet-123", "writer@example.com");
+    expect(createSignedUploadUrl).toHaveBeenCalledWith(expect.stringMatching(/^external-import\/sheet-123\/[^/]+\/_Draw request report_2026-04-27.xlsx$/), {
+      upsert: true,
+    });
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(readJson(res)).toMatchObject({
+      status: "upload_ready",
+      spreadsheet_id: "sheet-123",
+      bucket: "external-import-uploads",
+      files: [
+        {
+          file_name: "_Draw request report_2026-04-27.xlsx",
+          upload_url: "https://storage.example.com/signed-upload",
+          token: "signed-upload-token",
+          path: expect.stringMatching(/^external-import\/sheet-123\/[^/]+\/_Draw request report_2026-04-27.xlsx$/),
+        },
+      ],
+    });
+  });
+
+  it("creates the private upload bucket when staging storage has not been initialized yet", async () => {
+    mockGetServerSession.mockResolvedValue({
+      user: { email: "writer@example.com" },
+    } as never);
+    const { getBucket, createBucket } = mockSupabaseStorage({ bucketExists: false });
+
+    const req = {
+      method: "POST",
+      body: {
+        spreadsheet_id: "sheet-123",
+        files: [{ file_name: "draw.xlsx", size: 5_000_000 }],
+      },
+    } as unknown as NextApiRequest;
+    const res = createMockRes();
+
+    await uploadHandler(req, res);
+
+    expect(getBucket).toHaveBeenCalledWith("external-import-uploads");
+    expect(createBucket).toHaveBeenCalledWith("external-import-uploads", {
+      public: false,
+    });
+    expect(res.status).toHaveBeenCalledWith(200);
   });
 });
 

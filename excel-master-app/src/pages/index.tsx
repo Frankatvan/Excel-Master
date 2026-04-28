@@ -1057,6 +1057,74 @@ function readFileAsBase64(file: File) {
   });
 }
 
+const DIRECT_EXTERNAL_IMPORT_PREVIEW_LIMIT_BYTES = 4 * 1024 * 1024;
+
+interface ExternalImportUploadReservation {
+  file_name: string;
+  bucket?: string;
+  path: string;
+  token: string;
+}
+
+function shouldUseSignedExternalImportUpload(file: File) {
+  return Number(file.size || 0) > DIRECT_EXTERNAL_IMPORT_PREVIEW_LIMIT_BYTES;
+}
+
+async function uploadExternalImportFileToStorage(spreadsheetId: string, file: File) {
+  const reservationResponse = await fetch("/api/external_import/upload", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      spreadsheet_id: spreadsheetId,
+      files: [
+        {
+          file_name: file.name,
+          content_type: file.type || "application/octet-stream",
+          size: file.size,
+        },
+      ],
+    }),
+  });
+  const reservationPayload = await parseResponseBody(reservationResponse);
+  if (!reservationResponse.ok) {
+    throw new Error(resolveErrorMessage(reservationPayload, "外部数据导入上传初始化失败"));
+  }
+
+  const reservations = isRecord(reservationPayload) && Array.isArray(reservationPayload.files)
+    ? reservationPayload.files
+    : [];
+  const reservation = reservations[0] as ExternalImportUploadReservation | undefined;
+  const bucket = isRecord(reservationPayload) && typeof reservationPayload.bucket === "string"
+    ? reservationPayload.bucket
+    : reservation?.bucket;
+  if (!reservation?.path || !reservation.token || !bucket) {
+    throw new Error("外部数据导入上传地址无效");
+  }
+
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
+  if (!supabaseUrl || !supabaseAnonKey) {
+    throw new Error("外部数据导入上传存储未配置");
+  }
+
+  const { createClient } = await import("@supabase/supabase-js");
+  const supabase = createClient(supabaseUrl, supabaseAnonKey);
+  const { error } = await supabase.storage.from(bucket).uploadToSignedUrl(reservation.path, reservation.token, file, {
+    contentType: file.type || "application/octet-stream",
+    upsert: true,
+  });
+  if (error) {
+    throw new Error(error.message || "外部数据导入文件上传失败");
+  }
+
+  return {
+    file_name: reservation.file_name || file.name,
+    path: reservation.path,
+  };
+}
+
 function panelClassName(extra = "") {
   return `${cardClassName} ${extra}`.trim();
 }
@@ -2135,21 +2203,26 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
     setError(null);
 
     try {
-      const contentBase64 = await readFileAsBase64(externalImportFile);
+      const previewBody = shouldUseSignedExternalImportUpload(externalImportFile)
+        ? {
+            spreadsheet_id: targetId,
+            storage_files: [await uploadExternalImportFileToStorage(targetId, externalImportFile)],
+          }
+        : {
+            spreadsheet_id: targetId,
+            files: [
+              {
+                file_name: externalImportFile.name,
+                content_base64: await readFileAsBase64(externalImportFile),
+              },
+            ],
+          };
       const res = await fetch("/api/external_import/preview", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          spreadsheet_id: targetId,
-          files: [
-            {
-              file_name: externalImportFile.name,
-              content_base64: contentBase64,
-            },
-          ],
-        }),
+        body: JSON.stringify(previewBody),
       });
       const data = await parseResponseBody(res);
       if (!res.ok) {

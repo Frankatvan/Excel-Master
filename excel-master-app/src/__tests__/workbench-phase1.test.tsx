@@ -1,6 +1,7 @@
 /** @jest-environment jsdom */
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { createClient } from "@supabase/supabase-js";
 
 import Home from "@/pages/index";
 
@@ -28,6 +29,12 @@ jest.mock("next/router", () => ({
     asPath: routerState.asPath,
   }),
 }));
+
+jest.mock("@supabase/supabase-js", () => ({
+  createClient: jest.fn(),
+}));
+
+const mockCreateClient = createClient as jest.MockedFunction<typeof createClient>;
 
 function jsonResponse(payload: unknown, ok = true) {
   return {
@@ -404,6 +411,7 @@ describe("phase 1 workbench page", () => {
     replaceMock.mockReset();
     signInMock.mockReset();
     signOutMock.mockReset();
+    mockCreateClient.mockReset();
     routerState.query = { spreadsheetId: "sheet-123" };
     routerState.asPath = "/?spreadsheetId=sheet-123";
     window.localStorage.clear();
@@ -639,7 +647,7 @@ describe("phase 1 workbench page", () => {
 
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
-    await waitFor(() => expect(screen.getByText("外部数据导入")).toBeTruthy());
+    await waitFor(() => expect(screen.getByLabelText("选择外部导入文件")).toBeTruthy());
     expect(screen.getByText("只会替换本次识别到的外部表。未上传的表保留当前版本。")).toBeTruthy();
     expect(screen.getByText("导入成功后会自动验证录入数据。")).toBeTruthy();
     expect(screen.getAllByText("Payable").length).toBeGreaterThan(0);
@@ -729,7 +737,7 @@ describe("phase 1 workbench page", () => {
 
     render(<Home defaultSpreadsheetId="configured-sheet-id" />);
 
-    await waitFor(() => expect(screen.getByText("外部数据导入")).toBeTruthy());
+    await waitFor(() => expect(screen.getByLabelText("选择外部导入文件")).toBeTruthy());
     expect(screen.getByText("外部导入 Worker 未配置，确认导入暂不可用。")).toBeTruthy();
 
     const file = new File(["demo"], "payable-april.xlsx", {
@@ -741,6 +749,115 @@ describe("phase 1 workbench page", () => {
     await waitFor(() => expect(screen.getByText("预览完成；外部导入 Worker 未配置，暂不能确认导入")).toBeTruthy());
     expect(screen.getByRole("button", { name: "确认导入" })).toHaveProperty("disabled", true);
     expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/confirm"))).toBe(false);
+  });
+
+  it("uploads large external import files through signed storage before previewing", async () => {
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://supabase.example.com";
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "anon-key";
+    const uploadToSignedUrl = jest.fn().mockResolvedValue({ data: { path: "external-import/sheet-123/upload-1/draw.xlsx" }, error: null });
+    mockCreateClient.mockReturnValue({
+      storage: {
+        from: jest.fn(() => ({
+          uploadToSignedUrl,
+        })),
+      },
+    } as never);
+
+    const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/projects/list")) {
+        return jsonResponse({
+          mode: "direct",
+          projects: [{ id: "p1", name: "Sandy Cove", spreadsheet_id: "sheet-123" }],
+        });
+      }
+      if (url.startsWith("/api/projects/state")) {
+        return jsonResponse(
+          baseProjectStatePayload({
+            current_stage: "external_data_ready",
+            is_owner_or_admin: false,
+            can_write: true,
+            drive_role: "writer",
+            is_drive_owner: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/audit_summary")) {
+        return jsonResponse(baseDashboardPayload());
+      }
+      if (url.startsWith("/api/external_import/status")) {
+        return jsonResponse({ status: "not_started", manifest_items: [] });
+      }
+      if (url.startsWith("/api/external_import/upload")) {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          spreadsheet_id: "sheet-123",
+          files: [
+            {
+              file_name: "_Draw request report_2026-04-27.xlsx",
+              size: 6291457,
+            },
+          ],
+        });
+        return jsonResponse({
+          status: "upload_ready",
+          spreadsheet_id: "sheet-123",
+          bucket: "external-import-uploads",
+          files: [
+            {
+              file_name: "_Draw request report_2026-04-27.xlsx",
+              bucket: "external-import-uploads",
+              path: "external-import/sheet-123/upload-1/draw.xlsx",
+              token: "signed-token",
+              upload_url: "https://storage.example.com/signed",
+            },
+          ],
+        });
+      }
+      if (url.startsWith("/api/external_import/preview")) {
+        expect(init?.method).toBe("POST");
+        const body = JSON.parse(String(init?.body));
+        expect(body).toEqual({
+          spreadsheet_id: "sheet-123",
+          storage_files: [
+            {
+              file_name: "_Draw request report_2026-04-27.xlsx",
+              path: "external-import/sheet-123/upload-1/draw.xlsx",
+            },
+          ],
+        });
+        expect(String(init?.body)).not.toContain("content_base64");
+        return jsonResponse({
+          status: "preview_ready",
+          spreadsheet_id: "sheet-123",
+          preview_hash: "preview-hash-123",
+          confirm_allowed: true,
+          worker_configured: true,
+          source_tables: [],
+          files: [],
+        });
+      }
+      return jsonResponse({});
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    render(<Home defaultSpreadsheetId="configured-sheet-id" />);
+
+    await waitFor(() => expect(screen.getByLabelText("选择外部导入文件")).toBeTruthy());
+    const file = new File([new Uint8Array(6 * 1024 * 1024 + 1)], "_Draw request report_2026-04-27.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    fireEvent.change(screen.getByLabelText("选择外部导入文件"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "预览导入" }));
+
+    await waitFor(() => expect(uploadToSignedUrl).toHaveBeenCalledWith(
+      "external-import/sheet-123/upload-1/draw.xlsx",
+      "signed-token",
+      file,
+      { contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", upsert: true },
+    ));
+    await waitFor(() => expect(screen.getByText("预览完成，可以确认导入")).toBeTruthy());
+    expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/upload"))).toBe(true);
   });
 
   it("shows external import status to readonly collaborators without upload controls", async () => {
