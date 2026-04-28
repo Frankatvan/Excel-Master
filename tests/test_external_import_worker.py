@@ -18,11 +18,25 @@ WORKER_PATH = (
     / "aiwb_finance"
     / "external_import_worker.py"
 )
+WORKER_ENTRY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "excel-master-app"
+    / "api"
+    / "external_import_worker.py"
+)
 
 
 def load_worker_module():
     spec = importlib.util.spec_from_file_location("external_import_worker", WORKER_PATH)
     assert spec and spec.loader, "worker module spec should be loadable"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_worker_entry_module():
+    spec = importlib.util.spec_from_file_location("external_import_worker_entry", WORKER_ENTRY_PATH)
+    assert spec and spec.loader, "worker entry module spec should be loadable"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -82,6 +96,15 @@ def test_only_uploaded_or_detected_tables_are_cleared_and_written():
     ]
     assert request_sheet_ids == [1, 1, 2, 2]
     assert [item["status"] for item in plan["manifest"]] == ["imported", "imported", "stale"]
+
+
+def test_vercel_worker_entry_loads_runtime_dependencies_without_mocks():
+    load_worker_entry_module()
+    from aiwb_finance import external_import_worker as runtime_worker
+
+    dependencies = runtime_worker._load_runtime_dependencies()
+
+    assert sorted(dependencies) == ["get_sheets_service", "run_validate_input_data"]
 
 
 def test_writes_use_structured_grid_ranges():

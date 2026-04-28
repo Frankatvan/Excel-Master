@@ -145,6 +145,20 @@ describe("deployment packaging guardrails", () => {
 
     expect(requirements).toContain("pandas");
     expect(requirements).toContain("google-api-python-client");
+    expect(requirements).toContain("PyYAML");
+    expect(requirements).toContain("openpyxl");
+  });
+
+  it("keeps repository root python requirements aligned for fallback worker packaging", () => {
+    const repositoryRoot = path.resolve(__dirname, "../../..");
+    const requirementsPath = path.join(repositoryRoot, "requirements.txt");
+
+    expect(fs.existsSync(requirementsPath)).toBe(true);
+
+    const requirements = fs.readFileSync(requirementsPath, "utf8");
+
+    expect(requirements).toContain("PyYAML");
+    expect(requirements).toContain("openpyxl");
   });
 
   it("provides a fast production deploy path that skips env re-sync", () => {
