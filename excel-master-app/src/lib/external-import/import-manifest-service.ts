@@ -82,6 +82,12 @@ export interface ExternalImportStatusPayload {
   spreadsheet_id: string;
   job_id: string | null;
   status: string;
+  has_next_step?: boolean;
+  current_step?: string | null;
+  current_table?: string | null;
+  completed_chunks?: number | null;
+  total_chunks?: number | null;
+  rows_written?: number | null;
   job: ExternalImportJobStatus | null;
   manifest: ExternalImportManifestStatus | null;
   manifest_items: ExternalImportManifestItemStatus[];
@@ -264,6 +270,10 @@ function readNumberOrNull(value: unknown) {
   return null;
 }
 
+function readStringOrNull(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
 function readMetaNumber(meta: JsonObject | null | undefined, keys: string[]) {
   if (!meta) {
     return null;
@@ -271,6 +281,19 @@ function readMetaNumber(meta: JsonObject | null | undefined, keys: string[]) {
   for (const key of keys) {
     const value = readNumberOrNull(meta[key]);
     if (value !== null) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function readMetaString(meta: JsonObject | null | undefined, keys: string[]) {
+  if (!meta) {
+    return null;
+  }
+  for (const key of keys) {
+    const value = readStringOrNull(meta[key]);
+    if (value) {
       return value;
     }
   }
@@ -329,6 +352,17 @@ function buildProgressStatus(
   };
 }
 
+function hasNextExternalImportStep(job: ExternalImportJobStatus | null) {
+  if (!job) {
+    return false;
+  }
+  if (job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") {
+    return false;
+  }
+  const currentStep = readMetaString(job.result_meta, ["current_step"]);
+  return currentStep !== "complete";
+}
+
 export async function getExternalImportStatus(
   input: GetExternalImportStatusInput,
   client: SupabaseLike = getSupabaseClient(),
@@ -353,6 +387,12 @@ export async function getExternalImportStatus(
     spreadsheet_id: input.spreadsheetId,
     job_id: job.id,
     status: job.status,
+    has_next_step: hasNextExternalImportStep(job),
+    current_step: readMetaString(job.result_meta, ["current_step"]),
+    current_table: readMetaString(job.result_meta, ["current_table"]),
+    completed_chunks: readMetaNumber(job.result_meta, ["completed_chunks"]),
+    total_chunks: readMetaNumber(job.result_meta, ["total_chunks"]),
+    rows_written: readMetaNumber(job.result_meta, ["rows_written"]),
     job,
     manifest,
     manifest_items: manifestItems,

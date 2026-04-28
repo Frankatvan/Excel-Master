@@ -585,6 +585,21 @@ describe("phase 1 workbench page", () => {
       }
       if (url.startsWith("/api/external_import/status")) {
         return jsonResponse({
+          status: "running",
+          job_id: "job-123",
+          has_next_step: true,
+          current_step: "write_chunk",
+          current_table: "payable",
+          completed_chunks: 1,
+          total_chunks: 4,
+          rows_written: 50,
+          progress: {
+            percent: 25,
+            total_items: 2,
+            completed_items: 0,
+            failed_items: 0,
+            pending_items: 2,
+          },
           manifest: {
             tables: [
               {
@@ -641,6 +656,11 @@ describe("phase 1 workbench page", () => {
         expect(init?.body).toBe(JSON.stringify({ spreadsheet_id: "sheet-123", preview_hash: "preview-hash-123" }));
         return jsonResponse({ status: "queued", job_id: "job-123" });
       }
+      if (url.startsWith("/api/external_import/trigger")) {
+        expect(init?.method).toBe("POST");
+        expect(init?.body).toEqual(expect.stringContaining('"job_id":"job-123"'));
+        return jsonResponse({ status: "running", progress: 55, has_next_step: true, steps_advanced: 5 });
+      }
       return jsonResponse({});
     });
     global.fetch = fetchMock as typeof fetch;
@@ -676,6 +696,9 @@ describe("phase 1 workbench page", () => {
       expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/confirm"))).toBe(true),
     );
     expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/external_import/status")).length).toBeGreaterThanOrEqual(2);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/external_import/trigger"))).toBe(true);
+    expect(await screen.findByText("导入进度 25%")).toBeTruthy();
+    expect(screen.getByText(/chunks: 1\/4/)).toBeTruthy();
   });
 
   it("keeps preview available but disables external import confirm when the worker is not configured", async () => {

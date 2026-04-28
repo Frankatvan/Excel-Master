@@ -163,4 +163,60 @@ describe("external import manifest service", () => {
     });
     expect(client.queries.map((query) => query.table)).toEqual(["jobs", "external_import_manifests"]);
   });
+
+  it("surfaces chunk progress and has_next_step from job result metadata", async () => {
+    const client = new FakeSupabaseClient({
+      jobs: {
+        data: {
+          id: "job-running-123",
+          spreadsheet_id: "sheet-123",
+          status: "running",
+          progress: 45,
+          result_meta: {
+            current_step: "write_chunk",
+            current_table: "payable",
+            completed_chunks: 2,
+            total_chunks: 5,
+            rows_written: 100,
+            cursor: { chunk_index: 0, row_offset: 100 },
+          },
+        },
+        error: null,
+      },
+      external_import_manifests: {
+        data: { id: "manifest-123", job_id: "job-running-123", spreadsheet_id: "sheet-123", status: "imported" },
+        error: null,
+      },
+      external_import_manifest_items: {
+        data: [
+          { id: "item-1", manifest_id: "manifest-123", status: "imported", result_meta: {} },
+          { id: "item-2", manifest_id: "manifest-123", status: "parsed", result_meta: {} },
+          { id: "item-3", manifest_id: "manifest-123", status: "failed", result_meta: {} },
+        ],
+        error: null,
+      },
+    });
+
+    const status = await getExternalImportStatus(
+      { spreadsheetId: "sheet-123", jobId: "job-running-123" },
+      client as never,
+    );
+
+    expect(status).toMatchObject({
+      status: "running",
+      has_next_step: true,
+      current_step: "write_chunk",
+      current_table: "payable",
+      completed_chunks: 2,
+      total_chunks: 5,
+      rows_written: 100,
+      progress: {
+        percent: 45,
+        total_items: 3,
+        completed_items: 1,
+        failed_items: 1,
+        pending_items: 1,
+      },
+    });
+  });
 });

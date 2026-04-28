@@ -137,6 +137,49 @@ describe("/api/external_import/step", () => {
     expect(mockGetJob).not.toHaveBeenCalled();
   });
 
+  it("accepts the worker secret as a bearer token", async () => {
+    mockRunExternalImportJobStep.mockResolvedValue({
+      status: "running",
+      progress: 25,
+      cursor: { chunk_index: 0, row_offset: 50 },
+      has_next_step: true,
+      rows_written: 50,
+    } as never);
+    const res = createMockRes();
+    const stepHandler = loadStepHandler();
+
+    await stepHandler(
+      {
+        method: "POST",
+        headers: { authorization: "Bearer worker-secret" },
+        body: { job_id: "job-123" },
+      } as unknown as NextApiRequest,
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(mockGetJob).toHaveBeenCalledWith("job-123");
+    expect(mockRunExternalImportJobStep).toHaveBeenCalled();
+  });
+
+  it("rejects a wrong bearer token before loading the job", async () => {
+    const res = createMockRes();
+    const stepHandler = loadStepHandler();
+
+    await stepHandler(
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wrong-secret" },
+        body: { job_id: "job-123" },
+      } as unknown as NextApiRequest,
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(mockGetJob).not.toHaveBeenCalled();
+    expect(mockRunExternalImportJobStep).not.toHaveBeenCalled();
+  });
+
   it("marks a queued job running and records initial progress before executing a chunk", async () => {
     mockRunExternalImportJobStep.mockResolvedValue({
       status: "running",

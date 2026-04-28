@@ -3,7 +3,7 @@ import type { GetServerSideProps } from "next";
 import { useRouter } from "next/router";
 import { signIn, signOut, useSession } from "next-auth/react";
 import type { FormEvent } from "react";
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 
 import AuditAmountDetailDrawer, {
   type AuditAmountDetailMode,
@@ -414,6 +414,19 @@ interface ExternalImportStatusView {
   preview_hash?: string;
   confirm_allowed?: boolean;
   worker_configured?: boolean;
+  has_next_step?: boolean;
+  current_step?: string | null;
+  current_table?: string | null;
+  completed_chunks?: number | null;
+  total_chunks?: number | null;
+  rows_written?: number | null;
+  progress?: {
+    percent: number | null;
+    total_items: number;
+    completed_items: number;
+    failed_items: number;
+    pending_items: number;
+  };
   tables: ExternalImportTableStatus[];
 }
 
@@ -935,6 +948,11 @@ function getStringArray(value: unknown) {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function readNumberOrNull(value: unknown) {
+  const parsed = typeof value === "string" && value.trim() ? Number(value) : value;
+  return typeof parsed === "number" && Number.isFinite(parsed) ? parsed : null;
+}
+
 function normalizeExternalImportTableStatus(value: unknown): ExternalImportTableStatus | null {
   if (!isRecord(value)) {
     return null;
@@ -1005,6 +1023,9 @@ function normalizeExternalImportStatus(payload: unknown): ExternalImportStatusVi
   const tables = tablesCandidate
     .map((item) => normalizeExternalImportTableStatus(item))
     .filter((item): item is ExternalImportTableStatus => Boolean(item));
+  const job = isRecord(payload.job) ? payload.job : {};
+  const resultMeta = isRecord(job.result_meta) ? job.result_meta : {};
+  const progress = isRecord(payload.progress) ? payload.progress : null;
 
   return {
     status: typeof payload.status === "string" ? payload.status : typeof manifest.status === "string" ? manifest.status : undefined,
@@ -1017,6 +1038,31 @@ function normalizeExternalImportStatus(payload: unknown): ExternalImportStatusVi
     preview_hash: typeof payload.preview_hash === "string" ? payload.preview_hash : undefined,
     confirm_allowed: typeof payload.confirm_allowed === "boolean" ? payload.confirm_allowed : undefined,
     worker_configured: typeof payload.worker_configured === "boolean" ? payload.worker_configured : undefined,
+    has_next_step: typeof payload.has_next_step === "boolean" ? payload.has_next_step : undefined,
+    current_step:
+      typeof payload.current_step === "string"
+        ? payload.current_step
+        : typeof resultMeta.current_step === "string"
+          ? resultMeta.current_step
+          : null,
+    current_table:
+      typeof payload.current_table === "string"
+        ? payload.current_table
+        : typeof resultMeta.current_table === "string"
+          ? resultMeta.current_table
+          : null,
+    completed_chunks: readNumberOrNull(payload.completed_chunks ?? resultMeta.completed_chunks),
+    total_chunks: readNumberOrNull(payload.total_chunks ?? resultMeta.total_chunks),
+    rows_written: readNumberOrNull(payload.rows_written ?? resultMeta.rows_written),
+    progress: progress
+      ? {
+          percent: readNumberOrNull(progress.percent),
+          total_items: Number(progress.total_items || 0),
+          completed_items: Number(progress.completed_items || 0),
+          failed_items: Number(progress.failed_items || 0),
+          pending_items: Number(progress.pending_items || 0),
+        }
+      : undefined,
     updated_at:
       typeof payload.updated_at === "string"
         ? payload.updated_at
@@ -1262,6 +1308,7 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
   const currentId = routeSpreadsheetId || (isLegacySpreadsheetId ? defaultSpreadsheetId : "") || directSpreadsheetId;
   const latestSpreadsheetIdRef = useRef(currentId);
   latestSpreadsheetIdRef.current = currentId;
+  const externalImportTriggeringRef = useRef(false);
   const activeProjectState = projectStateForId === currentId ? projectState : null;
   const isProjectSummaryView = projectMode === "summary" && !routeSpreadsheetId && !isLegacySpreadsheetId;
   const isProjectEmptyView = projectMode === "empty" && !routeSpreadsheetId && !isLegacySpreadsheetId;
@@ -1756,6 +1803,37 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
     }
   }
 
+  const triggerExternalImportStep = useCallback(async (spreadsheetId: string, importJobId: string) => {
+    if (!canWriteExternalImport || externalImportTriggeringRef.current) {
+      return null;
+    }
+    externalImportTriggeringRef.current = true;
+    try {
+      const res = await fetch("/api/external_import/trigger", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          spreadsheet_id: spreadsheetId,
+          job_id: importJobId,
+          max_steps_per_request: 5,
+        }),
+      });
+      const data = await parseResponseBody(res);
+      if (!res.ok) {
+        throw new Error(resolveErrorMessage(data, "外部导入后台推进失败"));
+      }
+      return data;
+    } catch (triggerError) {
+      const message = triggerError instanceof Error ? triggerError.message : "外部导入后台推进失败";
+      setExternalImportMessage(message);
+      return null;
+    } finally {
+      externalImportTriggeringRef.current = false;
+    }
+  }, [canWriteExternalImport]);
+
   async function loadProjectList() {
     setProjectListLoading(true);
     setError(null);
@@ -2177,6 +2255,9 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
 
   async function refreshAfterExternalImportConfirm(targetId: string, importJobId?: string | null) {
     const immediateStatus = await loadExternalImportStatus(targetId, importJobId);
+    if (importJobId && canWriteExternalImport) {
+      await triggerExternalImportStep(targetId, importJobId);
+    }
     const latestStatus = immediateStatus?.status || "";
     if (latestStatus === "succeeded" || latestStatus === "failed" || latestStatus === "partial") {
       await refreshWorkbenchData(targetId);
@@ -2586,6 +2667,37 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
     setExternalImportPreviewHash(null);
     setExternalImportMessage(null);
   }, [currentId]);
+
+  useEffect(() => {
+    if (!currentId || !externalImportStatus?.import_job_id) {
+      return;
+    }
+    const importJobId = externalImportStatus.import_job_id;
+    const status = externalImportStatus.status || "";
+    if (status === "succeeded" || status === "failed" || status === "cancelled" || status === "partial") {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      if (latestSpreadsheetIdRef.current !== currentId) {
+        return;
+      }
+      if (canWriteExternalImport && externalImportStatus.has_next_step !== false) {
+        void triggerExternalImportStep(currentId, importJobId);
+      }
+      void loadExternalImportStatus(currentId, importJobId);
+    }, 2500);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    canWriteExternalImport,
+    currentId,
+    externalImportStatus?.completed_chunks,
+    externalImportStatus?.has_next_step,
+    externalImportStatus?.import_job_id,
+    externalImportStatus?.status,
+    triggerExternalImportStep,
+  ]);
 
   return (
     <div className={shellClassName}>
@@ -3037,6 +3149,30 @@ export default function Home({ defaultSpreadsheetId }: { defaultSpreadsheetId: s
                           <div>外部导入 Worker 未配置，确认导入暂不可用。</div>
                         )}
                       </div>
+                      {externalImportStatus?.progress && (
+                        <div className="mt-3 grid gap-1 rounded-xl border border-[#D8E3DD] bg-[#FFFDF7] px-3 py-2 text-xs text-[#335768]">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-semibold text-[#102A38]">
+                              导入进度 {externalImportStatus.progress.percent ?? 0}%
+                            </span>
+                            <span>
+                              {externalImportStatus.progress.completed_items}/{externalImportStatus.progress.total_items} tables
+                            </span>
+                          </div>
+                          <div>
+                            {[
+                              externalImportStatus.current_step ? `step: ${externalImportStatus.current_step}` : null,
+                              externalImportStatus.current_table ? `table: ${externalImportStatus.current_table}` : null,
+                              externalImportStatus.total_chunks
+                                ? `chunks: ${externalImportStatus.completed_chunks ?? 0}/${externalImportStatus.total_chunks}`
+                                : null,
+                              externalImportStatus.rows_written != null ? `rows: ${formatNumber(externalImportStatus.rows_written)}` : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </div>
+                        </div>
+                      )}
 
                       {canWriteExternalImport && (
                         <div className="mt-3 grid gap-2">
